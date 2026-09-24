@@ -431,6 +431,8 @@ assert not agon.paused()
 text = sam("inbox", wait=0)
 assert "Team paused" not in text and "STOP please" in text, text
 assert "paused" in agon.INSTRUCTIONS
+plan = con.execute("EXPLAIN QUERY PLAN SELECT text FROM msgs WHERE sender = 'human' ORDER BY id DESC LIMIT 1")
+assert "msgs_by_sender" in str(plan.fetchall())  # found in review: no scan through a long agent-only history
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
