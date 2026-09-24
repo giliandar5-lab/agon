@@ -17,19 +17,39 @@ os.environ["AGON_DB"] = str(Path(TMP, "test.db"))
 import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line above)
 
 
-def agent(name):
-    p = subprocess.Popen([sys.executable, SERVER, name], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+class Agent:
+    """A fake MCP client (like Claude Code or Codex) talking to `python agon.py <name>` over stdio."""
 
-    def rpc(method, params):
-        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode() + b"\n")
-        p.stdin.flush()
-        return json.loads(p.stdout.readline())
+    def __init__(self, name, client="fake-client", version="2025-06-18"):
+        self.p = subprocess.Popen([sys.executable, SERVER, name], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        info = {"name": client, "version": "1.0"}
+        self.hello = self.rpc("initialize", {"protocolVersion": version, "clientInfo": info})["result"]
+        assert self.hello["serverInfo"]["name"] == "agon"
 
-    assert rpc("initialize", {"protocolVersion": "2025-06-18"})["result"]["serverInfo"]["name"] == "agon"
-    return lambda tool, **a: rpc("tools/call", {"name": tool, "arguments": a})["result"]["content"][0]["text"]
+    def write(self, msg):  # a JSON-RPC message, or raw bytes to test bad input
+        self.p.stdin.write(msg if isinstance(msg, bytes) else json.dumps(msg).encode() + b"\n")
+        self.p.stdin.flush()
+
+    def read(self):
+        return json.loads(self.p.stdout.readline())
+
+    def rpc(self, method, params=None, id=1):
+        self.write({"jsonrpc": "2.0", "id": id, "method": method} | ({} if params is None else {"params": params}))
+        return self.read()
+
+    def call(self, tool, **args):  # the whole tools/call result
+        return self.rpc("tools/call", {"name": tool, "arguments": args})["result"]
+
+    def __call__(self, tool, **args):  # just its text
+        return self.call(tool, **args)["content"][0]["text"]
+
+    def close(self):
+        self.p.stdin.close()
+        self.p.wait(10)
+        self.p.stdout.close()
 
 
-claude, gemini, gpt = agent("claude"), agent("gemini"), agent("gpt")
+claude, gemini, gpt = Agent("claude"), Agent("gemini"), Agent("gpt")
 claude("send", text="hi team 👋")
 claude("send", text="secret for gpt", to="gpt")
 
@@ -105,4 +125,14 @@ assert buf.getvalue() == b'{"n": 1}\n'
 buf = io.BytesIO()  # the server writes to any binary stream, so it can run in-process too
 agon.serve_mcp("ivan", io.BytesIO(b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'), buf)
 assert json.loads(buf.getvalue()) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+# 12. Version negotiation: echo a supported revision, otherwise answer with the newest
+assert agon.PROTOCOLS == ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
+vera = Agent("vera")
+for version in agon.PROTOCOLS:
+    assert vera.rpc("initialize", {"protocolVersion": version})["result"]["protocolVersion"] == version
+for version in ("2026-07-28", "1999-01-01", 5, None):  # 2026-07-28 is stateless: we keep speaking the older ones
+    params = {} if version is None else {"protocolVersion": version}
+    assert vera.rpc("initialize", params)["result"]["protocolVersion"] == "2025-11-25"
+vera.close()
 print("ok")
