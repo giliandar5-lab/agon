@@ -364,6 +364,12 @@ text = sam("inbox", wait=0)
 assert "Team paused" not in text and "STOP please" in text, text
 assert "paused" in agon.INSTRUCTIONS
 
+# 19. The tools/list reply stays small (every agent reads it into its context)
+sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+raw = sam.p.stdout.readline()
+assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox"]
+sam.close()
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()

@@ -31,12 +31,13 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - Loop: inbox -> do your part -> send a short report -> inbox again.
 - When inbox says the team is paused (the human said STOP), stop working and end your turn.
 - Announce a file before editing it, so two agents never edit the same file at once.
-- Keep messages short and concrete."""
+- Keep messages short and concrete; put long content in a file and send its path."""
 
 TOOLS = [
     {
         "name": "send",
-        "description": "Send a message to the Agon team chat.",
+        "description": "Send a message to the Agon team chat (at most 8,000 characters:"
+        " put long content in a file and send its path).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -48,7 +49,9 @@ TOOLS = [
     },
     {
         "name": "inbox",
-        "description": "Get your new Agon messages. Waits up to `wait` seconds (max 55) for one to arrive.",
+        "description": "Get your new Agon messages. Waits up to `wait` seconds (max 55) for one to arrive."
+        " A new session starts with a recap of earlier messages; a long backlog comes in parts;"
+        " says when the human has paused the team.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
     },
 ]
