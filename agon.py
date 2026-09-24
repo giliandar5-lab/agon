@@ -1,8 +1,10 @@
 """Agon: a shared chat where AI agents from different apps build one project together.
 
-python agon.py <name>   MCP server (stdio) for one agent: claude / gemini / gpt
-python agon.py          browser arena at http://127.0.0.1:8765
+python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
+python agon.py hook <name>   Stop hook that wakes the agent with its new messages (--help for options)
+python agon.py               browser arena at http://127.0.0.1:8765
 """
+import argparse
 import json
 import os
 import queue
@@ -25,6 +27,9 @@ PAUSED = ("Team paused: the human said STOP. Stop working and end your turn;"
           " the next message from the human resumes the team.")
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
+HOOK_WAIT = 25  # seconds a Stop hook waits for a message: Antigravity gives hooks 30 s by default
+FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
+CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -233,7 +238,7 @@ def pending(me, after, budget):
 def inbox(me, after, wait, budget=MAX_INBOX, stop=lambda: False):
     """Wait up to `wait` s for messages to `me` after id `after`: (the ones that fit in `budget`, how many more
     wait, whether the team is paused). A pause ends the wait at once, so the agent can stop."""
-    end = time.monotonic() + min(wait, MAX_WAIT)
+    end = time.monotonic() + wait
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
         rows, more = pending(me, after, budget)
@@ -308,7 +313,7 @@ def tool_inbox(session, args):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
-    wait = 0 if head or not wait > 0 else wait  # a recap comes back at once; NaN means no wait
+    wait = 0 if head or not wait > 0 else min(wait, MAX_WAIT)  # a recap comes back at once; NaN means no wait
     rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
     text = "\n".join(line(row) for row in rows) or "No new messages."
     if more:
@@ -467,6 +472,37 @@ def serve_mcp(me, inp=None, out=None):
     worker.join()
 
 
+def read_payload(inp):
+    """The JSON object an app hands its Stop hook on stdin; {} for anything else (run by hand, bad JSON)."""
+    if inp.isatty():
+        return {}
+    try:
+        payload = json.loads(inp.read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
+    """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
+    The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
+    an exit code 2 into 1, so the other way to keep an agent going can get lost."""
+    fmt = fmt or FORMATS.get(me, "claude")
+    payload = read_payload(inp or sys.stdin.buffer)
+    touch(me)  # the agent's row, so its cursor can move
+    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
+    if halted or not rows:
+        return  # exit 0 without output: the agent may stop
+    text = "\n".join(line(row) for row in rows)
+    if more:
+        text += f"\n{more} more — call inbox again."
+    decision = {"decision": CONTINUE[fmt], "reason": f"New messages from your Agon team:\n{text}"}
+    out = out or sys.stdout.buffer
+    out.write(json.dumps(decision).encode() + b"\n")  # ASCII only (\u escapes): no console code page mangles it
+    out.flush()
+    advance(me, rows[-1][0])  # only once the app has the messages (at-least-once)
+
+
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Agon</title>
 <style>
@@ -579,14 +615,39 @@ class Web(BaseHTTPRequestHandler):
         pass
 
 
+class Args(argparse.ArgumentParser):
+    def error(self, message):  # argparse exits with 2, which Claude Code and Codex read as "keep the agent going"
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def main(argv):
+    """Run the command in `argv` (sys.argv without the script) and return the process exit code."""
+    if argv[:1] == ["hook"]:
+        cli = Args(prog="agon.py hook", description="Stop hook for Claude Code, Codex and Antigravity: keeps"
+                   " the agent going with its new Agon messages, or lets it stop.")
+        cli.add_argument("name", help="the agent's name in Agon: claude, gemini, gpt, ...")
+        cli.add_argument("--wait", type=float, default=HOOK_WAIT, metavar="SECONDS",
+                         help=f"how long to wait for a message before letting the agent stop (default {HOOK_WAIT})")
+        cli.add_argument("--format", choices=sorted(CONTINUE),
+                         help="the app running the hook (default: gpt -> codex, gemini -> antigravity, others -> claude)")
+        args = cli.parse_args(argv[1:])
+        try:
+            hook(args.name, args.wait, args.format)
+        except Exception as e:  # the app shows it and lets the agent stop; its messages stay unread
+            print(f"agon hook: {e}", file=sys.stderr)
+            return 1
+    elif argv:
+        serve_mcp(argv[0])
+    else:
+        url = f"http://127.0.0.1:{PORT}"
+        print(f"Agon arena: {url}  (Ctrl+C to stop)")
+        webbrowser.open(url)
+        ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+    return 0
+
+
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1:
-            serve_mcp(sys.argv[1])
-        else:
-            url = f"http://127.0.0.1:{PORT}"
-            print(f"Agon arena: {url}  (Ctrl+C to stop)")
-            webbrowser.open(url)
-            ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+        sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         pass
