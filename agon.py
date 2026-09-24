@@ -90,6 +90,8 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - Keep messages short and concrete; put long content in a file and send its path.
 - ask gets a second opinion from another agent's app, which takes minutes: a review (read-only; it runs the
   tests and ends with a VERDICT) or a task done on a new git branch that you may merge."""
+ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
+off here and team messages don't come to you."""
 
 # Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
 LOCAL = {"destructiveHint": False, "openWorldHint": False}
@@ -360,11 +362,22 @@ class Session:
         self.client = None  # the app, from initialize.clientInfo.name
         self.start = None  # the newest message id when this process got its first request: bounds the recap
         self.recap = True  # the first inbox call starts with a recap
-        self.current = None  # id of the request being handled
+        self.local = threading.local()  # the request each thread is handling: asks run in threads of their own
         self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
         self.closed = False  # the client closed our stdin
         self.called = False  # a tool was called: the client is set up (and Claude Code listens to its channel)
         self.doorbell = False  # the channel doorbell thread runs (Claude Code clients only)
+        # An app that ask started for another agent: it answers that agent only, so Agon's tools are off
+        self.asked_by = os.environ.get("AGON_ASKED_BY")
+
+    @property
+    def current(self):
+        """The id of the request this thread is handling."""
+        return getattr(self.local, "rid", None)
+
+    @current.setter
+    def current(self, rid):
+        self.local.rid = rid
 
     def stopped(self):
         """Nobody waits for the current request any more (cancelled, or the client left): stop waiting."""
@@ -683,8 +696,9 @@ def keep_work(top, path, branch, base, name, message):
 
 
 def ask_run(asker, name, mode, prompt, cwd, end, stopped):
-    """Run agent `name`'s app once for an ask from `asker`, with `prompt` (the whole text it gets) in folder `cwd`:
-    (its answer or None, why it failed or None, the texts that show a usage limit or None)."""
+    """Run agent `name`'s app once for an ask from `asker`, with `prompt` (the whole text it gets) in folder `cwd`,
+    until time `end` or until stopped() gives a reason: (its answer or None, why it failed or None, the texts that
+    show a usage limit or None)."""
     argv, stdin = ask_command(name, mode, prompt, cwd)
     started = time.monotonic()
     env = dict(os.environ, AGON_ASKED_BY=asker)
@@ -695,8 +709,9 @@ def ask_run(asker, name, mode, prompt, cwd, end, stopped):
     spent = took(time.monotonic() - started)
     answer, error = final_answer(out)
     if code is None:
-        why = "was stopped" if stopped() else "ran out of time (AGON_ASK_TIMEOUT) and was stopped"
-        return None, f"{name} {why} after {spent}.", None
+        reason = stopped()
+        return None, (f"{name} was stopped after {spent}: {reason}." if reason
+                      else f"{name} ran out of time (AGON_ASK_TIMEOUT) and was stopped after {spent}."), None
     if code or answer is None and error is not None:
         why = error or tail(err) or tail(out) or "no output"
         limit = shows_limit([error, tail(out), tail(err)])
@@ -728,15 +743,24 @@ def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
 
 def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
+    if paused():
+        raise ToolError(f"Nothing asked: {PAUSED}")
     top = repository(cwd) if mode == "task" else None
     me, started = session.me, time.monotonic()
     end, head, skipped = started + ask_timeout(), f"{me} asked {agent} for a {mode}", []
+
+    def halt():  # why the app must stop now, if it must
+        if session.stopped():
+            return "the call was cancelled, or the app that asked is gone"
+        if paused():
+            return "the human paused the team"
+
     for name in [agent, *fallbacks(agent, me)]:  # the next one answers while one is out of quota
         if until := quota_until(name):
             skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
             continue
         try:
-            answer, problem, limit, branch, stat = ask_once(me, name, mode, prompt, cwd, top, end, session.stopped)
+            answer, problem, limit, branch, stat = ask_once(me, name, mode, prompt, cwd, top, end, halt)
         except ToolError as e:  # its app isn't there, or git failed
             if name != agent:
                 skipped.append(str(e).rstrip("."))
@@ -785,7 +809,8 @@ def handle(session, msg):
         params = {} if msg.get("params") is None else msg["params"]
         if not isinstance(params, dict):
             raise RpcError(-32602, "Invalid params: `params` must be an object")
-        touch(session.me)  # presence: every request moves last_seen
+        if not session.asked_by:  # an app that ask started isn't the team's agent
+            touch(session.me)  # presence: every request moves last_seen
         if session.start is None:
             session.start = newest_id()
         result, after = dispatch(session, msg["method"], params)
@@ -802,8 +827,9 @@ def dispatch(session, method, params):
             info = params.get("clientInfo")
             name = info.get("name") if isinstance(info, dict) else None
             session.client = name if isinstance(name, str) else None
-            touch(session.me, session.client)
-            if session.client == "claude-code" and not session.doorbell:
+            if not session.asked_by:
+                touch(session.me, session.client)
+            if session.client == "claude-code" and not session.doorbell and not session.asked_by:
                 session.doorbell = True
                 threading.Thread(target=doorbell, args=(session,), daemon=True).start()
             asked = params.get("protocolVersion")
@@ -812,12 +838,13 @@ def dispatch(session, method, params):
                 # Claude Code channels (research preview): run with --dangerously-load-development-channels
                 "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
                 "serverInfo": {"name": "agon", "version": VERSION},
-                "instructions": INSTRUCTIONS.format(me=session.me),
+                "instructions": (ASKED.format(asker=session.asked_by) if session.asked_by
+                                 else INSTRUCTIONS.format(me=session.me)),
             }, None
         case "ping":
             return {}, None
         case "tools/list":
-            return {"tools": TOOLS}, None
+            return {"tools": [] if session.asked_by else TOOLS}, None
         case "tools/call":
             return call_tool(session, params)
     raise RpcError(-32601, f"Method not found: {method}")
@@ -826,6 +853,9 @@ def dispatch(session, method, params):
 def call_tool(session, params):
     session.called = True
     name, args = params.get("name"), params.get("arguments")
+    if session.asked_by:
+        raise RpcError(-32602, f"Agon's tools are off here: ask started this session for {session.asked_by},"
+                               " and your final message is the answer.")
     tool = TOOL_HANDLERS.get(name) if isinstance(name, str) else None
     if tool is None:
         raise RpcError(-32602, f"Unknown tool: {name}. Tools: {', '.join(TOOL_HANDLERS)}")
@@ -906,31 +936,51 @@ def read_client(session, inp, todo):
         todo.put(EOF)
 
 
+def answer(session, msg):
+    """Handle one request and write its reply; False once the client is gone."""
+    rid = msg.get("id") if isinstance(msg, dict) else None
+    session.current = rid if isinstance(rid, (str, int)) else None
+    if session.current in session.cancelled:  # cancelled while it waited in the queue: don't run it
+        session.cancelled.discard(session.current)
+        return True
+    reply, after = handle(session, msg)
+    if session.current in session.cancelled:  # cancelled while it ran: no reply, messages stay unread
+        session.cancelled.discard(session.current)
+        return True
+    if reply is not None:
+        try:
+            emit(session.out, reply)
+        except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
+            return False
+    # Only now that the reply is out (at-least-once), and only if the client still reads: one that has
+    # closed our stdin is shutting down and won't see this reply, so its messages stay unread.
+    if after and not session.closed:
+        try:
+            after()
+        except Exception as e:  # the cursor stays put and the messages come again
+            print(f"agon: {e}", file=sys.stderr)
+    return True
+
+
+def answer_apart(session, msg):
+    """answer() from a thread of its own, with its own connection to agon.db."""
+    try:
+        answer(session, msg)
+    finally:
+        close_db()
+
+
 def work(session, todo):
-    """Answer the queued requests one by one, in order."""
+    """Answer the queued requests in order. An ask runs for minutes, so it gets a thread of its own and send and inbox
+    keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the background, and the agent
+    goes on. The process waits for those threads: a closed client stops their apps first."""
     try:
         while (msg := todo.get()) is not EOF:
-            rid = msg.get("id") if isinstance(msg, dict) else None
-            session.current = rid if isinstance(rid, (str, int)) else None
-            if session.current in session.cancelled:  # cancelled while it waited in the queue: don't run it
-                session.cancelled.discard(session.current)
-                continue
-            reply, after = handle(session, msg)
-            if session.current in session.cancelled:  # cancelled while it ran: no reply, messages stay unread
-                session.cancelled.discard(session.current)
-                continue
-            if reply is not None:
-                try:
-                    emit(session.out, reply)
-                except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
-                    return
-            # Only now that the reply is out (at-least-once), and only if the client still reads: one that has
-            # closed our stdin is shutting down and won't see this reply, so its messages stay unread.
-            if after and not session.closed:
-                try:
-                    after()
-                except Exception as e:  # the cursor stays put and the messages come again
-                    print(f"agon: {e}", file=sys.stderr)
+            params = msg.get("params") if isinstance(msg, dict) else None  # msg may be any JSON value
+            if isinstance(params, dict) and msg.get("method") == "tools/call" and params.get("name") == "ask":
+                threading.Thread(target=answer_apart, args=(session, msg)).start()
+            elif not answer(session, msg):
+                return
     finally:
         close_db()
 
@@ -1091,6 +1141,8 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     an exit code 2 into 1, so the other way to keep an agent going can get lost."""
     fmt = fmt or FORMATS.get(me, "claude")
     payload = read_payload(inp or sys.stdin.buffer)
+    if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
+        return
     touch(me)  # the agent's row, so its cursor can move
     if paused():  # 1. the human said STOP
         return

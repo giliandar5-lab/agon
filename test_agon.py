@@ -1025,6 +1025,75 @@ if windows:  # cmd.exe would read a prompt passed to a batch file as commands: A
     assert res["isError"] is True and "is a batch file, and cmd.exe could run commands hidden" in text, text
     guard.close()
 
+# Phase 3, isolation. An app that ask started must not act as the team's agent: its Stop hook would hand it that
+# agent's messages (claude -p and agy -p run the user's Stop hooks: checked with 2.1.281 and 1.2.10), and its Agon
+# server could read that agent's inbox. AGON_ASKED_BY marks such runs: the hook lets them stop at once, and the server
+# offers no tools and doesn't count as the agent being there
+say = sqlite3.connect(HOOKS["AGON_DB"], isolation_level=None)
+say.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'gpt', 'only for the real gpt')")
+say.close()
+t0 = time.monotonic()
+assert run_hook("gpt", "--wait", "5", env={"AGON_ASKED_BY": "claude"}) == (0, b"", "") and time.monotonic() - t0 < 4
+code, out, err = run_hook("gpt", "--wait", "0")
+assert code == 0 and "only for the real gpt" in json.loads(out)["reason"], (code, out, err)  # left for the agent
+seen = agent_row("gpt", "last_seen")
+inside = Agent("gpt", client="claude-code", env=dict(os.environ, AGON_ASKED_BY="claude"))
+assert inside.hello["instructions"].startswith('Agon\'s ask started this session for "claude"'), inside.hello
+assert inside.rpc("tools/list", id=2)["result"] == {"tools": []}
+reply = inside.rpc("tools/call", {"name": "inbox", "arguments": {}}, id=3)
+assert reply["error"]["code"] == -32602 and reply["error"]["message"].startswith("Agon's tools are off here"), reply
+inside.close()
+assert agent_row("gpt", "last_seen") == seen
+
+
+# Phase 3, threads. An ask gets a thread of its own, so the agent's send and inbox answer while it runs (Claude Code
+# moves a long tool call to the background, and the agent goes on). A cancel, STOP or a closed client stops the app,
+# with its whole process tree, and no new ask starts while the team is paused
+def beating():  # whether the child of a HANG app still writes
+    size = BEAT.stat().st_size if BEAT.exists() else -1
+    time.sleep(0.4)
+    return (BEAT.stat().st_size if BEAT.exists() else -1) != size
+
+
+def until(condition, seconds=15):
+    end = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < end, "timed out"
+        time.sleep(0.1)
+
+
+busy = Agent("busy", env=ASK)
+while busy("inbox", wait=0) != "No new messages.":
+    pass
+BEAT.unlink()
+busy.write(call(40, "ask", agent="gpt", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+t0 = time.monotonic()
+assert busy("send", text="still here", to="rev") == "Sent." and busy("inbox", wait=0) == "No new messages."
+assert time.monotonic() - t0 < 5
+busy.write(cancel(40))
+until(lambda: not beating())
+assert busy.rpc("ping", id=41) == {"jsonrpc": "2.0", "id": 41, "result": {}}  # and no reply to the cancelled ask
+until(lambda: agon_said().startswith("busy asked gpt for a review: gpt was stopped after "))
+assert agon_said().endswith("s: the call was cancelled, or the app that asked is gone."), agon_said()
+BEAT.unlink()
+busy.write(call(42, "ask", agent="gemini", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+agon.post("human", "all", "STOP")
+reply = busy.read()
+assert reply["id"] == 42 and reply["result"]["isError"] is True and not beating(), reply
+text = reply["result"]["content"][0]["text"]
+assert re.fullmatch(r"gemini was stopped after \d+s: the human paused the team\.", text), text
+res, text = asked(busy, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and text == f"Nothing asked: {agon.PAUSED}", text
+agon.post("human", "all", "go on")
+BEAT.unlink()
+busy.write(call(43, "ask", agent="claude", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+t0 = time.monotonic()
+busy.close()  # the app that asked quits: its Agon server stops the ask's app, then exits
+assert time.monotonic() - t0 < 10 and not beating()
+
 # Phase 3, 4. The final message of each app's format, else nothing (then the raw output tail is the answer)
 assert agon.final_answer(json.dumps({"type": "result", "is_error": False, "result": "fine"})) == ("fine", None)
 assert agon.final_answer(json.dumps([{"type": "system"}, {"type": "result", "result": "v"}])) == ("v", None)
