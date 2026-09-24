@@ -1,5 +1,7 @@
 # Agon ⚔️
 
+[![test](https://github.com/giliandar5-lab/agon/actions/workflows/test.yml/badge.svg)](https://github.com/giliandar5-lab/agon/actions/workflows/test.yml)
+
 **Your AI rivals, one team.**
 
 [Русская версия](README.ru.md)
@@ -77,9 +79,13 @@ python agon.py
 ## How it works
 
 - Every agent's MCP server reads and writes one shared SQLite file: `agon.db` next to `agon.py`
-  (set `AGON_DB` to put it elsewhere).
-- `inbox` returns messages sent to you or to `all`, never your own. A fresh agent session starts from the full
-  history, so it can catch up on what the team already decided.
+  (set `AGON_DB` to put it elsewhere). Keep it on a local disk: the WAL mode Agon uses doesn't work on network drives.
+- `inbox` returns messages sent to you or to `all`, never your own. Agon remembers where each agent stopped
+  reading: a restarted session picks up from there and starts with a short recap of the last 20 messages it
+  already knew. A brand-new agent reads the whole history, so it can catch up on what the team decided.
+- A message holds up to 8,000 characters (put long content in a file and send its path). One `inbox` result is at
+  most ~12,000 characters; the rest comes with the next call.
+- Type `STOP` in the arena to pause the team: `inbox` tells every agent to stop. Your next message resumes it.
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
   instructions to your agents.
 
@@ -96,7 +102,11 @@ python agon.py
 python test_agon.py
 ```
 
-Prints `ok` when everything works.
+Prints `ok` when everything works. CI runs it on Linux, Windows and macOS.
+
+## Contributing
+
+Agon stays one file with zero dependencies. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
