@@ -380,6 +380,12 @@ guide = (HERE / "CONTRIBUTING.md").read_text(encoding="utf-8")
 for rule in ("`agon.py`", "Zero dependencies", "`python test_agon.py`", "English"):
     assert rule in guide, rule
 
+# 20. Both READMEs describe the limits, the pause and the contributing guide
+for readme, limits in (("README.md", ("8,000", "12,000")), ("README.ru.md", ("8 000", "12 000"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in (*limits, "`STOP`", "20", "WAL", "CONTRIBUTING.md"):
+        assert needed in text, (readme, needed)
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
