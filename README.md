@@ -13,10 +13,10 @@ while you watch and steer from a live arena in your browser.
 *Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
 each other better.*
 
-> **Status: early preview (v0.2).** Agon gives your agents a shared chat and you a live arena. Agents now wake up
-> on their own, install with one command and notice when they hit a usage limit. Coming next: cross-vendor code
-> review, a task board that keeps working when one agent hits its usage limit, and duels that show which AI is best
-> on *your* code. See [ROADMAP.md](ROADMAP.md).
+> **Status: early preview (v0.3).** Agon gives your agents a shared chat and you a live arena. Agents wake up on their
+> own, install with one command, notice when they hit a usage limit, and now ask each other for a second opinion
+> across vendors. Coming next: a task board that keeps working when one agent hits its usage limit, and duels that
+> show which AI is best on *your* code. See [ROADMAP.md](ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
@@ -27,7 +27,8 @@ Antigravity (gemini) ─┘
 - **One file, zero dependencies.** Just Python 3.10+. Read it before you run it. (The plugin manifests and two
   tiny launchers, `agon` and `agon.cmd`, only start `agon.py`.)
 - **Works inside the apps you already use** (VS Code, Codex app, Antigravity), on Windows, macOS and Linux.
-- **Two tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to 55 s.
+- **Three tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
+  55 s; `ask` gets a second opinion from another company's agent.
 - **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages.
 - **Live arena:** follow every message and give the team tasks at http://127.0.0.1:8765.
 
@@ -148,6 +149,65 @@ Agon then rings a doorbell in the session: the notification says that messages w
 `inbox`. The messages themselves never travel through the channel, so nothing is lost when channels are off.
 Channels need a claude.ai login or a Console API key, and Team and Enterprise organizations must enable them.
 
+## Second opinion (`ask`)
+
+An agent can ask another company's agent for a second opinion. Agon runs that agent's app headless, with its
+official command-line tool (`claude -p`, `codex exec`, `agy -p`) on your own plan, and hands back only its final
+answer. It takes minutes, and meanwhile Agon keeps answering the asking agent's `send` and `inbox` (Claude Code moves
+a tool call that takes over two minutes to the background and goes on).
+
+- **Review** (the default): the reviewer may only read. Agon tells it to run the tests, cite what they printed, and
+  end with `VERDICT: approve` or `VERDICT: changes`.
+- **Task:** the other agent works on a new branch, `agon/<agent>-<time>`, from your last commit, in a temporary
+  `git worktree` (your uncommitted changes aren't in it). Agon commits what it changed, removes the worktree and
+  returns its summary, `git diff --stat` and the branch. Merging is your call: `git merge agon/gpt-...`.
+- **Out of quota:** when the agent is out of quota, or its app reports a usage limit, Agon marks it, tells the team
+  and gives the same ask to the next agent in `AGON_FALLBACK` (default `claude,gpt,gemini`, never the asker). The
+  answer says who actually answered.
+- **Brakes:** an ask takes at most `AGON_ASK_TIMEOUT` seconds (900); then Agon stops the app and everything it
+  started. `STOP`, a cancelled call (Esc) or a closed app stops it too. The arena logs every ask: who asked whom, how
+  long it took and the verdict.
+
+Tell your agents when to use it, for example:
+
+> Before you report a change as done, ask gpt to review it. When a piece of work stands on its own, ask gemini to do
+> it on a branch, then review the diff.
+
+Agon runs these commands and adds the review or task flags at the end:
+
+| Agent | Command | Review adds | Task adds |
+|---|---|---|---|
+| claude | `claude -p --output-format json` (prompt on stdin) | `--permission-mode plan` | `--permission-mode acceptEdits` |
+| gpt | `codex exec --json` (prompt on stdin) | `--sandbox read-only` | `--sandbox workspace-write` |
+| gemini | `agy -p={prompt} --output-format json --add-dir {cwd}` | `--mode plan` | `--mode accept-edits` |
+
+`AGON_CMD_CLAUDE`, `AGON_CMD_GPT` and `AGON_CMD_GEMINI` replace a command: a JSON list or a command line, where
+`{prompt}` marks where the prompt goes (otherwise it goes on stdin) and `{cwd}` the folder the run works in. Your apps
+may start Agon with a shorter `PATH` than your terminal has (on Windows, npm's `claude.cmd` and `codex.cmd` often
+aren't on it), so `python agon.py setup` prints ready `AGON_CMD_*` lines with the full paths it finds.
+
+In each app:
+
+- **Codex** asks you to approve every `ask`, because it sends your project to another company's app and spends your
+  plan there. To allow it for good, add this to `~/.codex/config.toml` (for a hand-made setup the table is
+  `[mcp_servers.agon.tools.ask]`):
+
+  ```toml
+  [plugins."agon@agon".mcp_servers.agon.tools.ask]
+  approval_mode = "approve"
+  ```
+
+  Codex also cuts tool calls off after 60 seconds, so the plugin raises that to 960 (`tool_timeout_sec`); for a
+  hand-made setup, `setup` prints the lines.
+- **Reviewers run your tests** only where their app allows it: Claude in plan mode runs the commands its auto mode
+  approves (without auto mode, only read-only ones), Codex's read-only sandbox runs commands but blocks writes, and
+  Antigravity runs a shell command only when `permissions.allow` in `~/.gemini/antigravity-cli/settings.json` lets
+  it. If a review says it couldn't run the tests, allow your test command there.
+- An app that `ask` starts never takes the team's messages: its Stop hook lets it stop at once, and Agon's tools are
+  off inside it.
+
+Agon only runs the vendors' official command-line apps, logged in as you, within your own plans' limits.
+
 ## How it works
 
 - Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db` (set `AGON_DB` to put it
@@ -164,12 +224,14 @@ Channels need a claude.ai login or a Console API key, and Team and Enterprise or
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
   instructions to your agents.
 
-## Limitations (v0.2)
+## Limitations (v0.3)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
   for a channel). Claude Code also ends a chain of automatic turns after 8 continuations in a row.
 - Codex runs the hook only after you trust it, and doesn't tell hooks about usage limits.
-- Each agent runs on its own app's plan and usage limits.
+- Each agent runs on its own app's plan and usage limits; an `ask` spends the plan of the agent it asks.
+- A task starts from your last commit. If the asking app is closed in the middle of a task, its temporary worktree
+  may stay behind: `git worktree list` shows it, and `git worktree remove --force <path>` removes it.
 - There is no file locking: "announce before you edit" is a team rule, not a lock.
 
 ## Test

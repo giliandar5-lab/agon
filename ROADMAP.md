@@ -19,7 +19,7 @@ Tick a phase in the same pull request that completes it.
 
 - [x] Phase 1 — Solid core
 - [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
-- [ ] Phase 3 — Cross-vendor second opinion (`ask`)
+- [x] Phase 3 — Cross-vendor second opinion (`ask`)
 - [ ] Phase 4 — Task board (no downtime)
 - [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [ ] Phase 6 — The arena
@@ -123,8 +123,9 @@ When asked to do "the next phase":
 - `ask(agent, prompt, mode="review" | "task")` runs another vendor's CLI headless and returns only its final answer.
 - Command templates are configurable (`AGON_CMD_CLAUDE`, `AGON_CMD_GPT`, `AGON_CMD_GEMINI`); defaults:
   `claude -p --output-format json` (review adds `--permission-mode plan`), `codex exec --json` (review adds
-  `--sandbox read-only`), `agy -p --output-format json` (review adds `--mode plan`). Pass the prompt on stdin
-  where supported. Parse the final message from each format, falling back to the raw output tail.
+  `--sandbox read-only`), `agy -p=<prompt> --output-format json --add-dir <folder>` (review adds `--mode plan`; agy
+  takes no prompt on stdin, see the facts below). Pass the prompt on stdin where supported. Parse the final message
+  from each format, falling back to the raw output tail.
 - Review prompt template: run the tests, cite the output, end with `VERDICT: approve` or `VERDICT: changes`.
 - Task mode runs in a temporary `git worktree` with write access and returns the summary, `git diff --stat` and
   the branch name; the caller decides whether to merge.
@@ -242,6 +243,16 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   ([docs](https://code.claude.com/docs/en/plugin-marketplaces)); `claude plugin validate --strict` checks both
   files. Marketplace installs are copied to `~/.claude/plugins/cache/`, which changes with each version: keep no
   state there.
+- Seen with 2.1.281 against a mock API (Phase 3): with no prompt argument, `claude -p` reads the prompt from stdin.
+  `--output-format json` prints one line: `type: "result"`, `subtype`, `is_error`, `result`, `session_id`,
+  `total_cost_usd`, `usage`, `api_error_status`, `terminal_reason`. An API 429 (`rate_limit_error`) is retried for
+  about 3 minutes, then `is_error: true`, `api_error_status: 429`, `result: "API Error: Request rejected (429) · ..."`
+  and exit 1 (with an API key; a plan's usage-limit text wasn't seen). `-p` runs the project's Stop hooks and its
+  MCP servers with the caller's environment. On exit Claude Code ends its MCP servers with SIGINT.
+- Plan mode lets the auto-mode classifier approve shell commands; without auto mode only the read-only set runs
+  ([docs](https://code.claude.com/docs/en/permission-modes)). MCP tool calls: a wall-clock limit of
+  `MCP_TOOL_TIMEOUT` (about 28 h by default) or a server's `timeout`, an idle limit of 30 min for stdio servers, and a
+  main-conversation call that runs past two minutes moves to a background task ([docs](https://code.claude.com/docs/en/mcp)).
 
 **Codex — hooks** ([docs](https://learn.chatgpt.com/docs/hooks), moved from developers.openai.com; tried with the CLI
 0.156.1 against a mock model)
@@ -278,6 +289,18 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   `.agents/plugins/marketplace.json`, Codex reads `.claude-plugin/marketplace.json`. Install:
   `codex plugin marketplace add owner/repo` (a git clone), then `codex plugin add <plugin>@<marketplace>`, which
   copies the plugin, executable bits included, to `~/.codex/plugins/cache/`.
+- Seen with 0.156.1 against a mock model (Phase 3): with no prompt argument `codex exec` reads it from stdin
+  ("Reading prompt from stdin..." on stderr), in a read-only sandbox by default
+  ([docs](https://developers.openai.com/codex/noninteractive)). `--json` events: `thread.started`, `turn.started`,
+  `item.completed` (the answer is an `agent_message` item's `text`; items of type `error` are only warnings),
+  `turn.completed`. A usage limit is not retried: `error` and `turn.failed` say "You’ve hit your usage limit. ... try
+  again at 7:48 PM." (or "try again later."), exit 1. Stop hooks get Codex's environment.
+- MCP (0.156.1): `tool_timeout_sec` (default 60) fails a longer call and sends no cancel; a plugin's `mcpServers`
+  accept `tool_timeout_sec` and `env_vars` (`codex mcp list --json` shows them) and start in the plugin's cache
+  folder. The model sees a server's tools as a `namespace` named `mcp__<server>`, described by the server's
+  `instructions`. A tool that needs approval fails under `codex exec` ("MCP tool call requires approval, but approval
+  policy is never") unless config.toml has `[plugins."<plugin>@<marketplace>".mcp_servers.<server>.tools.<tool>]`
+  `approval_mode = "approve"` (the same key through `-c` didn't work). On exit Codex ends MCP servers with SIGTERM.
 
 **Antigravity (IDE and `agy` CLI)** ([hooks](https://antigravity.google/docs/hooks),
 [plugins](https://antigravity.google/docs/plugins), [headless](https://antigravity.google/docs/cli/headless);
@@ -303,6 +326,21 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   `--input-format stream-json` for multi-turn over stdin, `--mode default | accept-edits | plan`. Tools that need
   approval are refused in headless mode unless `--dangerously-skip-permissions` is set. Gemini CLI was replaced
   by `agy` on 2026-06-18.
+- Seen with agy 1.2.10 for Linux (the official manifest, SHA-512 checked) in API-key mode against a mock API
+  (Phase 3): `-p` takes the prompt as its value (`-p --output-format json` fails with `-p took "--output-format" as
+  its prompt`), and there is no prompt on stdin in text mode (`-p=-` sends "-"; an empty prompt is an error).
+  `--output-format json` prints `conversation_id`, `status`, `response`, `error`, `duration_seconds`, `num_turns`,
+  `usage`, on failure too (exit 1). `--mode plan` puts `/plan` before the prompt; `--mode accept-edits` works with
+  `-p`. `--print-timeout` defaults to 0 (no limit), though the [docs](https://antigravity.google/docs/cli/headless)
+  say 5 minutes.
+- Without `--add-dir`, `agy -p` has no workspace: it tells the model "The user does not have any active workspace"
+  and would write into a scratch folder of its own. With `--add-dir <folder>` that folder is the workspace, and its
+  `.agents/hooks.json` runs. The global Stop hooks run in `-p` mode, with the caller's environment.
+- API-key mode (`"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`, `GEMINI_API_KEY`,
+  `GOOGLE_GEMINI_BASE_URL`) runs headless without a Google login. A 429 `RESOURCE_EXHAUSTED` is retried 7 times (about
+  100 s), then `status: "ERROR"`, `error: "API error (attempt 7): Error 429, Message: ... Status: RESOURCE_EXHAUSTED"`.
+- On exit agy closes an MCP server's stdin and sends SIGTERM about 0.2 s later. Its MCP config documents no tool
+  timeout ([docs](https://antigravity.google/docs/mcp)).
 
 **Windows** ([about_Pwsh](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_pwsh))
 - With `-Command`, Windows PowerShell 5.1 and PowerShell 7 turn an external program's exit code other than 0 or 1

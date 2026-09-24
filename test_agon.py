@@ -1206,6 +1206,22 @@ for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "
                    "AGON_LIMIT_PATTERNS", "`--wait`", "v0.2"):
         assert needed in text, (readme, needed)
 
+# Phase 3: both READMEs explain ask (the modes, the commands and their flags, how to replace them, the fallback, the
+# timeout, Codex's approval and timeout settings), and the roadmap has the phase ticked
+for readme in ("README.md", "README.ru.md"):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in ("`ask`", "`VERDICT: approve`", "`VERDICT: changes`", "`git worktree`", "`git diff --stat`",
+                   "`AGON_FALLBACK`", "`claude,gpt,gemini`", "`AGON_ASK_TIMEOUT`", "`AGON_CMD_CLAUDE`",
+                   "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
+                   "`tool_timeout_sec`",
+                   '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
+                   "`[mcp_servers.agon.tools.ask]`", "`permissions.allow`", "`git worktree remove --force", "(v0.3)"):
+        assert needed in text, (readme, needed)
+    for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
+        for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
+            assert f"`{' '.join(args)}`" in text, (readme, name, args)
+assert "- [x] Phase 3 — Cross-vendor second opinion (`ask`)" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
