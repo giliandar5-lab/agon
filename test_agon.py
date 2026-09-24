@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import os
+import queue
 import sqlite3
 import subprocess
 import sys
@@ -239,12 +240,29 @@ gpt = Agent("gpt")  # a new session of the same agent
 away = con.execute("SELECT id FROM msgs WHERE text = 'while gpt was away'").fetchone()[0]
 text = gpt("inbox", wait=0)
 assert text.endswith(f"New messages:\n#{away} claude -> all: while gpt was away"), text  # nothing old comes again
+
+
+def worker(out, closed=False, cancelled=()):  # run the server's worker on one inbox request from agent zed
+    session, todo = agon.Session("zed", out), queue.Queue()
+    session.closed, session.cancelled = closed, set(cancelled)
+    todo.put({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inbox", "arguments": {}}})
+    todo.put(agon.EOF)
+    t = threading.Thread(target=agon.work, args=(session, todo))  # its own thread: work() closes its connection
+    t.start()
+    t.join()
+    return session
+
+
 agon.post("test", "zed", "for zed")
-line = b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inbox", "arguments": {}}}\n'
-agon.serve_mcp("zed", io.BytesIO(line), Gone())  # the reply can't be written...
+worker(Gone())  # the reply can't be written...
 assert agent_row("zed", "cursor") == 0  # ...so the message stays unread
 buf = io.BytesIO()
-agon.serve_mcp("zed", io.BytesIO(line), buf)
+worker(buf, closed=True)  # the client already closed our stdin: it is shutting down and won't read the reply
+assert "for zed" in buf.getvalue().decode() and agent_row("zed", "cursor") == 0
+buf = io.BytesIO()
+assert worker(buf, cancelled=[1]).cancelled == set() and buf.getvalue() == b""  # cancelled: no reply, id forgotten
+assert agent_row("zed", "cursor") == 0
+worker(buf)
 assert "for zed" in json.loads(buf.getvalue())["result"]["content"][0]["text"]
 assert agent_row("zed", "cursor") == con.execute("SELECT MAX(id) FROM msgs").fetchone()[0]
 
