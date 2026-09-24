@@ -1,0 +1,5 @@
+#!/bin/sh
+# Starts agon.py with Python 3 (the Codex and Antigravity plugins run Agon through this file; Windows uses agon.cmd).
+dir=$(dirname "$0")
+if command -v python3 >/dev/null 2>&1; then exec python3 "$dir/agon.py" "$@"; fi
+exec python "$dir/agon.py" "$@"

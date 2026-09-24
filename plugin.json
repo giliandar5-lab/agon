@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "agon",
+  "description": "Your AI rivals, one team: Gemini joins Claude (Claude Code) and GPT (Codex) in one shared chat. Adds the agon MCP server and a Stop hook that keeps the agent going with new messages."
+}
