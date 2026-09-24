@@ -72,16 +72,20 @@ def db():
     if con is None:
         # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
         con = sqlite3.connect(DB, timeout=5, isolation_level=None)
-        for tries in range(50):  # WAL: readers and the writer don't block each other
-            try:
-                con.execute("PRAGMA journal_mode=WAL")
-                break
-            except sqlite3.OperationalError:  # two agents switching a new file at once skip the busy timeout
-                if tries == 49:
-                    raise
-                time.sleep(0.1)
-        con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
-        migrate(con)
+        try:
+            for tries in range(50):  # WAL: readers and the writer don't block each other
+                try:
+                    con.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError:  # two agents switching a new file at once skip the busy timeout
+                    if tries == 49:
+                        raise
+                    time.sleep(0.1)
+            con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
+            migrate(con)
+        except BaseException:
+            con.close()  # the next call starts over with a new connection
+            raise
         _local.con = con
     return con
 
@@ -136,12 +140,16 @@ def too_long(text):
 
 
 def touch(me, client=None):
-    """Note that agent `me` was just seen; `client` (the app, from initialize) is kept until a new one comes."""
-    db().execute(
-        "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
-        " client = COALESCE(excluded.client, client), last_seen = excluded.last_seen",
-        (me, client, time.time()),
-    )
+    """Note that agent `me` was just seen; `client` (the app, from initialize) is kept until a new one comes.
+    Best effort: presence never fails the request it came with."""
+    try:
+        db().execute(
+            "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+            " client = COALESCE(excluded.client, client), last_seen = excluded.last_seen",
+            (me, client, time.time()),
+        )
+    except sqlite3.Error:
+        pass
 
 
 def data_version():

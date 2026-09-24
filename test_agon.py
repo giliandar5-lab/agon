@@ -100,6 +100,33 @@ held = dict(os.environ, AGON_DB=str(Path(TMP, "held.db")))
 assert subprocess.run(OPEN, cwd=HERE, env=held).returncode == 0
 release.join()
 holder.close()
+given = []  # found in review: a connection whose setup fails is closed, not leaked
+
+
+def failing_migrate(c):
+    given.append(c)
+    raise sqlite3.OperationalError("database is locked")
+
+
+def open_and_check():
+    agon.migrate, real_migrate = failing_migrate, agon.migrate
+    try:
+        agon.db()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        agon.migrate = real_migrate
+    try:
+        given[0].execute("SELECT 1")
+    except sqlite3.ProgrammingError:  # "Cannot operate on a closed database."
+        given.append("closed")
+    agon.close_db()
+
+
+t = threading.Thread(target=open_and_check)  # a thread with no connection yet
+t.start()
+t.join()
+assert given[-1] == "closed", given
 
 # 3. wait_for_change(): wakes up when another connection commits, otherwise times out
 v = agon.data_version()
@@ -236,6 +263,11 @@ assert abs(time.time() - before) < 60
 time.sleep(0.1)
 cody.rpc("tools/list")
 assert agent_row("cody", "last_seen") > before
+cody.close()
+con.execute("CREATE TRIGGER broken BEFORE UPDATE OF last_seen ON agents BEGIN SELECT RAISE(ABORT, 'disk I/O'); END")
+cody = Agent("cody")  # found in review: when presence can't be written, requests still work
+assert cody("send", text="presence is best effort", to="vera") == "Sent."
+con.execute("DROP TRIGGER broken")
 cody.close()
 
 # 5. Each agent's cursor lives in agon.db and moves only after the reply is written (at-least-once)
