@@ -78,6 +78,9 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     "CREATE TABLE agents(name TEXT PRIMARY KEY, client TEXT, cursor INTEGER NOT NULL DEFAULT 0,"
     " last_seen REAL, autoruns INTEGER NOT NULL DEFAULT 0, out_of_quota_until REAL)",  # times: Unix seconds
     "CREATE INDEX msgs_by_sender ON msgs(sender, id)",  # paused() finds the human's latest message at once
+    # any message from the human gives every agent its automatic turns back (see out_of_turns())
+    "CREATE TRIGGER human_resets_autoruns AFTER INSERT ON msgs WHEN NEW.sender = 'human'"
+    " BEGIN UPDATE agents SET autoruns = 0; END",
 ]
 _local = threading.local()
 
@@ -587,6 +590,25 @@ def out_of_quota(me, text):
         raise
 
 
+def max_autoruns():
+    """AGON_MAX_AUTORUNS: how many times in a row the hook may keep an agent going without the human (25)."""
+    try:
+        return int(os.environ.get("AGON_MAX_AUTORUNS") or 25)
+    except ValueError:
+        raise ValueError("AGON_MAX_AUTORUNS must be a whole number, such as 25") from None
+
+
+def out_of_turns(me, limit):
+    """Whether agent `me` has used its `limit` automatic turns; the first time, the hook tells the human.
+    Any message from the human gives them back (the human_resets_autoruns trigger)."""
+    row = db().execute("SELECT autoruns FROM agents WHERE name = ?", (me,)).fetchone()
+    if (row[0] if row else 0) < limit:
+        return False
+    if db().execute("UPDATE agents SET autoruns = ? WHERE name = ? AND autoruns = ?", (limit + 1, me, limit)).rowcount:
+        post("agon", "human", f"{me} paused after {limit} automatic turns, waiting for the human")
+    return True
+
+
 def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
     The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
@@ -598,7 +620,7 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
         return
     if hit := usage_limit(payload):  # 2. out of quota: say so and let it stop
         return out_of_quota(me, hit)
-    if turn_failed(payload):
+    if turn_failed(payload) or out_of_turns(me, max_autoruns()):
         return
     # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
     rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
@@ -612,6 +634,7 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     out.write(json.dumps(decision).encode() + b"\n")  # ASCII only (\u escapes): no console code page mangles it
     out.flush()
     advance(me, rows[-1][0])  # only once the app has the messages (at-least-once)
+    db().execute("UPDATE agents SET autoruns = autoruns + 1 WHERE name = ?", (me,))
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
