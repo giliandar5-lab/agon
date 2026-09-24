@@ -1,4 +1,5 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
+import io
 import json
 import os
 import sqlite3
@@ -91,4 +92,17 @@ t0 = time.monotonic()
 agon.post("test", "gemini", "are you there?")
 t.join(10)
 assert got and "are you there?" in got[0] and time.monotonic() - t0 < 2, got
+
+# 15. Writes to stdout go through one lock
+buf = io.BytesIO()
+with agon.OUT_LOCK:
+    t = threading.Thread(target=agon.emit, args=(buf, {"n": 1}))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive() and buf.getvalue() == b""  # waits while another thread holds the lock
+t.join()
+assert buf.getvalue() == b'{"n": 1}\n'
+buf = io.BytesIO()  # the server writes to any binary stream, so it can run in-process too
+agon.serve_mcp("ivan", io.BytesIO(b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'), buf)
+assert json.loads(buf.getvalue()) == {"jsonrpc": "2.0", "id": 1, "result": {}}
 print("ok")
