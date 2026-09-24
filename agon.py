@@ -99,7 +99,8 @@ def migrate(con):
             con.execute(f"PRAGMA user_version = {len(SCHEMA)}")
         con.execute("COMMIT")
     except BaseException:
-        con.execute("ROLLBACK")
+        if con.in_transaction:  # SQLite may have rolled back already
+            con.execute("ROLLBACK")
         raise
 
 
@@ -378,11 +379,11 @@ def read_client(session, inp, todo):
     """Read the client's messages: queue requests for work() and handle at once what can't wait behind a long
     inbox call (cancellations, pings, unreadable lines). When the client closes stdin, mark the session closed."""
     try:
-        for line in inp:
-            if not line.strip():
+        for raw in inp:
+            if not raw.strip():
                 continue
             try:
-                msg = json.loads(line)
+                msg = json.loads(raw)
             except Exception:  # bad JSON or UTF-8, nesting too deep, a number too long...
                 emit(session.out, error(None, -32700, "Parse error: send one JSON-RPC message per line"))
                 continue
