@@ -176,4 +176,25 @@ agon.post, real_post = locked, agon.post  # a failure inside the tool itself
 res = agon.call_tool(agon.Session("tess"), {"name": "send", "arguments": {"text": "hi"}})
 agon.post = real_post
 assert res["isError"] is True and "database is locked" in res["content"][0]["text"], res
+
+# 16. Bad input never crashes the server: every bad line gets an error and the next request still works
+bea = Agent("bea")
+for line in (b"\xff\xfe\x00 not utf-8", b"[" * 100_000, b"1" * 5000, b"123", b'"text"', b"null", b"{}",
+             b'{"jsonrpc": "2.0", "id": 4, "method": 5}', b'{"jsonrpc": "2.0", "id": 5, "method": "ping", "params": 1}',
+             b'{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": ["send"]}}',
+             b'{"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {"clientInfo": 42}}'):
+    bea.write(line + b"\n")
+    reply = bea.read()
+    assert "error" in reply or "protocolVersion" in reply.get("result", {}), (line[:40], reply)
+assert bea.call("inbox", wait=[1])["isError"] is True
+assert bea.rpc("ping", id=9) == {"jsonrpc": "2.0", "id": 9, "result": {}} and bea.p.poll() is None
+bea.close()
+
+
+class Gone(io.RawIOBase):  # a client that closed its end of the pipe
+    def write(self, data):
+        raise BrokenPipeError
+
+
+agon.serve_mcp("gone", io.BytesIO(b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'), Gone())  # returns quietly
 print("ok")

@@ -252,17 +252,20 @@ def serve_mcp(me, inp=None, out=None):
     """MCP server for agent `me`: one JSON-RPC message per line on stdin and stdout."""
     inp, out = inp or sys.stdin.buffer, out or sys.stdout.buffer
     session = Session(me)
-    for line in inp:
-        if not line.strip():
-            continue
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            reply = error(None, -32700, "Parse error: send one JSON-RPC message per line")
-        else:
-            reply = handle(session, msg)
-        if reply is not None:
-            emit(out, reply)
+    try:
+        for line in inp:
+            if not line.strip():
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:  # bad JSON or UTF-8, nesting too deep, a number too long...
+                reply = error(None, -32700, "Parse error: send one JSON-RPC message per line")
+            else:
+                reply = handle(session, msg)
+            if reply is not None:
+                emit(out, reply)
+    except (OSError, ValueError):  # the client closed the pipes (ValueError: write to a closed file)
+        pass
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -362,10 +365,13 @@ class Web(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        serve_mcp(sys.argv[1])
-    else:
-        url = f"http://127.0.0.1:{PORT}"
-        print(f"Agon arena: {url}  (Ctrl+C to stop)")
-        webbrowser.open(url)
-        ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+    try:
+        if len(sys.argv) > 1:
+            serve_mcp(sys.argv[1])
+        else:
+            url = f"http://127.0.0.1:{PORT}"
+            print(f"Agon arena: {url}  (Ctrl+C to stop)")
+            webbrowser.open(url)
+            ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+    except KeyboardInterrupt:
+        pass
