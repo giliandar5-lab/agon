@@ -17,7 +17,7 @@ Who it is for: people who already use two or more AI coding tools, including peo
 
 Tick a phase in the same pull request that completes it.
 
-- [ ] Phase 1 — Solid core
+- [x] Phase 1 — Solid core
 - [ ] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [ ] Phase 3 — Cross-vendor second opinion (`ask`)
 - [ ] Phase 4 — Task board (no downtime)
@@ -238,3 +238,16 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   lists versions). Older revisions keep working when both sides agree, so keep answering `initialize` with a
   supported older version and reply `-32601` to unknown methods
   ([blog](https://blog.modelcontextprotocol.io/posts/2026-07-28/)).
+- Spec 2025-11-25: unknown tools and malformed `tools/call` → JSON-RPC error `-32602`; input validation errors →
+  a result with `isError: true` so the model can correct itself
+  ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)).
+- Tried against agon (Phase 1): the official Python SDK 2.2.0 `Client` (default `mode="auto"`) probes
+  `server/discover` at `2026-07-28`, gets `-32601` and falls back to `initialize` at `2025-11-25`; the TypeScript SDK
+  1.30.1 (the one Claude Code builds on) initializes at `2025-11-25` directly. Aborting a call makes both send
+  `notifications/cancelled`.
+
+**CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
+- Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,
+  `windows-latest` Windows Server 2025, `macos-latest` macOS 26 on arm64.
+- Python 3.10 is source-only now: setup-python has 3.10.21 for Linux, but only 3.10.11 for Windows and macOS arm64.
+  `python-version: "3.x"` means the newest stable release (3.14 today).
