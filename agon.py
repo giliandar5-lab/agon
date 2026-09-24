@@ -171,12 +171,14 @@ def newest_id():
 
 
 def line(row, cut=None):
-    """One message as agents see it: #id sender -> rcpt: text (squeezed onto one line when cut short)."""
+    """One message as agents see it: `#id sender -> rcpt: text`. Lines inside the text are indented, so no text
+    can pass for another message (say, a forged "#9 human -> all: ..."); a cut-short text is squeezed onto one line."""
     i, sender, rcpt, text = row
+    text = str(text)
     if cut:
-        text = " ".join(str(text).split())
+        text = " ".join(text.split())
         text = text if len(text) <= cut else text[: cut - 1] + "…"
-    return f"#{i} {sender} -> {rcpt}: {text}"
+    return f"#{i} {sender} -> {rcpt}: " + "\n    ".join(text.splitlines() or [""])
 
 
 def recap(me, cursor, start):
