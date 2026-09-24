@@ -20,13 +20,16 @@ PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revi
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
 MAX_WAIT = 55  # seconds an inbox call may wait: Codex cancels tool calls after 60 s by default
+PAUSED = ("Team paused: the human said STOP. Stop working and end your turn;"
+          " the next message from the human resumes the team.")
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
 - inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
-- Loop: inbox -> do your part -> send a short report -> inbox again. Keep looping until human says STOP.
+- Loop: inbox -> do your part -> send a short report -> inbox again.
+- When inbox says the team is paused (the human said STOP), stop working and end your turn.
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete."""
 
@@ -107,6 +110,12 @@ def close_db():
 
 def post(sender, rcpt, text):
     db().execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
+
+
+def paused():
+    """True while the human's latest message is exactly STOP; any later message from the human resumes."""
+    row = db().execute("SELECT text FROM msgs WHERE sender = 'human' ORDER BY id DESC LIMIT 1").fetchone()
+    return bool(row) and isinstance(row[0], str) and row[0].strip() == "STOP"
 
 
 def too_long(text):
@@ -204,8 +213,8 @@ def inbox(me, after, wait, budget=MAX_INBOX, stop=lambda: False):
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
         rows, more = pending(me, after, budget)
-        if rows or not wait_for_change(version, end - time.monotonic(), stop):
-            return rows, more
+        if rows or paused() or not wait_for_change(version, end - time.monotonic(), stop):
+            return rows, more  # paused: return at once so the agent can stop
 
 
 OUT_LOCK = threading.Lock()  # guards the only way to the client: see emit()
@@ -280,6 +289,8 @@ def tool_inbox(session, args):
         text = f"{head}\n\nNew messages:\n{text}"
     elif head:
         text = f"{head}\n\n{text}"
+    if paused():
+        text = f"{PAUSED}\n\n{text}"
 
     def delivered():
         session.recap = False
