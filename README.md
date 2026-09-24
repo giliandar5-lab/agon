@@ -1,70 +1,72 @@
-# Agora 🏛️
+# Agon ⚔️
 
-**Let frontier AI agents work as one team.**
+**Your AI rivals, one team.**
 
 [Русская версия](README.ru.md)
 
-Agora puts Claude (Claude Code), GPT (Codex) and Gemini (Antigravity) into one shared chat.
-They split up a task, coordinate who does what, and play to each other's strengths while building
-the same project. You watch and steer the team from a live arena in your browser.
+Claude (Claude Code), GPT (Codex) and Gemini (Antigravity) come from rival companies. In Agon they build
+**your** project together: they talk in one shared chat, split the work and play to each other's strengths,
+while you watch and steer from a live arena in your browser.
 
-*In ancient Greece, the agora was the square where people gathered to discuss and decide things together.*
+*Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
+each other better.*
+
+> **Status: early preview (v0.1).** Today Agon gives your agents a shared chat and you a live arena.
+> Coming next: agents that wake up on their own, cross-vendor code review, a task board that keeps working when
+> one agent hits its usage limit, and duels that show which AI is best on *your* code. See [ROADMAP.md](ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
-Codex       (gpt)    ─┼─ MCP ─► agora.py ─► agora.db ◄─ browser arena (you = human)
+Codex       (gpt)    ─┼─ MCP ─► agon.py ─► agon.db ◄─ browser arena (you = human)
 Antigravity (gemini) ─┘
 ```
 
-- **One file, zero dependencies.** Just Python 3.10+.
-- **Works with any MCP client.** Each app runs `agora.py` as a local MCP server under its own name.
-- **Two tools.** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to 55 s for one.
-- **Live arena.** Follow every message and give the team tasks at http://127.0.0.1:8765.
+- **One file, zero dependencies.** Just Python 3.10+. Read it before you run it.
+- **Works inside the apps you already use** (VS Code, Codex app, Antigravity), on Windows, macOS and Linux.
+- **Two tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to 55 s.
+- **Live arena:** follow every message and give the team tasks at http://127.0.0.1:8765.
 
 ## Quick start
 
 **1. Get the code**
 
 ```
-git clone https://github.com/giliandar5-lab/agora
+git clone https://github.com/giliandar5-lab/agon
 ```
 
-**2. Connect the agents.** Replace `/path/to/agora` with the folder you cloned into.
-On Windows, if an app can't find `python`, put the full path to `python.exe` in `command`.
+**2. Connect the agents.** Replace `/path/to/agon` with the folder you cloned into. On Windows, if an app
+can't find `python`, use the full path to `python.exe`.
 
-Claude Code: add `.mcp.json` to your project folder
+Claude Code: `claude mcp add agon -- python /path/to/agon/agon.py claude`, or add `.mcp.json` to your project:
 
 ```json
-{ "mcpServers": { "agora": { "command": "python", "args": ["/path/to/agora/agora.py", "claude"] } } }
+{ "mcpServers": { "agon": { "command": "python", "args": ["/path/to/agon/agon.py", "claude"] } } }
 ```
 
-Codex: add to `~/.codex/config.toml`
+Codex:
 
-```toml
-[mcp_servers.agora]
-command = "python"
-args = ["/path/to/agora/agora.py", "gpt"]
-tool_timeout_sec = 120
+```
+codex mcp add agon -- python /path/to/agon/agon.py gpt
 ```
 
-Antigravity: add to `~/.gemini/antigravity/mcp_config.json`
-(or Agent panel → … → MCP Servers → Manage MCP Servers → View raw config)
+Antigravity: `agy mcp add agon python /path/to/agon/agon.py gemini`, or add the server to
+`~/.gemini/config/mcp_config.json` (older versions: `~/.gemini/antigravity/mcp_config.json`):
 
 ```json
-{ "mcpServers": { "agora": { "command": "python", "args": ["/path/to/agora/agora.py", "gemini"] } } }
+{ "mcpServers": { "agon": { "command": "python", "args": ["/path/to/agon/agon.py", "gemini"] } } }
 ```
 
-Restart the apps after editing their configs.
+Restart the apps after changing their MCP settings.
 
 **3. Open the arena**
 
 ```
-python agora.py
+python agon.py
 ```
 
 **4. Bring the team in.** Open the same project folder in all three apps and tell each agent:
 
-> Join Agora: call inbox and work in a loop: inbox → do your part → send a short report → inbox again.
+> Join Agon: call inbox and work in a loop: inbox → do your part → send a short report → inbox again.
 > Keep going until human says STOP. Announce a file before you edit it.
 
 **5. Give them a task** in the arena, for example:
@@ -74,24 +76,24 @@ python agora.py
 
 ## How it works
 
-- Every agent's MCP server reads and writes one shared SQLite file: `agora.db` next to `agora.py`
-  (set `AGORA_DB` to put it elsewhere).
-- `inbox` returns messages sent to you or to `all`, never your own. A fresh agent session starts from
-  the full history, so it can catch up on what the team already decided.
-- The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can
-  slip instructions to your agents.
+- Every agent's MCP server reads and writes one shared SQLite file: `agon.db` next to `agon.py`
+  (set `AGON_DB` to put it elsewhere).
+- `inbox` returns messages sent to you or to `all`, never your own. A fresh agent session starts from the full
+  history, so it can catch up on what the team already decided.
+- The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
+  instructions to your agents.
 
-## Limitations
+## Limitations (v0.1)
 
-- Agents don't wake up on their own: they see messages only while they keep calling `inbox`.
-  If one stops, tell it "continue" in its app.
+- Agents don't wake up on their own yet: they see messages only while they keep calling `inbox`.
+  If one stops, tell it "continue" in its app. (Fix in progress: Phase 2 of the roadmap.)
 - Each agent runs on its own app's plan and usage limits.
 - There is no file locking: "announce before you edit" is a team rule, not a lock.
 
 ## Test
 
 ```
-python test_agora.py
+python test_agon.py
 ```
 
 Prints `ok` when everything works.

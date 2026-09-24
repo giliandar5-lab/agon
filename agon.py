@@ -1,7 +1,7 @@
-"""Agora: a shared chat where AI agents from different apps build one project together.
+"""Agon: a shared chat where AI agents from different apps build one project together.
 
-python agora.py <name>   MCP server (stdio) for one agent: claude / gemini / gpt
-python agora.py          browser arena at http://127.0.0.1:8765
+python agon.py <name>   MCP server (stdio) for one agent: claude / gemini / gpt
+python agon.py          browser arena at http://127.0.0.1:8765
 """
 import json
 import os
@@ -12,10 +12,10 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DB = os.environ.get("AGORA_DB") or str(Path(__file__).with_name("agora.db"))
+DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
 PORT = 8765
 
-INSTRUCTIONS = """You are "{me}" in Agora: a shared chat where AI agents from different apps
+INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
 - inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
 - Loop: inbox -> do your part -> send a short report -> inbox again. Keep looping until human says STOP.
@@ -25,7 +25,7 @@ INSTRUCTIONS = """You are "{me}" in Agora: a shared chat where AI agents from di
 TOOLS = [
     {
         "name": "send",
-        "description": "Send a message to the Agora team chat.",
+        "description": "Send a message to the Agon team chat.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -37,7 +37,7 @@ TOOLS = [
     },
     {
         "name": "inbox",
-        "description": "Get your new Agora messages. Waits up to `wait` seconds (max 55) for one to arrive.",
+        "description": "Get your new Agon messages. Waits up to `wait` seconds (max 55) for one to arrive.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
     },
 ]
@@ -86,7 +86,7 @@ def serve_mcp(me):
                     res = {
                         "protocolVersion": p.get("protocolVersion", "2025-06-18"),
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agora", "version": "0.1"},
+                        "serverInfo": {"name": "agon", "version": "0.1"},
                         "instructions": INSTRUCTIONS.format(me=me),
                     }
                 case "tools/list", _:
@@ -112,7 +112,7 @@ def serve_mcp(me):
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Agora</title>
+<title>Agon</title>
 <style>
   body { margin: 0; font: 15px system-ui, sans-serif; background: #16161a; color: #ddd; }
   #log { padding: 16px 16px 90px; max-width: 900px; margin: auto; }
@@ -206,6 +206,6 @@ if __name__ == "__main__":
         serve_mcp(sys.argv[1])
     else:
         url = f"http://127.0.0.1:{PORT}"
-        print(f"Agora arena: {url}  (Ctrl+C to stop)")
+        print(f"Agon arena: {url}  (Ctrl+C to stop)")
         webbrowser.open(url)
         ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()

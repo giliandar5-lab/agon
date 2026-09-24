@@ -1,4 +1,4 @@
-"""Self-check: python test_agora.py  (runs three fake agents against a temporary database)"""
+"""Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
 import json
 import os
 import subprocess
@@ -6,8 +6,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-os.environ["AGORA_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
-SERVER = str(Path(__file__).with_name("agora.py"))
+os.environ["AGON_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
+SERVER = str(Path(__file__).with_name("agon.py"))
 
 
 def agent(name):
@@ -18,7 +18,7 @@ def agent(name):
         p.stdin.flush()
         return json.loads(p.stdout.readline())
 
-    assert rpc("initialize", {"protocolVersion": "2025-06-18"})["result"]["serverInfo"]["name"] == "agora"
+    assert rpc("initialize", {"protocolVersion": "2025-06-18"})["result"]["serverInfo"]["name"] == "agon"
     return lambda tool, **a: rpc("tools/call", {"name": tool, "arguments": a})["result"]["content"][0]["text"]
 
 
