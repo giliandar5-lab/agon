@@ -1,6 +1,6 @@
-# Autopilot phase (draft spec)
+# Phase 5 — Autopilot (full specification)
 
-Status: draft, researched 2026-09-24. Becomes a numbered phase in ROADMAP.md (after the Task board phase) once Phase 2 is merged. Until then this file is the full specification.
+This is Phase 5 of [ROADMAP.md](../ROADMAP.md). Researched 2026-09-24; re-verify the platform facts before coding.
 
 
 ## Goal
