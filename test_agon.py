@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 TMP = tempfile.mkdtemp()
@@ -66,4 +67,20 @@ old.close()
 fresh = dict(os.environ, AGON_DB=str(Path(TMP, "fresh.db")))  # several agents create one database at once
 starts = [subprocess.Popen([sys.executable, "-c", "import agon; agon.db()"], cwd=HERE, env=fresh) for _ in range(4)]
 assert [p.wait() for p in starts] == [0, 0, 0, 0]
+
+# 3. wait_for_change(): wakes up when another connection commits, otherwise times out
+v = agon.data_version()
+t0 = time.monotonic()
+assert not agon.wait_for_change(v, 0.3) and time.monotonic() - t0 >= 0.25
+posted = []
+threading.Timer(0.3, lambda: (posted.append(time.monotonic()), agon.post("test", "nobody", "wake up"), agon.close_db())).start()
+assert agon.wait_for_change(v, 10) and time.monotonic() - posted[0] < 1
+got = []  # an agent waiting in inbox gets a new message right away
+t = threading.Thread(target=lambda: got.append(gemini("inbox", wait=20)))
+t.start()
+time.sleep(0.5)
+t0 = time.monotonic()
+agon.post("test", "gemini", "are you there?")
+t.join(10)
+assert got and "are you there?" in got[0] and time.monotonic() - t0 < 2, got
 print("ok")
