@@ -233,7 +233,9 @@ cody.close()
 gpt.close()
 claude("send", text="while gpt was away")
 gpt = Agent("gpt")  # a new session of the same agent
-assert gpt("inbox", wait=0) == f"#{agon.cursor_of('gpt')} claude -> all: while gpt was away"  # nothing old again
+away = con.execute("SELECT id FROM msgs WHERE text = 'while gpt was away'").fetchone()[0]
+text = gpt("inbox", wait=0)
+assert text.endswith(f"New messages:\n#{away} claude -> all: while gpt was away"), text  # nothing old comes again
 agon.post("test", "zed", "for zed")
 line = b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inbox", "arguments": {}}}\n'
 agon.serve_mcp("zed", io.BytesIO(line), Gone())  # the reply can't be written...
@@ -273,6 +275,30 @@ time.sleep(0.3)
 t0 = time.monotonic()
 walt.close()  # a client that quits mid-wait doesn't leave the server waiting
 assert time.monotonic() - t0 < 5
+
+# 8. The first inbox call of a server process starts with a recap: the last 20 messages the agent knew
+ria = Agent("ria")
+text = ria("inbox", wait=0)  # a brand-new agent gets no recap: it reads the whole history instead
+assert "Recap" not in text and "hi team" in text, text
+for i in range(25):
+    agon.post("test", "all", f"note {i}: " + "x" * 300)
+while ria("inbox", wait=0) != "No new messages.":
+    pass
+ria("send", text="ria's own report")
+agon.post("gemini", "claude", "private to claude")  # others' direct messages never show up
+ria.close()
+ria = Agent("ria")
+t0 = time.monotonic()
+text = ria("inbox", wait=20)  # comes back at once, without waiting
+assert time.monotonic() - t0 < 5
+head, _, rest = text.partition("\n\n")
+lines = head.splitlines()
+assert lines[0].startswith("Recap") and len(lines) == 1 + 20, lines
+assert "note 6:" in lines[1] and "note 24:" in lines[-2] and "ria's own report" in lines[-1], lines
+assert all(len(line) < 200 for line in lines) and lines[1].endswith("…")  # cut short
+assert "private" not in text and rest == "No new messages.", text
+assert ria("inbox", wait=0) == "No new messages."  # only the first call of a process has it
+ria.close()
 
 for a in (claude, gemini, gpt):
     a.close()
