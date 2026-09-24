@@ -132,9 +132,22 @@ def inbox(me, after, wait):
             return rows
 
 
-def serve_mcp(me):
+OUT_LOCK = threading.Lock()  # guards the only way to the client: see emit()
+
+
+def emit(out, msg):
+    """Write one JSON-RPC message as one line; the lock keeps lines from different threads whole."""
+    data = json.dumps(msg).encode() + b"\n"
+    with OUT_LOCK:
+        out.write(data)
+        out.flush()
+
+
+def serve_mcp(me, inp=None, out=None):
+    """MCP server for agent `me`: one JSON-RPC message per line on stdin and stdout."""
+    inp, out = inp or sys.stdin.buffer, out or sys.stdout.buffer
     last = 0  # in-memory cursor: a fresh agent session starts from the history and catches up
-    for line in sys.stdin.buffer:
+    for line in inp:
         if not line.strip():
             continue
         req = json.loads(line)
@@ -166,11 +179,10 @@ def serve_mcp(me):
                     res = {}
                 case method, name:
                     raise ValueError(f"unknown: {method} {name or ''}")
-            out = {"jsonrpc": "2.0", "id": req["id"], "result": res}
+            reply = {"jsonrpc": "2.0", "id": req["id"], "result": res}
         except Exception as e:
-            out = {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "message": str(e)}}
-        sys.stdout.buffer.write(json.dumps(out).encode() + b"\n")
-        sys.stdout.buffer.flush()
+            reply = {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "message": str(e)}}
+        emit(out, reply)
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
