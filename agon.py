@@ -44,6 +44,12 @@ TOOLS = [
 ]
 
 
+SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new steps at the end, never edit old ones
+    "CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT,"
+    " ts TEXT DEFAULT (datetime('now', 'localtime')))",  # IF NOT EXISTS: v0.1 databases already have it
+    "CREATE TABLE agents(name TEXT PRIMARY KEY, client TEXT, cursor INTEGER NOT NULL DEFAULT 0,"
+    " last_seen REAL, autoruns INTEGER NOT NULL DEFAULT 0, out_of_quota_until REAL)",  # times: Unix seconds
+]
 _local = threading.local()
 
 
@@ -55,12 +61,26 @@ def db():
         con = sqlite3.connect(DB, timeout=5, isolation_level=None)
         con.execute("PRAGMA journal_mode=WAL")  # readers and the writer don't block each other
         con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT,"
-            " ts TEXT DEFAULT (datetime('now', 'localtime')))"
-        )
+        migrate(con)
         _local.con = con
     return con
+
+
+def migrate(con):
+    """Apply the SCHEMA steps this database doesn't have yet; safe when several agents start at once."""
+    if con.execute("PRAGMA user_version").fetchone()[0] >= len(SCHEMA):
+        return
+    con.execute("BEGIN IMMEDIATE")  # one process migrates, the others wait for it and then skip
+    try:
+        done = con.execute("PRAGMA user_version").fetchone()[0]
+        for step in SCHEMA[done:]:
+            con.execute(step)
+        if done < len(SCHEMA):  # a newer agon may have gone further: never lower the version
+            con.execute(f"PRAGMA user_version = {len(SCHEMA)}")
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
 
 
 def close_db():
