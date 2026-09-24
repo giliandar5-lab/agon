@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -43,20 +44,35 @@ TOOLS = [
 ]
 
 
+_local = threading.local()
+
+
 def db():
-    con = sqlite3.connect(DB, timeout=5)  # timeout=5 is busy_timeout=5000
-    con.execute("PRAGMA journal_mode=WAL")  # readers and the writer don't block each other
-    con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT,"
-        " ts TEXT DEFAULT (datetime('now', 'localtime')))"
-    )
+    """This thread's connection to agon.db (SQLite connections must stay in the thread that made them)."""
+    con = getattr(_local, "con", None)
+    if con is None:
+        # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
+        con = sqlite3.connect(DB, timeout=5, isolation_level=None)
+        con.execute("PRAGMA journal_mode=WAL")  # readers and the writer don't block each other
+        con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT,"
+            " ts TEXT DEFAULT (datetime('now', 'localtime')))"
+        )
+        _local.con = con
     return con
 
 
+def close_db():
+    """Close this thread's connection, for threads that end (like the arena's request threads)."""
+    con = getattr(_local, "con", None)
+    if con is not None:
+        _local.con = None
+        con.close()
+
+
 def post(sender, rcpt, text):
-    with db() as con:
-        con.execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
+    db().execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
 
 
 def inbox(me, after, wait):
@@ -172,6 +188,12 @@ class Web(BaseHTTPRequestHandler):
         if self.headers.get("Host") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
             return True
         self.send_error(403)
+
+    def handle(self):
+        try:
+            super().handle()
+        finally:
+            close_db()  # every request runs in a new thread with its own connection
 
     def do_GET(self):
         if not self.local():
