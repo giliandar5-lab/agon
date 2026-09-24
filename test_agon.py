@@ -666,6 +666,33 @@ for name, command, shell in (
     assert p.returncode == 0 and f"plugin hook for {name}" in json.loads(p.stdout)["reason"], (name, p)
 say.close()
 
+# Phase 2, 13. `agon.py setup` finds claude, codex and agy on PATH and prints the commands and the hook snippets, with
+# absolute paths to Python and agon.py. It writes nothing: Agon never edits the apps' config files
+bin_dir, setup_home = Path(TMP, "bin"), Path(TMP, "setup-home")
+bin_dir.mkdir()
+setup_home.mkdir()
+fake = bin_dir / ("claude.bat" if windows else "claude")  # a claude CLI on PATH; codex and agy aren't there
+fake.write_text("@echo off\n" if windows else "#!/bin/sh\n")
+fake.chmod(0o755)
+env = {k: v for k, v in os.environ.items() if k != "AGON_DB"}
+env |= {"PATH": str(bin_dir), "HOME": str(setup_home), "USERPROFILE": str(setup_home)}
+for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db"))}):
+    p = subprocess.run([sys.executable, SERVER, "setup"], env=env | extra, capture_output=True, text=True, timeout=60)
+    out, script = p.stdout, str(Path(SERVER).resolve())
+    assert p.returncode == 0 and p.stderr == "", p
+    assert f"claude is {fake}".lower() in out.lower() and "codex isn't on PATH" in out and "agy isn't on PATH" in out
+    assert f"Python  {sys.executable}" in out and f"Agon    {script}" in out and f"python={sys.executable}" in out
+    snippets = [json.loads(line) for line in out.splitlines() if line.startswith("  {")]
+    assert len(snippets) == 3, out  # Claude Code, Codex and Antigravity
+    [claude_hook] = snippets[0]["hooks"]["StopFailure"][0]["hooks"]
+    assert claude_hook == {"type": "command", "command": sys.executable, "args": [script, "hook", "claude"],
+                           "timeout": 60}  # exec form: no shell, so no quoting to get wrong
+    for snippet, name in ((snippets[1]["hooks"]["Stop"][0]["hooks"][0], "gpt"),
+                          (snippets[2]["agon"]["Stop"][0], "gemini")):
+        assert script in snippet["command"] and snippet["command"].endswith(f"hook {name}"), snippet
+    assert ("--env AGON_DB=" in out) == bool(extra)  # Codex passes only the variables it is told to
+    assert not any(setup_home.iterdir()) and not Path(TMP, "team2.db").exists()  # nothing written, no database
+
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
 # (Claude Code drops channel events silently when the channel isn't loaded), and nobody else gets one
