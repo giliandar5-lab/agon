@@ -8,6 +8,7 @@ from pathlib import Path
 
 os.environ["AGON_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
 SERVER = str(Path(__file__).with_name("agon.py"))
+import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line above)
 
 
 def agent(name):
@@ -31,4 +32,10 @@ assert "hi team 👋" in g and "secret" not in g, g  # sees broadcasts, not othe
 assert gemini("inbox", wait=0) == "No new messages."  # cursor moved on
 assert "secret for gpt" in gpt("inbox", wait=0)
 assert claude("inbox", wait=0) == "No new messages."  # own messages never come back
+
+# 1. Storage: WAL, busy timeout, synchronous=NORMAL
+con = agon.db()
+assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+assert con.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+assert con.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
 print("ok")
