@@ -62,6 +62,7 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     " ts TEXT DEFAULT (datetime('now', 'localtime')))",  # IF NOT EXISTS: v0.1 databases already have it
     "CREATE TABLE agents(name TEXT PRIMARY KEY, client TEXT, cursor INTEGER NOT NULL DEFAULT 0,"
     " last_seen REAL, autoruns INTEGER NOT NULL DEFAULT 0, out_of_quota_until REAL)",  # times: Unix seconds
+    "CREATE INDEX msgs_by_sender ON msgs(sender, id)",  # paused() finds the human's latest message at once
 ]
 _local = threading.local()
 
@@ -228,13 +229,15 @@ def pending(me, after, budget):
 
 
 def inbox(me, after, wait, budget=MAX_INBOX, stop=lambda: False):
-    """Wait up to `wait` s for messages to `me` after id `after`: (the ones that fit in `budget`, how many more)."""
+    """Wait up to `wait` s for messages to `me` after id `after`: (the ones that fit in `budget`, how many more
+    wait, whether the team is paused). A pause ends the wait at once, so the agent can stop."""
     end = time.monotonic() + min(wait, MAX_WAIT)
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
         rows, more = pending(me, after, budget)
-        if rows or paused() or not wait_for_change(version, end - time.monotonic(), stop):
-            return rows, more  # paused: return at once so the agent can stop
+        halted = paused()
+        if rows or halted or not wait_for_change(version, end - time.monotonic(), stop):
+            return rows, more, halted
 
 
 OUT_LOCK = threading.Lock()  # guards the only way to the client: see emit()
@@ -304,7 +307,7 @@ def tool_inbox(session, args):
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
     wait = 0 if head or not wait > 0 else wait  # a recap comes back at once; NaN means no wait
-    rows, more = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
+    rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
     text = "\n".join(line(row) for row in rows) or "No new messages."
     if more:
         text += f"\n{more} more — call inbox again."
@@ -312,7 +315,7 @@ def tool_inbox(session, args):
         text = f"{head}\n\nNew messages:\n{text}"
     elif head:
         text = f"{head}\n\n{text}"
-    if paused():
+    if halted:
         text = f"{PAUSED}\n\n{text}"
 
     def delivered():
