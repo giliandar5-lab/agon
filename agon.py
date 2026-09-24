@@ -95,17 +95,34 @@ def post(sender, rcpt, text):
     db().execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
 
 
+def data_version():
+    """A number that changes whenever another connection commits to agon.db."""
+    return db().execute("PRAGMA data_version").fetchone()[0]
+
+
+def wait_for_change(since, timeout):
+    """True once another connection commits after data_version() returned `since`, False after `timeout` s.
+    One cheap PRAGMA every 0.2 s: near-zero CPU, at most 0.2 s latency."""
+    end = time.monotonic() + timeout
+    while data_version() == since:
+        left = end - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(0.2, left))
+    return True
+
+
 def inbox(me, after, wait):
-    deadline = time.time() + min(wait, 55)  # Codex cancels tool calls after 60 s by default
+    end = time.monotonic() + min(wait, 55)  # Codex cancels tool calls after 60 s by default
     while True:
+        version = data_version()  # read before the query: a message committed right after it still wakes us
         rows = db().execute(
             "SELECT id, sender, rcpt, text FROM msgs"
             " WHERE id > ? AND sender != ? AND rcpt IN ('all', ?) ORDER BY id LIMIT 50",
             (after, me, me),
         ).fetchall()
-        if rows or time.time() >= deadline:
+        if rows or not wait_for_change(version, end - time.monotonic()):
             return rows
-        time.sleep(1)
 
 
 def serve_mcp(me):
