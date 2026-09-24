@@ -147,6 +147,7 @@ for version in ("2026-07-28", "1999-01-01", 5, None):  # 2026-07-28 is stateless
     assert vera.rpc("initialize", params)["result"]["protocolVersion"] == "2025-11-25"
 vera.close()
 
+
 # 13. Error codes: parse error -32700 (id null), not a request -32600, unknown method -32601, bad params -32602
 def code(reply):
     return reply["id"], reply["error"]["code"]
@@ -184,7 +185,7 @@ def locked(*args):
 
 
 agon.post, real_post = locked, agon.post  # a failure inside the tool itself
-res, after = agon.call_tool(agon.Session("tess", io.BytesIO()), {"name": "send", "arguments": {"text": "hi"}})
+res, _ = agon.call_tool(agon.Session("tess", io.BytesIO()), {"name": "send", "arguments": {"text": "hi"}})
 agon.post = real_post
 assert res["isError"] is True and "database is locked" in res["content"][0]["text"], res
 
