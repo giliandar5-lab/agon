@@ -17,6 +17,7 @@ from pathlib import Path
 DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
 PORT = 8765
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
+MAX_TEXT = 8000  # characters in one message
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
 
@@ -104,6 +105,13 @@ def close_db():
 
 def post(sender, rcpt, text):
     db().execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
+
+
+def too_long(text):
+    """Why `text` can't be one message, or None when it can."""
+    if len(text) > MAX_TEXT:
+        return (f"The message is {len(text):,} characters; the limit is {MAX_TEXT:,}."
+                " Put long content in a file and send its path.")
 
 
 def touch(me, client=None):
@@ -231,6 +239,8 @@ def tool_send(session, args):
         raise ToolError("Nothing sent: `text` must be a non-empty string.")
     if not isinstance(to, str) or not to.strip():
         raise ToolError("Nothing sent: `to` must be all, human or an agent name such as claude, gemini or gpt.")
+    if problem := too_long(text):
+        raise ToolError(f"Nothing sent: {problem}")
     post(session.me, to.strip(), text)
     return "Sent.", None
 
@@ -438,9 +448,9 @@ loop();
 f.onsubmit = async e => {
   e.preventDefault();
   if (!t.value.trim()) return;
-  await fetch('/msgs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({ to: to.value, text: t.value }) });
-  t.value = '';
+  const r = await fetch('/msgs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                   body: JSON.stringify({ to: to.value, text: t.value }) });
+  if (r.ok) t.value = ''; else alert(await r.text());
 };
 </script>"""
 
@@ -480,10 +490,26 @@ class Web(BaseHTTPRequestHandler):
             return
         if self.headers.get("Content-Type") != "application/json":
             return self.send_error(415)
-        msg = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        post("human", msg.get("to", "all"), msg["text"])
+        try:
+            msg = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
+            text, to = msg["text"], msg.get("to", "all")
+        except Exception:
+            text = to = None
+        if not isinstance(text, str) or not text.strip() or not isinstance(to, str) or not to.strip():
+            return self.answer(400, 'Send JSON like {"to": "all", "text": "..."}.')
+        if problem := too_long(text):
+            return self.answer(413, problem)
+        post("human", to.strip(), text)
         self.send_response(204)
         self.end_headers()
+
+    def answer(self, code, text):
+        body = text.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *args):
         pass

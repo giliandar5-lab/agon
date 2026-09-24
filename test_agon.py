@@ -1,4 +1,5 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
+import http.client
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 TMP = tempfile.mkdtemp()
@@ -299,6 +301,33 @@ assert all(len(line) < 200 for line in lines) and lines[1].endswith("…")  # cu
 assert "private" not in text and rest == "No new messages.", text
 assert ria("inbox", wait=0) == "No new messages."  # only the first call of a process has it
 ria.close()
+
+# 9. A message is at most 8,000 characters, from agents and from the arena alike
+sam = Agent("sam")
+res = sam.call("send", text="x" * 8001)
+assert res["isError"] is True and "Put long content in a file and send its path." in res["content"][0]["text"], res
+assert "isError" not in sam.call("send", text="y" * 8000)
+assert con.execute("SELECT COUNT(*) FROM msgs WHERE sender = 'sam'").fetchone()[0] == 1  # only the one that fit
+arena = ThreadingHTTPServer(("127.0.0.1", 0), agon.Web)
+agon.PORT = arena.server_port  # the arena checks the Host header against its port
+threading.Thread(target=arena.serve_forever, daemon=True).start()
+
+
+def arena_post(body):
+    c = http.client.HTTPConnection("127.0.0.1", agon.PORT, timeout=10)
+    c.request("POST", "/msgs", body=body, headers={"Content-Type": "application/json"})
+    r = c.getresponse()
+    status, text = r.status, r.read().decode()
+    c.close()
+    return status, text
+
+
+status, text = arena_post(json.dumps({"to": "all", "text": "z" * 8001}))
+assert status == 413 and "Put long content in a file and send its path." in text, (status, text)
+assert arena_post(json.dumps({"to": "sam", "text": "hello from the arena"}))[0] == 204
+assert arena_post(b"{broken")[0] == 400 and arena_post(json.dumps({"to": "all"}))[0] == 400
+arena.shutdown()
+arena.server_close()
 
 for a in (claude, gemini, gpt):
     a.close()
