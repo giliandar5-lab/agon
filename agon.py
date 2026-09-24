@@ -51,6 +51,8 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete; put long content in a file and send its path."""
 
+# Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
+LOCAL = {"destructiveHint": False, "openWorldHint": False}
 TOOLS = [
     {
         "name": "send",
@@ -64,6 +66,7 @@ TOOLS = [
             },
             "required": ["text"],
         },
+        "annotations": LOCAL,
     },
     {
         "name": "inbox",
@@ -71,6 +74,7 @@ TOOLS = [
         " A new session starts with a recap of earlier messages; a long backlog comes in parts;"
         " says when the human has paused the team.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
+        "annotations": LOCAL,
     },
 ]
 

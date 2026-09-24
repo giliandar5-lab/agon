@@ -663,6 +663,8 @@ for a in (cleo, dora, vic):
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
 assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox"]
+for tool in json.loads(raw)["result"]["tools"]:  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
+    assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
 sam.close()
 
 # 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons
