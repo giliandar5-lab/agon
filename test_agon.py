@@ -779,6 +779,33 @@ with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
 if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
     with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
         f.write(f"written by {app}\n")
+if "ATTACK " in prompt:  # a reviewer that ignores "don't change any files": it reports what it sees, then changes
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    target = prompt.split("ATTACK ", 1)[1].split()[0]  # all, the file the prompt names by its full path too
+    def read(name):
+        path = os.path.join(top, name)
+        return open(path, encoding="utf-8").read().strip() if os.path.exists(path) else None
+    def git(*args):
+        return subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", *args], cwd=top,
+                              capture_output=True, text=True).stdout.rstrip()
+    seen = {"app.py": read("app.py"), "sub/lib.py": read("sub/lib.py"), "old.txt": read("old.txt"),
+            "new.txt": read("new.txt"), "debug.log": read("debug.log"), "status": git("status", "--porcelain"),
+            "remotes": git("remote"), "refs": git("for-each-ref", "--format=%(refname)"),
+            "head": git("rev-parse", "--symbolic-full-name", "HEAD"), "target": target.replace("\\", "/")}
+    for name in ("app.py", "new.txt", "evil.txt", "debug.log", "sub/lib.py", target):
+        with open(os.path.join(top, name), "w", encoding="utf-8") as f:
+            f.write("HACKED\n")
+    os.remove(os.path.join(top, "sub", "lib.py"))
+    git("add", "-A")
+    git("commit", "-qm", "evil")
+    git("branch", "evil")
+    git("tag", "evil")
+    git("config", "user.name", "evil")
+    open(os.path.join(top, "app.py"), "w").write("HACKED AGAIN\n")
+    git("stash")
+    seen["after"] = read("app.py"), git("log", "-1", "--format=%s"), git("stash", "list")
+    print(json.dumps({"conversation_id": "c", "status": "SUCCESS", "response": json.dumps(seen)}))
+    sys.exit()
 if app in os.environ.get("FAKE_LIMIT", "").split(","):  # the usage limit as each app reports it
     if app == "claude":
         print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
@@ -821,8 +848,19 @@ APPS = {"claude": "claude", "gpt": "codex", "gemini": "agy"}
 ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT))
 for name, app in APPS.items():  # the default command, with the fake in place of the app
     ASK[f"AGON_CMD_{name.upper()}"] = json.dumps([sys.executable, str(FAKE), app, *agon.COMMANDS[name][1:]])
-project = Path(TMP, "project")
+project, plain = Path(TMP, "project"), Path(TMP, "plain")  # a git repository with a commit, and a folder that isn't
 project.mkdir()
+plain.mkdir()
+
+
+def git_in(folder, *args):
+    return subprocess.run(["git", *args], cwd=folder, capture_output=True, text=True, check=True).stdout.strip()
+
+
+(project / "README.md").write_text("A project to review.\n")
+git_in(project, "init", "-q")
+git_in(project, "add", "-A")
+git_in(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
 
 
 def fake_runs():
@@ -869,13 +907,20 @@ rev = Agent("rev", env=ASK)
 for name, app in APPS.items():
     res, text = asked(rev, agent=name, prompt="Please review utils.py 🙂", cwd=str(project))
     run = fake_runs()[-1]
+    where = run["args"][run["args"].index("--add-dir") + 1] if name == "gemini" else str(project)
     template = [*agon.COMMANDS[name][1:], *agon.MODE_ARGS["review"][name]]
-    assert run["args"] == [a.replace("{prompt}", run["prompt"]).replace("{cwd}", str(project)) for a in template], run
+    assert run["args"] == [a.replace("{prompt}", run["prompt"]).replace("{cwd}", where) for a in template], run
     assert run["via"] == ("args" if name == "gemini" else "stdin") and run["asked_by"] == "rev", run
     assert "Review only: don't change any files." in run["prompt"] and run["prompt"].endswith("review utils.py 🙂")
-    assert "VERDICT: approve, or VERDICT: changes" in run["prompt"] and Path(run["cwd"]).resolve() == project.resolve()
+    assert "VERDICT: approve, or VERDICT: changes" in run["prompt"]
+    assert ("You work in a throwaway copy of the project" in run["prompt"]) == (name in agon.REVIEW_COPY), run["prompt"]
+    if name in agon.REVIEW_COPY:  # agy can't be held to read-only: it reviews a copy, which is gone afterwards
+        assert Path(where).resolve() == Path(run["cwd"]).resolve() != project.resolve() and not Path(where).exists()
+    else:
+        assert Path(run["cwd"]).resolve() == project.resolve()
     assert "isError" not in res and text.startswith(f"{name} answered in "), text
-    assert f"s (review, VERDICT: approve):\n\n{app} looked at project: 3 tests passed.\nVERDICT: approve" in text, text
+    looked = f"{app} looked at {Path(run['cwd']).name}: 3 tests passed.\nVERDICT: approve"
+    assert f"s (review, VERDICT: approve):\n\n{looked}" in text, text
     assert re.fullmatch(rf"rev asked {name} for a review: {name} answered in \d+s, VERDICT: approve\.", agon_said())
 res, text = asked(rev, agent="gpt", prompt="PLAIN, please", cwd=str(project))  # no JSON: the output is the answer
 assert "isError" not in res and text.endswith(" (review, no verdict):\n\nplain words, no JSON"), text
@@ -914,7 +959,7 @@ repo = Path(TMP, "repo")
 
 
 def in_repo(*args):
-    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+    return git_in(repo, *args)
 
 
 in_repo("init", "-q")
@@ -954,9 +999,96 @@ assert agon_said().startswith("rev asked claude for a task: claude finished in "
 empty_repo = Path(TMP, "empty-repo")
 empty_repo.mkdir()
 subprocess.run(["git", "init", "-q"], cwd=empty_repo, check=True)
-for where, why in ((project, f"{project} isn't in a git repository"), (empty_repo, "this repository has none yet")):
+for where, why in ((plain, f"{plain} isn't in a git repository."), (empty_repo, "this repository has no commit yet.")):
     res, text = asked(rev, agent="gpt", prompt="EDIT x.txt", mode="task", cwd=str(where))
-    assert res["isError"] is True and text.startswith("Nothing asked: a task ") and why in text, text
+    assert res["isError"] is True and text.startswith("Nothing asked: a task ") and text.endswith(why), text
+
+# Phase 3, a review never changes the user's files. agy's --mode plan only puts /plan before the prompt: only its
+# permission settings stop a write, and 1.2.10 writes in a temporary folder or where a write_file rule allows it, even
+# in a review. So a gemini review works in a throwaway copy: a clone with the user's branches, tags, HEAD and index,
+# and the files as they are, uncommitted changes and new files included. A fake agy that ignores "don't change any
+# files" (it rewrites, adds and deletes files, the one the prompt names by its full path too, commits, branches, tags,
+# stashes and changes the git config) changes only the copy: the user's files, index, refs, stash and config stay
+work = Path(TMP, "work")
+(work / "sub").mkdir(parents=True)
+git_in(work, "init", "-q")
+for name, content in ((".gitignore", "*.log\n"), ("app.py", "v1\n"), ("old.txt", "old\n"), ("sub/lib.py", "lib v1\n")):
+    (work / name).write_text(content)
+git_in(work, "add", "-A")
+git_in(work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+git_in(work, "branch", "agon/claude-1")  # a branch to review, say
+git_in(work, "tag", "v1")
+(work / "app.py").write_text("v2, not committed\n")  # changed
+(work / "sub" / "lib.py").write_text("lib v2, staged\n")
+git_in(work, "add", "sub/lib.py")  # staged
+(work / "old.txt").unlink()  # deleted
+(work / "new.txt").write_text("brand new\n")  # not tracked yet
+(work / "debug.log").write_text("ignored\n")  # left out by .gitignore
+
+
+def state(folder):  # all a review must leave alone: every file (bytes), the index, refs, stash, worktrees and config
+    files = {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(folder).parts}
+    return files, [git_in(folder, *args) for args in (("status", "--porcelain"), ("ls-files", "--stage"),
+                                                       ("for-each-ref",), ("stash", "list"), ("worktree", "list"),
+                                                       ("config", "--local", "--list"))]
+
+
+before = state(work)
+res, text = asked(rev, agent="gemini", prompt=f"ATTACK {work / 'notes.txt'} and review it", cwd=str(work / "sub"))
+run = fake_runs()[-1]
+assert "isError" not in res and state(work) == before, text  # the user's repository is exactly as it was
+sent = Path(run["prompt"].split("ATTACK ", 1)[1].split()[0])  # the path in the prompt led into the copy,
+assert sent.name == "notes.txt" and sent.parent.name.startswith("agon-review-gemini-"), run["prompt"]
+seen = json.loads(text.split(":\n\n", 1)[1])
+assert seen["target"] == (work / "notes.txt").as_posix(), seen  # and the answer's paths lead back to the user's
+assert seen["app.py"] == "v2, not committed" and seen["sub/lib.py"] == "lib v2, staged", seen  # the copy had the
+assert seen["new.txt"] == "brand new" and seen["old.txt"] is None and seen["debug.log"] is None, seen  # user's files,
+assert seen["status"].splitlines() == [" M app.py", " D old.txt", "M  sub/lib.py", "?? new.txt"], seen  # as git sees
+assert seen["status"].strip() == git_in(work, "status", "--porcelain"), seen  # them in the user's repository, with
+assert seen["refs"] == git_in(work, "for-each-ref", "--format=%(refname)"), seen  # the same branches, tags and HEAD
+assert seen["head"] == git_in(work, "rev-parse", "--symbolic-full-name", "HEAD") and "refs/heads/" in seen["head"]
+assert seen["remotes"] == "" and seen["after"][:2] == ["HACKED", "evil"] and seen["after"][2].startswith("stash@{0}")
+assert Path(run["cwd"]).name == "sub" and not Path(run["cwd"]).exists()  # it ran in the copy's sub, which is gone
+res, text = asked(rev, agent="gemini", prompt="hi", cwd=str(plain))
+assert res["isError"] is True and text == ("Can't run gemini's review: it works in a throwaway copy of your git"
+                                           f" repository, and {plain} isn't in a git repository."), text
+lone = Path(TMP, "lone")  # a detached HEAD stays detached in the copy
+lone.mkdir()
+git_in(lone, "init", "-q")
+(lone / "a.txt").write_text("a\n")
+git_in(lone, "add", "-A")
+git_in(lone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+git_in(lone, "checkout", "-q", "--detach")
+copy, folder = agon.review_copy(git_in(lone, "rev-parse", "--show-toplevel"), str(lone), "gemini")
+assert folder == copy and git_in(Path(copy), "rev-parse", "--symbolic-full-name", "HEAD") == "HEAD"
+assert git_in(Path(copy), "rev-parse", "HEAD") == git_in(lone, "rev-parse", "HEAD") and not git_in(Path(copy), "status",
+                                                                                                "--porcelain")
+agon.rmtree(copy)
+assert not Path(copy).exists()
+if os.name != "nt":  # a link that stays in the repository comes as it is; one that leads out stays out of the copy,
+    Path(TMP, "outside.txt").write_text("the user's\n")  # so a write at its place there doesn't reach the user's file
+    for name, to in (("in.txt", "a.txt"), ("out.txt", Path(TMP, "outside.txt")), ("up.txt", "../outside.txt"),
+                     ("loop", "loop")):
+        (lone / name).symlink_to(to)
+    copy, _ = agon.review_copy(git_in(lone, "rev-parse", "--show-toplevel"), str(lone), "gemini")
+    assert os.readlink(Path(copy, "in.txt")) == "a.txt" and (Path(copy) / "in.txt").read_text() == "a\n"
+    for name in ("out.txt", "up.txt"):
+        assert not os.path.lexists(Path(copy, name)), name
+        Path(copy, name).write_text("HACKED\n")
+    assert Path(TMP, "outside.txt").read_text() == "the user's\n"
+    agon.rmtree(copy)
+top, copy = Path(TMP, "proj"), Path(TMP, "proj", "copy")
+said = f"{top}{os.sep}app.py, {top.as_posix()}/lib.py and {top}. Not {top}2, {top}.old, {top}-web or x{top}."
+assert agon.repath(said, [str(top)], str(copy)) == (f"{copy}{os.sep}app.py, {copy.as_posix()}/lib.py and {copy}."
+                                                    f" Not {top}2, {top}.old, {top}-web or x{top}.")
+if os.name == "nt":
+    assert agon.repath(f"{str(top).upper()}\\a", [str(top)], str(copy)) == f"{copy}\\a"
+else:  # the repository's folder as the path to cwd spells it: through a link here
+    link = Path(TMP, "link")
+    link.symlink_to(work)
+    assert agon.spelled(str(work.resolve()), str(link / "sub")) == str(link)
+assert agon.spelled(str(work), str(work / "sub")) == str(work) == agon.spelled(str(work), str(plain))
 
 # Phase 3, 7. An agent that is out of quota, or whose app reports a usage limit, is marked (and the team told), and
 # the next agent in AGON_FALLBACK (claude,gpt,gemini) answers instead; the reply says who answered. Never the asker
@@ -1234,6 +1366,11 @@ for readme in ("README.md", "README.ru.md"):
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
             assert f"`{' '.join(args)}`" in text, (readme, name, args)
+# They say gemini reviews a throwaway copy, what stays out of it, and where a copy may stay behind
+for readme, copy in (("README.md", "gemini\n  reviews a throwaway copy of your git repository"),
+                     ("README.ru.md", "gemini проверяет одноразовую копию твоего git-репозитория")):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert copy in text and "`.gitignore`" in text and "`agon-review-gemini-...`" in text, readme
 assert "- [x] Phase 3 — Cross-vendor second opinion (`ask`)" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
 for a in (claude, gemini, gpt):

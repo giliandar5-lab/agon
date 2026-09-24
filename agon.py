@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -68,12 +69,18 @@ MODE_ARGS = {  # added at the end: a review only reads, a task writes (in a git 
              "gemini": ["--mode", "accept-edits"]},
 }
 REVIEW = """{asker} asks you for a code review through Agon, where AI agents from different companies build one project.
-Review only: don't change any files. Run the project's tests and cite the commands you ran and what they printed.
+Review only: don't change any files.{copy} Run the project's tests and cite the commands you ran and what they printed.
 Your final message is the answer; don't use Agon's tools (send, inbox, ask).
 End it with one line: VERDICT: approve, or VERDICT: changes.
 
 What {asker} asks:
 {prompt}"""
+# Claude Code's plan mode and Codex's read-only sandbox keep a reviewer from editing the files. agy's --mode plan only
+# puts /plan before the prompt: only its permission settings stop a write, and 1.2.10 writes in a temporary folder or
+# where a write_file rule allows it, even during a review. So its reviews work in a throwaway copy of the project
+REVIEW_COPY = {"gemini"}
+COPY = (" You work in a throwaway copy of the project that has its uncommitted changes; what .gitignore leaves out,"
+        " such as installed dependencies, and links that lead out of the project aren't in it.")
 TASK = """{asker} asks you to do a task through Agon, where AI agents from different companies build one project.
 You work in a git worktree of your own. When you finish, Agon commits what you changed to branch {branch}, and
 {asker} decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, ask).
@@ -673,10 +680,11 @@ def verdict(answer):
     return found[-1].lower() if found else None
 
 
-def git(cwd, *args):
-    """Run git in folder `cwd` and return what it printed; ToolError with git's own words when it fails."""
-    p = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+def git(cwd, *args, feed=None):
+    """Run git in folder `cwd`, with `feed` on its stdin, and return what it printed; ToolError with git's own words
+    when it fails."""
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW, **({"stdin": subprocess.DEVNULL} if feed is None else {"input": feed}))
     if p.returncode:
         command = next(a for a in args if not a.startswith("-") and "=" not in a)  # commit, not the -c before it
         raise ToolError(f"git {command} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
@@ -684,19 +692,83 @@ def git(cwd, *args):
 
 
 def repository(cwd):
-    """The top folder of the git repository that `cwd` is in, which must have a commit to start a task from."""
+    """The top folder of the git repository that `cwd` is in, which has a commit; else a ToolError that says why."""
     if not shutil.which("git"):
-        raise ToolError("Nothing asked: a task works on a git branch, and there is no git on Agon's PATH.")
+        raise ToolError("there is no git on Agon's PATH")
     try:
         top = git(cwd, "rev-parse", "--show-toplevel")
     except ToolError:
-        raise ToolError(f"Nothing asked: a task works on a git branch, and {cwd} isn't in a git repository.") from None
+        raise ToolError(f"{cwd} isn't in a git repository") from None
     try:
         git(top, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
     except ToolError:
-        raise ToolError("Nothing asked: a task starts from your last commit, and this repository has none"
-                        " yet.") from None
+        raise ToolError("this repository has no commit yet") from None
     return top
+
+
+def rmtree(path):
+    """Delete a folder Agon made, read-only files too (git makes some on Windows). Best effort."""
+    def writable(func, name, _):
+        os.chmod(name, stat.S_IWRITE)
+        func(name)
+
+    try:
+        shutil.rmtree(path, **{"onexc" if sys.version_info >= (3, 12) else "onerror": writable})
+    except OSError:  # a file still in use (Windows): it stays in the temporary folder
+        pass
+
+
+def review_copy(top, cwd, name):
+    """A throwaway copy of the repository at `top` for agent `name`'s review, where git shows what it shows in the
+    user's: the same branches, tags and HEAD (a clone that borrows the history), the same index, and the files as they
+    are now, uncommitted changes and new files included (what .gitignore leaves out stays out, and so do links that
+    lead out of the repository). It has no remote, and the user's repository is only read, whatever the reviewer does
+    in the copy, git included (a worktree would share the branches, the stash and the config). Returns (the copy, its
+    folder that matches `cwd`)."""
+    path = tempfile.mkdtemp(prefix=f"agon-review-{name}-")
+    try:
+        git(path, "clone", "-q", "--mirror", "--shared", top, ".git")  # every ref, not the user's hooks or config
+        git(path, "config", "core.bare", "false")
+        git(path, "config", "--remove-section", "remote.origin")  # nothing in the copy leads back to the user's
+        head = git(top, "rev-parse", "--symbolic-full-name", "HEAD")  # refs/heads/<branch>, or HEAD when detached
+        if head.startswith("refs/"):
+            git(path, "symbolic-ref", "HEAD", head)
+        else:
+            git(path, "update-ref", "--no-deref", "HEAD", git(top, "rev-parse", "HEAD"))
+        git(path, "update-index", "-z", "--index-info", feed=git(top, "ls-files", "-z", "--stage"))  # what's staged
+        inside = Path(os.path.realpath(top))
+        for file in filter(None, git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0")):
+            source, target = Path(top, file), Path(path, file)
+            if source.is_symlink() and not Path(os.path.realpath(source)).is_relative_to(inside):
+                continue  # a link out of the repository stays out: a write through it would reach the user's files
+            if source.is_file() or source.is_symlink():  # not a file the user deleted
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(source, target, follow_symlinks=False)
+                except OSError:  # a file that just went, or a link Windows won't make: the review goes on
+                    pass
+            elif source.is_dir():  # a submodule or another repository inside: an empty folder, as if not cloned
+                target.mkdir(parents=True, exist_ok=True)
+    except BaseException:
+        rmtree(path)
+        raise
+    return path, same_folder(top, path, cwd)
+
+
+def spelled(top, cwd):
+    """The top folder of the repository, `top` as git gives it, as the path to `cwd` spells it: through a link, with a
+    Windows short name... (or `top` when it can't)."""
+    real, path = Path(top).resolve(), Path(os.path.abspath(cwd))
+    return str(next((folder for folder in (path, *path.parents) if folder.resolve() == real), Path(top)))
+
+
+def repath(text, olds, new):
+    """`text` with the paths into any of the folders `olds` pointing into folder `new` instead, in the same slashes
+    (on Windows either, in any case). Whole folder names only: /a/proj isn't in /a/project, /a/proj.old or /b/a/proj."""
+    forms = dict.fromkeys(form for old in olds for form in (str(Path(old)), Path(old).as_posix()))
+    return re.sub(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])",
+                  lambda found: str(Path(new)) if "\\" in found.group() else Path(new).as_posix(), text,
+                  flags=re.I if os.name == "nt" else 0)
 
 
 def new_worktree(top, name):
@@ -783,8 +855,24 @@ def fallbacks(agent, asker):
 def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
     """Agent `name`'s go at an ask: (its answer or None, why it failed or None, the texts that show a usage limit or
     None, the branch that holds a task's work or None, its diff stat or None)."""
+    if mode == "review" and name in REVIEW_COPY:  # its app can't be held to read-only: it reviews a throwaway copy
+        try:
+            source = repository(cwd)
+        except ToolError as e:
+            raise ToolError(f"Can't run {name}'s review: it works in a throwaway copy of your git repository, and"
+                            f" {e}.") from None
+        mine = spelled(source, cwd)
+        copy, folder = review_copy(source, cwd, name)
+        try:  # the paths into the user's repository in the prompt lead into the copy, and back in what it says
+            back = [copy, os.path.realpath(copy)]
+            text = repath(REVIEW.format(asker=asker, prompt=prompt, copy=COPY), [source, mine], copy)
+            answer, problem, limit = ask_run(asker, name, mode, text, folder, end, stopped)
+        finally:
+            rmtree(copy)  # and with it whatever the reviewer changed
+        return answer and repath(answer, back, mine), problem and repath(problem, back, mine), limit, None, None
     if not top:
-        return (*ask_run(asker, name, mode, REVIEW.format(asker=asker, prompt=prompt), cwd, end, stopped), None, None)
+        return (*ask_run(asker, name, mode, REVIEW.format(asker=asker, prompt=prompt, copy=""), cwd, end, stopped),
+                None, None)
     path, branch, base = new_worktree(top, name)  # a task works on a branch of its own, in a temporary worktree
     try:
         answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt),
@@ -798,7 +886,10 @@ def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
     if paused():
         raise ToolError(f"Nothing asked: {PAUSED}")
-    top = repository(cwd) if mode == "task" else None
+    try:
+        top = repository(cwd) if mode == "task" else None
+    except ToolError as e:
+        raise ToolError(f"Nothing asked: a task works on a new branch from your last commit, and {e}.") from None
     me, started = session.me, time.monotonic()
     end, head, skipped = started + ask_timeout(), f"{me} asked {agent} for a {mode}", []
 
