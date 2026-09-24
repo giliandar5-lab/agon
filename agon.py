@@ -1,12 +1,20 @@
 """Agon: a shared chat where AI agents from different apps build one project together.
 
-python agon.py <name>   MCP server (stdio) for one agent: claude / gemini / gpt
-python agon.py          browser arena at http://127.0.0.1:8765
+python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
+python agon.py hook <name>   Stop hook that wakes the agent with its new messages (--help for options)
+python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
+python agon.py               browser arena at http://127.0.0.1:8765
 """
+import argparse
+import datetime
 import json
 import os
 import queue
+import re
+import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -14,8 +22,10 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
+# One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
+DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
+VERSION = "0.2.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -24,15 +34,30 @@ PAUSED = ("Team paused: the human said STOP. Stop working and end your turn;"
           " the next message from the human resumes the team.")
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
+HOOK_WAIT = 25  # seconds a Stop hook waits for a message: Antigravity gives hooks 30 s by default
+RING_DELAY = 1  # seconds a message may wait for inbox or the Stop hook before the channel doorbell rings
+FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
+CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
+LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON_LIMIT_PATTERNS replaces the list
+    r"you(?:['’]ve| have) hit your (?:\w+ ){0,2}limit",  # Claude Code ("You've hit your limit"), Codex
+    r"usage limit reached|limit reached\W{1,5}resets",  # Claude Code ("5-hour limit reached ∙ resets 3pm")
+    r"you(?:['’]re| are) out of (?:extra )?usage",  # Claude Code
+    r"(?:reached|exceeded|exhausted) (?:your|the) (?:\w+ ){0,2}quota|QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED",  # Gemini
+    r"^rate_limit$",  # Claude Code's StopFailure error type
+]
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
 - inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
 - Loop: inbox -> do your part -> send a short report -> inbox again.
 - When inbox says the team is paused (the human said STOP), stop working and end your turn.
+- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon">
+  event only says that messages wait: call inbox to read them.
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete; put long content in a file and send its path."""
 
+# Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
+LOCAL = {"destructiveHint": False, "openWorldHint": False}
 TOOLS = [
     {
         "name": "send",
@@ -46,6 +71,7 @@ TOOLS = [
             },
             "required": ["text"],
         },
+        "annotations": LOCAL,
     },
     {
         "name": "inbox",
@@ -53,6 +79,7 @@ TOOLS = [
         " A new session starts with a recap of earlier messages; a long backlog comes in parts;"
         " says when the human has paused the team.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
+        "annotations": LOCAL,
     },
 ]
 
@@ -63,6 +90,9 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     "CREATE TABLE agents(name TEXT PRIMARY KEY, client TEXT, cursor INTEGER NOT NULL DEFAULT 0,"
     " last_seen REAL, autoruns INTEGER NOT NULL DEFAULT 0, out_of_quota_until REAL)",  # times: Unix seconds
     "CREATE INDEX msgs_by_sender ON msgs(sender, id)",  # paused() finds the human's latest message at once
+    # any message from the human gives every agent its automatic turns back (see out_of_turns())
+    "CREATE TRIGGER human_resets_autoruns AFTER INSERT ON msgs WHEN NEW.sender = 'human'"
+    " BEGIN UPDATE agents SET autoruns = 0; END",
 ]
 _local = threading.local()
 
@@ -71,6 +101,7 @@ def db():
     """This thread's connection to agon.db (SQLite connections must stay in the thread that made them)."""
     con = getattr(_local, "con", None)
     if con is None:
+        Path(DB).parent.mkdir(parents=True, exist_ok=True)
         # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
         con = sqlite3.connect(DB, timeout=5, isolation_level=None)
         try:
@@ -231,7 +262,7 @@ def pending(me, after, budget):
 def inbox(me, after, wait, budget=MAX_INBOX, stop=lambda: False):
     """Wait up to `wait` s for messages to `me` after id `after`: (the ones that fit in `budget`, how many more
     wait, whether the team is paused). A pause ends the wait at once, so the agent can stop."""
-    end = time.monotonic() + min(wait, MAX_WAIT)
+    end = time.monotonic() + wait
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
         rows, more = pending(me, after, budget)
@@ -278,6 +309,8 @@ class Session:
         self.current = None  # id of the request being handled
         self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
         self.closed = False  # the client closed our stdin
+        self.called = False  # a tool was called: the client is set up (and Claude Code listens to its channel)
+        self.doorbell = False  # the channel doorbell thread runs (Claude Code clients only)
 
     def stopped(self):
         """Nobody waits for the current request any more (cancelled, or the client left): stop waiting."""
@@ -306,7 +339,7 @@ def tool_inbox(session, args):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
-    wait = 0 if head or not wait > 0 else wait  # a recap comes back at once; NaN means no wait
+    wait = 0 if head or not wait > 0 else min(wait, MAX_WAIT)  # a recap comes back at once; NaN means no wait
     rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
     text = "\n".join(line(row) for row in rows) or "No new messages."
     if more:
@@ -360,11 +393,15 @@ def dispatch(session, method, params):
             name = info.get("name") if isinstance(info, dict) else None
             session.client = name if isinstance(name, str) else None
             touch(session.me, session.client)
+            if session.client == "claude-code" and not session.doorbell:
+                session.doorbell = True
+                threading.Thread(target=doorbell, args=(session,), daemon=True).start()
             asked = params.get("protocolVersion")
             return {
                 "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "agon", "version": "0.1"},
+                # Claude Code channels (research preview): run with --dangerously-load-development-channels
+                "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
+                "serverInfo": {"name": "agon", "version": VERSION},
                 "instructions": INSTRUCTIONS.format(me=session.me),
             }, None
         case "ping":
@@ -377,6 +414,7 @@ def dispatch(session, method, params):
 
 
 def call_tool(session, params):
+    session.called = True
     name, args = params.get("name"), params.get("arguments")
     tool = TOOL_HANDLERS.get(name) if isinstance(name, str) else None
     if tool is None:
@@ -392,6 +430,38 @@ def call_tool(session, params):
     except Exception as e:  # e.g. agon.db stayed locked for 5 s: tell the agent, keep serving
         text = f"Agon failed: {e}. Try again in a moment."
     return {"content": [{"type": "text", "text": text}], "isError": True}, None
+
+
+def doorbell(session):
+    """Claude Code channel: wake an idle Claude when messages wait for it. The notification only says so and leaves
+    the cursor alone, so inbox or the Stop hook still delivers the messages: Claude Code silently drops channel
+    events when the session didn't load the channel, and a message pushed that way would be lost."""
+    me, rung = session.me, 0  # rung: the newest message announced so far
+    try:
+        while not session.closed:
+            try:
+                version = data_version()
+                if session.called and not paused():  # not before the client is set up, nor while the team is paused
+                    cursor = cursor_of(me)
+                    newest = db().execute(f"SELECT id, sender {FOR_ME} ORDER BY id DESC LIMIT 1",
+                                          (cursor, me, me)).fetchone()
+                    if newest and newest[0] > rung:
+                        count = db().execute(f"SELECT COUNT(*) {FOR_ME}", (cursor, me, me)).fetchone()[0]
+                        what = "1 new Agon message" if count == 1 else f"{count} new Agon messages"
+                        emit(session.out, {"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
+                            "content": f"{what}, the latest from {newest[1]} (#{newest[0]}). Call inbox to read them.",
+                            # meta becomes <channel> tag attributes: keys of letters, digits and _, tame values
+                            "meta": {"sender": re.sub(r"[^\w.-]", "_", str(newest[1])), "msg_id": str(newest[0])},
+                        }})
+                        rung = newest[0]
+                if wait_for_change(version, 60, lambda: session.closed):
+                    time.sleep(RING_DELAY)  # a message that comes in now may be delivered right away
+            except sqlite3.Error:  # e.g. agon.db stayed locked for 5 s: try again in a moment
+                time.sleep(RING_DELAY)
+    except (OSError, ValueError):  # the client is gone
+        pass
+    finally:
+        close_db()
 
 
 EOF = object()  # queued after the client's last message
@@ -463,6 +533,159 @@ def serve_mcp(me, inp=None, out=None):
     worker.start()
     read_client(session, inp or sys.stdin.buffer, todo)
     worker.join()
+
+
+def read_payload(inp):
+    """The JSON object an app hands its Stop hook on stdin; {} for anything else (run by hand, bad JSON)."""
+    if inp.isatty():
+        return {}
+    try:
+        payload = json.loads(inp.read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def turn_failed(payload):
+    """Whether the turn ended in an error or was cancelled rather than finished. Such a turn is never continued:
+    Claude Code ignores what a StopFailure hook says, and Antigravity would re-enter its error."""
+    error, reason = payload.get("error"), str(payload.get("terminationReason") or "").lower()
+    return (payload.get("hook_event_name") == "StopFailure" or isinstance(error, str) and bool(error.strip())
+            or any(word in reason for word in ("error", "cancel", "quota")))
+
+
+def limit_patterns():
+    """AGON_LIMIT_PATTERNS, a JSON list of regular expressions (or a single one), replaces LIMIT_PATTERNS."""
+    raw = os.environ.get("AGON_LIMIT_PATTERNS")
+    if not raw:
+        return LIMIT_PATTERNS
+    try:
+        patterns = json.loads(raw)
+    except ValueError:
+        patterns = raw  # one plain regular expression
+    patterns = [patterns] if isinstance(patterns, str) else patterns
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError("AGON_LIMIT_PATTERNS must be a JSON list of regular expressions, or one expression")
+    return patterns
+
+
+def usage_limit(payload):
+    """The error texts of a Stop hook payload if they show a usage limit, else None. The model's last message is
+    read only when the turn failed (then Claude Code puts the error there): an agent writing about limits has none."""
+    keys = ["error", "error_details", "terminationReason"] + ["last_assistant_message"] * turn_failed(payload)
+    texts = [value for key in keys if isinstance(value := payload.get(key), str)]
+    if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
+        return "\n".join(texts)
+
+
+UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+DURATION = r"(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])"
+CLOCK = re.compile(  # "resets 3pm", "at 3:57 PM", "at Sep 25th, 2026 7:40 PM", "at 9/25/2026, 5:23 PM"
+    r"\b(?:at|resets?|until|on)\s+(?:(?P<mon>[a-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?:(?P<year>\d{4}),?\s+)?(?:at\s+)?|(?P<m>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{4}),?\s+)?"
+    r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
+
+
+def reset_time(text, now):
+    """When a usage limit resets (Unix time), from the text an app printed: an older Claude Code timestamp, a
+    duration ("in 2 hours 5 minutes", "after 2h3m4s") or a local clock time with an optional date; else None."""
+    if m := re.search(r"\|(\d{10})\b", text):  # "Claude AI usage limit reached|1760000000"
+        return float(m[1])
+    if m := re.search(rf"\b(?:in|after)\s+((?:{DURATION}[\s,]*(?:and\s+)?)+)", text, re.I):
+        return now + sum(int(n) * UNITS[unit[0].lower()] for n, unit in re.findall(DURATION, m[1], re.I))
+    for m in CLOCK.finditer(text):
+        if not (m["min"] or m["ap"]):
+            continue  # a bare number isn't a time
+        hour, minute = int(m["h"]), int(m["min"] or 0)
+        if m["ap"]:
+            hour = hour % 12 + (12 if m["ap"][0] in "pP" else 0)
+        base = datetime.datetime.fromtimestamp(now)
+        try:
+            if m["mon"]:
+                if m["mon"][:3].lower() not in MONTHS:
+                    continue
+                day = base.replace(year=int(m["year"] or base.year), month=MONTHS.index(m["mon"][:3].lower()) + 1,
+                                   day=int(m["day"]))
+            elif m["m"]:
+                day = base.replace(year=int(m["y"]), month=int(m["m"]), day=int(m["d"]))
+            else:
+                day = base
+            when = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if when.timestamp() <= now and not m["y"] and not m["year"]:  # no year given: the next such time
+                when = when.replace(year=when.year + 1) if m["mon"] else when + datetime.timedelta(days=1)
+        except ValueError:  # no such day or hour
+            continue
+        return when.timestamp()
+
+
+def out_of_quota(me, text):
+    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
+    team, once per limit."""
+    now = time.time()
+    until = reset_time(text, now)
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (me,)).fetchone()
+        con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
+                    " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
+        if not (row and row[0] and row[0] > now):  # not already known
+            clock = "%H:%M" if until and until - now < 20 * 3600 else "%b %d %H:%M"
+            post("agon", "all", f"{me} hit its usage limit"
+                 + (f", resets ~{time.strftime(clock, time.localtime(until))}." if until else "; reset time unknown."))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+
+
+def max_autoruns():
+    """AGON_MAX_AUTORUNS: how many times in a row the hook may keep an agent going without the human (25)."""
+    try:
+        return int(os.environ.get("AGON_MAX_AUTORUNS") or 25)
+    except ValueError:
+        raise ValueError("AGON_MAX_AUTORUNS must be a whole number, such as 25") from None
+
+
+def out_of_turns(me, limit):
+    """Whether agent `me` has used its `limit` automatic turns; the first time, the hook tells the human.
+    Any message from the human gives them back (the human_resets_autoruns trigger)."""
+    row = db().execute("SELECT autoruns FROM agents WHERE name = ?", (me,)).fetchone()
+    if (row[0] if row else 0) < limit:
+        return False
+    if db().execute("UPDATE agents SET autoruns = ? WHERE name = ? AND autoruns = ?", (limit + 1, me, limit)).rowcount:
+        post("agon", "human", f"{me} paused after {limit} automatic turns, waiting for the human")
+    return True
+
+
+def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
+    """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
+    The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
+    an exit code 2 into 1, so the other way to keep an agent going can get lost."""
+    fmt = fmt or FORMATS.get(me, "claude")
+    payload = read_payload(inp or sys.stdin.buffer)
+    touch(me)  # the agent's row, so its cursor can move
+    if paused():  # 1. the human said STOP
+        return
+    if hit := usage_limit(payload):  # 2. out of quota: say so and let it stop
+        return out_of_quota(me, hit)
+    if turn_failed(payload) or out_of_turns(me, max_autoruns()):
+        return
+    # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
+    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
+    if halted or not rows:
+        return  # exit 0 without output: the agent may stop
+    text = "\n".join(line(row) for row in rows)
+    if more:
+        text += f"\n{more} more — call inbox again."
+    decision = {"decision": CONTINUE[fmt], "reason": f"New messages from your Agon team:\n{text}"}
+    out = out or sys.stdout.buffer
+    out.write(json.dumps(decision).encode() + b"\n")  # ASCII only (\u escapes): no console code page mangles it
+    out.flush()
+    advance(me, rows[-1][0])  # only once the app has the messages (at-least-once)
+    db().execute("UPDATE agents SET autoruns = autoruns + 1 WHERE name = ?", (me,))
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -577,14 +800,104 @@ class Web(BaseHTTPRequestHandler):
         pass
 
 
+def command_line(args):
+    """`args` quoted for a terminal on this system (PowerShell and cmd take Windows quoting)."""
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+def setup(out=None):
+    """Print how to connect each app to this copy of agon.py, with absolute paths: plugin commands, then the MCP
+    server and Stop hook by hand. Agon never edits the apps' config files, so this only prints."""
+    py, script, home, windows = sys.executable, str(Path(__file__).resolve()), Path.home(), os.name == "nt"
+
+    def say(*lines):
+        print(*lines, sep="\n", file=out or sys.stdout)
+
+    def app(title, cli):
+        found = shutil.which(cli)
+        say("", f"== {title}: " + (f"{cli} is {found}" if found else f"{cli} isn't on PATH (all this works for the"
+                                                                     " app too)"))
+
+    say("Agon setup. Nothing is written: copy what you need.", "", f"Python  {py}", f"Agon    {script}",
+        f"Chat    {DB}", "        (one team at a time: set AGON_DB to a different file per project for separate teams)")
+    legacy = Path(script).with_name("agon.db")
+    if "AGON_DB" not in os.environ and legacy.exists():
+        say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
+
+    claude_hook = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 60}]}]
+    app("Claude Code", "claude")
+    say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
+        "  claude plugin marketplace add giliandar5-lab/agon",
+        "  " + command_line(["claude", "plugin", "install", "agon@agon", "--config", f"python={py}"]),
+        "By hand:",
+        "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", py, script, "claude"]),
+        f"  and the hooks, merged into {home / '.claude' / 'settings.json'}:",
+        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook}}),
+        "Channels (research preview), to wake an idle Claude:",
+        "  claude --dangerously-load-development-channels plugin:agon@agon   (by hand: server:agon)")
+
+    if windows:  # Codex runs hook commands through PowerShell there: & and single quotes (literal) around the paths
+        codex_hook = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in (py, script)) + " hook gpt"
+    else:
+        codex_hook = shlex.join([py, script, "hook", "gpt"])
+    forward = ["--env", f"AGON_DB={os.environ['AGON_DB']}"] if os.environ.get("AGON_DB") else []  # Codex won't pass it
+    app("Codex", "codex")
+    say("Plugin:", "  codex plugin marketplace add giliandar5-lab/agon", "  codex plugin add agon@agon",
+        "  then start Codex and trust the hook when it asks (or in /hooks)",
+        "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
+        f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
+        "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
+                                                          "timeout": 60}]}]}}))
+
+    # Antigravity runs hook commands with sh -c, or with cmd /c on Windows, where quotes don't survive
+    agy_hook = " ".join([py, script, "hook", "gemini"]) if windows else shlex.join([py, script, "hook", "gemini"])
+    app("Antigravity", "agy")
+    say("Plugin:", "  git clone https://github.com/giliandar5-lab/agon", "  agy plugin install ./agon",
+        f"  (Antigravity IDE: clone it into {home / '.gemini' / 'config' / 'plugins' / 'agon'} instead)",
+        "By hand:", "  " + command_line(["agy", "mcp", "add", "agon", py, script, "gemini"]),
+        f"  and the hook, merged into {home / '.gemini' / 'config' / 'hooks.json'}:",
+        "  " + json.dumps({"agon": {"enabled": True, "Stop": [{"type": "command", "command": agy_hook,
+                                                               "timeout": 60}]}}))
+    if windows and " " in py + script:
+        say("  This hook can't work: Antigravity can't run a path with a space. Use the plugin or paths without one.")
+
+
+class Args(argparse.ArgumentParser):
+    def error(self, message):  # argparse exits with 2, which Claude Code and Codex read as "keep the agent going"
+        self.exit(1, f"{self.prog}: error: {message}\n")
+
+
+def main(argv):
+    """Run the command in `argv` (sys.argv without the script) and return the process exit code."""
+    if argv[:1] == ["hook"]:
+        cli = Args(prog="agon.py hook", description="Stop hook for Claude Code, Codex and Antigravity: keeps"
+                   " the agent going with its new Agon messages, or lets it stop.")
+        cli.add_argument("name", help="the agent's name in Agon: claude, gemini, gpt, ...")
+        cli.add_argument("--wait", type=float, default=HOOK_WAIT, metavar="SECONDS",
+                         help=f"how long to wait for a message before letting the agent stop (default {HOOK_WAIT})")
+        cli.add_argument("--format", choices=sorted(CONTINUE),
+                         help="the app that runs the hook (default: gpt -> codex, gemini -> antigravity,"
+                         " any other name -> claude)")
+        args = cli.parse_args(argv[1:])
+        try:
+            hook(args.name, args.wait, args.format)
+        except Exception as e:  # the app shows it and lets the agent stop; its messages stay unread
+            print(f"agon hook: {e}", file=sys.stderr)
+            return 1
+    elif argv == ["setup"]:
+        setup()
+    elif argv:
+        serve_mcp(argv[0])
+    else:
+        url = f"http://127.0.0.1:{PORT}"
+        print(f"Agon arena: {url}  (Ctrl+C to stop)")
+        webbrowser.open(url)
+        ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+    return 0
+
+
 if __name__ == "__main__":
     try:
-        if len(sys.argv) > 1:
-            serve_mcp(sys.argv[1])
-        else:
-            url = f"http://127.0.0.1:{PORT}"
-            print(f"Agon arena: {url}  (Ctrl+C to stop)")
-            webbrowser.open(url)
-            ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+        sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         pass

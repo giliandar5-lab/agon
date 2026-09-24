@@ -1,0 +1,12 @@
+{
+  "agon": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./agon hook gemini || .\\agon.cmd hook gemini",
+        "timeout": 60
+      }
+    ]
+  }
+}

@@ -18,7 +18,7 @@ Who it is for: people who already use two or more AI coding tools, including peo
 Tick a phase in the same pull request that completes it.
 
 - [x] Phase 1 — Solid core
-- [ ] Phase 2 — Agents wake up on their own, one-command install, limit awareness
+- [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [ ] Phase 3 — Cross-vendor second opinion (`ask`)
 - [ ] Phase 4 — Task board (no downtime)
 - [ ] Phase 5 — The arena
@@ -58,12 +58,14 @@ When asked to do "the next phase":
 
 ## Architecture (all in `agon.py`, Python 3.10+ standard library)
 
-- **Storage:** SQLite in WAL mode (`busy_timeout=5000`, `synchronous=NORMAL`), one connection per thread.
+- **Storage:** SQLite in WAL mode (`busy_timeout=5000`, `synchronous=NORMAL`), one connection per thread, in
+  `~/.agon/agon.db` (`AGON_DB`) so that every app's copy of `agon.py` shares it.
   Tables: `msgs`, `agents(name, client, cursor, last_seen, autoruns, out_of_quota_until)`, `tasks` (Phase 4).
 - **Delivery:** per-agent cursor stored in the database; advance it only after the output is written
   (at-least-once). Waiting uses `PRAGMA data_version` every 0.2 s (near-zero CPU, ≤ 0.2 s latency).
 - **Agent tools (max 4):** `send`, `inbox`, `ask` (Phase 3), `tasks` (Phase 4).
-- **Wake-up layers:** Claude Code channels (push) → Stop hooks in all three apps → `inbox(wait)` → the human.
+- **Wake-up layers:** Claude Code channels (a doorbell: the push only says that messages wait) → Stop hooks in all
+  three apps (a JSON decision on stdout) → `inbox(wait)` → the human.
 - **Security:** arena on 127.0.0.1 with Host and JSON checks; every message shows its author (`[HUMAN]` stands
   out); messages from agents are requests, never permissions; Agon never edits user config files; reviews are
   read-only by default.
@@ -182,56 +184,110 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
 
 Sources are official docs unless marked *(secondary)*. Re-check when you can; these change often.
 
-**Claude Code — Stop hook** ([docs](https://code.claude.com/docs/en/hooks))
-- Configured in `~/.claude/settings.json`, `.claude/settings.json` or a plugin's `hooks/hooks.json`:
-  `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`.
-- stdin JSON includes `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `stop_hook_active`,
-  `last_assistant_message`.
-- Exit code 2 blocks the stop and shows stderr to Claude as the reason. Default timeout 600 s. Runs in the VS Code
-  extension too.
+**Claude Code — hooks** ([docs](https://code.claude.com/docs/en/hooks); tried with the CLI 2.1.281)
+- Configured in `~/.claude/settings.json`, `.claude/settings.json` or a plugin (`hooks/hooks.json` or inline in
+  `plugin.json`): `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`.
+- Exec form (`"command": "<executable>", "args": [...]`) runs without a shell; on Windows the command must be a real
+  `.exe`, and a bare name is looked up with `where.exe`, so `python3` finds the Microsoft Store stub. Shell form runs
+  `sh -c`, Git Bash on Windows, or PowerShell when Git for Windows (optional) isn't installed.
+- Stop stdin includes `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `stop_hook_active`,
+  `last_assistant_message`. To continue: exit 0 with stdout `{"decision": "block", "reason": "<prompt>"}` (what Agon
+  does) or exit 2 with the prompt on stderr; the transcript calls either a hook error. After 8 blocks in a row
+  Claude Code ends the turn anyway. Default timeout 600 s. Runs in the VS Code extension too.
+- A turn that ends in an API error (rate or usage limit, server error, ...) runs `StopFailure` instead of `Stop`:
+  stdin has `error` (`rate_limit`, ...), optional `error_details`, and the rendered error in
+  `last_assistant_message`. Its output and exit code are ignored.
+- Plugin hooks and MCP servers substitute `${CLAUDE_PLUGIN_ROOT}` and `${user_config.KEY}`. A userConfig `default`
+  reaches MCP servers but not hooks: a hook using an option that was never set fails ("Plugin option ... isn't set")
+  until the user sets it (`/plugin configure`, or `claude plugin install <plugin> --config KEY=VALUE`).
 
 **Claude Code — channels** ([docs](https://code.claude.com/docs/en/channels-reference))
 - Declare `capabilities.experimental["claude/channel"] = {}`; send `notifications/claude/channel` with
   `params: {"content": "...", "meta": {"key": "value"}}`. Meta keys must be letters, digits and underscores
   (others are dropped silently). The server `instructions` string is shown to Claude on connect.
-- Custom channels need `claude --dangerously-load-development-channels server:<name>` during the research
-  preview (CLI only). A channel does not register if protocol revision `2026-07-28` is negotiated.
+- Custom channels need `claude --dangerously-load-development-channels server:<name>` (or `plugin:<plugin>@<market>`)
+  during the research preview (CLI only). A channel does not register if protocol revision `2026-07-28` is
+  negotiated, nor without the flag, on other providers, or when an organization hasn't enabled channels.
+- Claude Code drops the events of an unregistered channel silently and never acknowledges them, and a server can't
+  tell (the client's `initialize` carries no channel capability): don't mark anything delivered by a push.
 
 **Claude Code — headless and plugins**
 - `claude -p "<prompt>" --output-format json` (final text in `result`), `--resume <session_id>`,
-  `--permission-mode plan | acceptEdits`.
-- Plugins: manifest `.claude-plugin/plugin.json`; MCP servers in `.mcp.json`; hooks in `hooks/hooks.json` (same
-  schema as settings); a `.claude-plugin/marketplace.json` lets users run `/plugin marketplace add owner/repo` and
-  `/plugin install <plugin>@<marketplace>` ([docs](https://code.claude.com/docs/en/plugin-marketplaces)).
+  `--permission-mode plan | acceptEdits`. `clientInfo.name` is `claude-code`; MCP servers inherit Claude Code's
+  environment plus `CLAUDECODE=1` and `CLAUDE_PROJECT_DIR`.
+- Plugins: manifest `.claude-plugin/plugin.json`, which may declare `mcpServers`, `hooks`, `userConfig` and
+  `channels` inline; a `.claude-plugin/marketplace.json` entry with `"source": "./"` makes the repository root the
+  plugin; users run `/plugin marketplace add owner/repo` and `/plugin install <plugin>@<marketplace>`
+  ([docs](https://code.claude.com/docs/en/plugin-marketplaces)); `claude plugin validate --strict` checks both
+  files. Marketplace installs are copied to `~/.claude/plugins/cache/`, which changes with each version: keep no
+  state there.
 
-**Codex — hooks** ([docs](https://developers.openai.com/codex/hooks)) *(details partly secondary)*
-- `~/.codex/hooks.json`, `<project>/.codex/hooks.json`, or a plugin's `hooks.json`. On by default since 0.150.1;
-  every non-managed hook must be trusted by the user in `/hooks`.
-- Stop stdin includes `turn_id`, `stop_hook_active`, `last_assistant_message`. To continue: stdout
-  `{"decision": "block", "reason": "<new prompt>"}` or exit code 2 with the prompt on stderr. `"continue": false`
-  ends the turn. The Stop output schema rejects unknown fields. Default timeout 600 s.
+**Codex — hooks** ([docs](https://learn.chatgpt.com/docs/hooks), moved from developers.openai.com; tried with the CLI
+0.156.1 against a mock model)
+- `~/.codex/hooks.json`, `<project>/.codex/hooks.json`, `[hooks]` in `config.toml`, or a plugin. Every non-managed
+  hook, plugin hooks included, must be trusted by the user: the TUI asks at startup, `/hooks` manages them,
+  `codex exec` skips untrusted hooks silently, `--dangerously-bypass-hook-trust` skips the check for one run.
+- Handler fields: `command`, `commandWindows` (a Windows override), `timeout`, `statusMessage`; no args or exec
+  form. Commands run in the user's shell with `-c` and the session's cwd; on Windows in PowerShell
+  (`-NoProfile -Command`, read from source).
+- Stop stdin includes `session_id`, `turn_id`, `transcript_path`, `cwd`, `hook_event_name`, `model`,
+  `stop_hook_active`, `last_assistant_message`. To continue: stdout `{"decision": "block", "reason": "<prompt>"}`
+  (any key beyond `continue`, `stopReason`, `suppressOutput`, `systemMessage`, `decision`, `reason` fails the hook)
+  or exit 2 with the prompt on stderr. Exit 0 without output ends the turn. No cap on continuations (224 in 20 s).
+  Default timeout 600 s.
+- Stop doesn't run when a turn fails, a usage limit included, and no hook event reports errors. The limit reads
+  "You’ve hit your usage limit. ... try again at 3:57 PM." (curly apostrophe; on another day "Try again at Sep 25th,
+  2026 7:40 PM.").
 
-**Codex — headless and plugins** *(secondary)*
+**Codex — headless, MCP and plugins**
 - `codex exec --json "<prompt>"` streams JSONL events (`thread.started` carries the session id, `item.*`,
   `turn.completed`, `error`); continue with `codex exec resume <SESSION_ID> --json "<prompt>"`.
   `--full-auto` was removed in 0.147.0 (use explicit `--sandbox read-only | workspace-write`);
-  `codex mcp-server` was removed in 0.154.0. `codex mcp add <name> -- <command> [args]` adds an MCP server.
-- Plugins: `.codex-plugin/plugin.json` is required; optional `.mcp.json`, `hooks.json`, `skills/` at the plugin
-  root. Install: `codex plugin marketplace add owner/repo`, then `codex plugin add <plugin>@<marketplace>` (0.146+).
+  `codex mcp-server` was removed in 0.154.0. `codex mcp add <name> [--env K=V] -- <command> [args]` adds an MCP
+  server. *(secondary)*
+- MCP: `clientInfo.name` is `codex-mcp-client`. Servers get only a whitelist of environment variables (HOME,
+  PATH, ...; on Windows USERPROFILE, APPDATA, ...) plus `env` and `env_vars`. A tool without annotations needs an
+  approval on every call (and fails under `codex exec`); `readOnlyHint`, or `destructiveHint: false` with
+  `openWorldHint: false`, runs it without asking. Tool timeout: 60 s in the docs (300 s in the source). On Windows
+  a command is resolved with PATHEXT relative to the server's `cwd`, so `./agon` finds `agon.cmd`.
+- Plugins: `.codex-plugin/plugin.json` (a legacy-compatible manifest; the portable one is a root `plugin.json`
+  with the Agent Plugins `$schema`). Inline `mcpServers` and `hooks` (`{"hooks": {...}}`) replace the default
+  `.mcp.json` and `hooks/hooks.json`. MCP configs expand nothing (a relative `cwd` joins the plugin root); hook
+  commands get `${PLUGIN_ROOT}` substituted and `PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT` exported. Without
+  `.agents/plugins/marketplace.json`, Codex reads `.claude-plugin/marketplace.json`. Install:
+  `codex plugin marketplace add owner/repo` (a git clone), then `codex plugin add <plugin>@<marketplace>`, which
+  copies the plugin, executable bits included, to `~/.codex/plugins/cache/`.
 
-**Antigravity (IDE and `agy` CLI)** ([hooks](https://antigravity.google/docs/hooks/),
-[headless](https://antigravity.google/docs/cli/headless/))
-- Hooks: `~/.gemini/config/hooks.json` or `<workspace>/.agents/hooks.json`, shaped
-  `{"agon": {"enabled": true, "Stop": [{"type": "command", "command": "...", "timeout": 60}]}}`. Stop stdin
-  includes `executionNum`, `terminationReason`, `error`, `fullyIdle`, `conversationId`, `workspacePaths`,
-  `transcriptPath`, `modelName`. To continue: stdout `{"decision": "continue", "reason": "<prompt>"}`; any other
-  decision lets it stop. Default timeout 30 s. Applies to the IDE and the CLI.
+**Antigravity (IDE and `agy` CLI)** ([hooks](https://antigravity.google/docs/hooks),
+[plugins](https://antigravity.google/docs/plugins), [headless](https://antigravity.google/docs/cli/headless);
+tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2.9 Windows binary)
+- Hooks: `~/.gemini/config/hooks.json`, `<workspace>/.agents/hooks.json` or a plugin's `hooks.json`, shaped
+  `{"agon": {"enabled": true, "Stop": [{"type": "command", "command": "...", "timeout": 60}]}}`. Commands run with
+  `sh -c`, on Windows `cmd /c` (quotes inside the command don't survive), in the folder of `hooks.json`. Stop
+  stdin includes `executionNum`, `terminationReason`, `error`, `fullyIdle`, `conversationId`, `workspacePaths`,
+  `transcriptPath`, `modelName`. To continue: stdout `{"decision": "continue", "reason": "<prompt>"}` and exit 0;
+  any other decision, a non-zero exit, empty output or unknown keys let it stop. Default timeout 30 s.
+- `terminationReason`: the docs say `model_stop`, `max_steps_exceeded`, `error`; 1.2.x sends `NO_TOOL_CALL`,
+  `ERROR`, `USER_CANCELED`, `QUOTA_EXHAUSTED`, ... Continuing after an error re-enters the loop. A configurable cap
+  ends long runs of continuations. Quota: "You have exhausted your quota on this model." (the server's error reads
+  "RESOURCE_EXHAUSTED (code 429): ... Your quota will reset after 2h3m4s.").
+- Plugins: a folder with `plugin.json` (its schema allows `name` and `description`), `mcp_config.json`, `hooks.json`,
+  `skills/`, `agents/`, `rules/`. `agy plugin install <folder>` copies it to `~/.gemini/config/plugins/<name>/`;
+  the IDE also loads `<workspace>/.agents/plugins/`. Plugin MCP servers start with `exec.Command(command, args)`
+  in the plugin folder (`${PLUGIN_ROOT}` expands in args); `agy plugin validate` looks up the command from its own
+  cwd.
 - MCP: `~/.gemini/config/mcp_config.json` or `<workspace>/.agents/mcp_config.json` (`{"mcpServers": {...}}`), or
-  `agy mcp add <name> <command> [args]` *(secondary)*.
+  `agy mcp add [flags] <name> <command> [args]`. `clientInfo.name` is `antigravity-client`.
 - Headless: `agy -p "<prompt>" --output-format text | json | stream-json`, `--continue`,
   `--input-format stream-json` for multi-turn over stdin, `--mode default | accept-edits | plan`. Tools that need
   approval are refused in headless mode unless `--dangerously-skip-permissions` is set. Gemini CLI was replaced
   by `agy` on 2026-06-18.
+
+**Windows** ([about_Pwsh](https://learn.microsoft.com/powershell/module/microsoft.powershell.core/about/about_pwsh))
+- With `-Command`, Windows PowerShell 5.1 and PowerShell 7 turn an external program's exit code other than 0 or 1
+  into 1: a hook can't count on exit code 2 there, while a JSON decision on stdout gets through.
+- On Windows 11 with python.org Python 3.12 or 3.14, `python3` is the Microsoft Store stub (exit 9009) and `py -3`
+  and `python` work (the maintainer's machine).
 
 **MCP protocol**
 - Revision `2026-07-28` is stateless (no `initialize`; version and client info travel in `_meta`; `server/discover`
@@ -240,7 +296,9 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   ([blog](https://blog.modelcontextprotocol.io/posts/2026-07-28/)).
 - Spec 2025-11-25: unknown tools and malformed `tools/call` → JSON-RPC error `-32602`; input validation errors →
   a result with `isError: true` so the model can correct itself
-  ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)).
+  ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)). Tool annotations:
+  `readOnlyHint`, `destructiveHint` (default true; false means additive only), `idempotentHint`, `openWorldHint`
+  (default true).
 - Tried against agon (Phase 1): the official Python SDK 2.2.0 `Client` (default `mode="auto"`) probes
   `server/discover` at `2026-07-28`, gets `-32601` and falls back to `initialize` at `2025-11-25`; the TypeScript SDK
   1.30.1 (the one Claude Code builds on) initializes at `2025-11-25` directly. Aborting a call makes both send

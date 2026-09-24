@@ -1,0 +1,15 @@
+{
+  "name": "agon",
+  "owner": {
+    "name": "giliandar5-lab",
+    "url": "https://github.com/giliandar5-lab"
+  },
+  "description": "Agon: Claude, GPT and Gemini build your project together.",
+  "plugins": [
+    {
+      "name": "agon",
+      "source": "./",
+      "description": "Shared team chat (MCP server) and a Stop hook that wakes the agent with new messages."
+    }
+  ]
+}

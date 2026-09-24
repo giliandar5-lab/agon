@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "agon": {
+      "command": "./agon",
+      "args": [
+        "gemini"
+      ]
+    }
+  }
+}
