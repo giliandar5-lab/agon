@@ -135,4 +135,25 @@ for version in ("2026-07-28", "1999-01-01", 5, None):  # 2026-07-28 is stateless
     params = {} if version is None else {"protocolVersion": version}
     assert vera.rpc("initialize", params)["result"]["protocolVersion"] == "2025-11-25"
 vera.close()
+
+# 13. Error codes: parse error -32700 (id null), not a request -32600, unknown method -32601, bad params -32602
+def code(reply):
+    return reply["id"], reply["error"]["code"]
+
+
+errol = Agent("errol")
+errol.write(b"{not json\n")
+assert code(errol.read()) == (None, -32700)
+errol.write(b"[1, 2]\n")
+assert code(errol.read()) == (None, -32600)
+errol.write(b'{"jsonrpc": "2.0", "id": 3}\n')
+assert code(errol.read()) == (3, -32600)
+assert code(errol.rpc("tools/dance", id=4)) == (4, -32601)
+assert code(errol.rpc("tools/call", {"name": "dance"}, id=5)) == (5, -32602)
+assert code(errol.rpc("tools/call", {"name": "send", "arguments": ["hi"]}, id=6)) == (6, -32602)
+assert code(errol.rpc("tools/call", ["send"], id=7)) == (7, -32602)
+errol.write({"jsonrpc": "2.0", "method": "notifications/initialized"})  # notifications get no reply
+errol.write({"jsonrpc": "2.0", "id": 99, "result": {}})  # neither do responses
+assert errol.rpc("ping", id=8) == {"jsonrpc": "2.0", "id": 8, "result": {}}
+errol.close()
 print("ok")

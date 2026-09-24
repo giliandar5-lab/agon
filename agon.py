@@ -144,47 +144,106 @@ def emit(out, msg):
         out.flush()
 
 
+class RpcError(Exception):
+    """A request the server can't take: answered with a JSON-RPC error code."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+class Session:
+    """What one server process keeps about its agent outside the database."""
+
+    def __init__(self, me):
+        self.me = me
+        self.last = 0  # in-memory cursor: a fresh agent session starts from the history and catches up
+
+
+def tool_send(session, args):
+    post(session.me, args.get("to", "all"), args["text"])
+    return "Sent."
+
+
+def tool_inbox(session, args):
+    rows = inbox(session.me, session.last, int(args.get("wait", 30)))
+    if rows:
+        session.last = rows[-1][0]
+    return "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows) or "No new messages."
+
+
+TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox}  # schemas are in TOOLS
+
+
+def handle(session, msg):
+    """Answer one message from the client: a JSON-RPC reply, or None when none is due."""
+    if not isinstance(msg, dict) or not isinstance(msg.get("method"), str):
+        if isinstance(msg, dict) and ("result" in msg or "error" in msg):
+            return None  # a response, but we never send requests
+        rid = msg.get("id") if isinstance(msg, dict) else None
+        return error(rid, -32600, "Invalid Request: expected a JSON-RPC 2.0 request object")
+    if "id" not in msg:
+        return None  # a notification (initialized, cancelled, ...): never answered
+    try:
+        params = {} if msg.get("params") is None else msg["params"]
+        if not isinstance(params, dict):
+            raise RpcError(-32602, "Invalid params: `params` must be an object")
+        return {"jsonrpc": "2.0", "id": msg["id"], "result": dispatch(session, msg["method"], params)}
+    except RpcError as e:
+        return error(msg["id"], e.code, str(e))
+    except Exception as e:
+        return error(msg["id"], -32603, f"Internal error: {e}")
+
+
+def dispatch(session, method, params):
+    match method:
+        case "initialize":
+            asked = params.get("protocolVersion")
+            return {
+                "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agon", "version": "0.1"},
+                "instructions": INSTRUCTIONS.format(me=session.me),
+            }
+        case "ping":
+            return {}
+        case "tools/list":
+            return {"tools": TOOLS}
+        case "tools/call":
+            return call_tool(session, params)
+    raise RpcError(-32601, f"Method not found: {method}")
+
+
+def call_tool(session, params):
+    name, args = params.get("name"), params.get("arguments")
+    tool = TOOL_HANDLERS.get(name) if isinstance(name, str) else None
+    if tool is None:
+        raise RpcError(-32602, f"Unknown tool: {name}. Tools: {', '.join(TOOL_HANDLERS)}")
+    args = {} if args is None else args
+    if not isinstance(args, dict):
+        raise RpcError(-32602, "Invalid params: `arguments` must be an object")
+    return {"content": [{"type": "text", "text": tool(session, args)}]}
+
+
 def serve_mcp(me, inp=None, out=None):
     """MCP server for agent `me`: one JSON-RPC message per line on stdin and stdout."""
     inp, out = inp or sys.stdin.buffer, out or sys.stdout.buffer
-    last = 0  # in-memory cursor: a fresh agent session starts from the history and catches up
+    session = Session(me)
     for line in inp:
         if not line.strip():
             continue
-        req = json.loads(line)
-        if "id" not in req:  # notifications need no reply
-            continue
-        p = req.get("params") or {}
-        args = p.get("arguments") or {}
         try:
-            match req["method"], p.get("name"):
-                case "initialize", _:
-                    asked = p.get("protocolVersion")
-                    res = {
-                        "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "agon", "version": "0.1"},
-                        "instructions": INSTRUCTIONS.format(me=me),
-                    }
-                case "tools/list", _:
-                    res = {"tools": TOOLS}
-                case "tools/call", "send":
-                    post(me, args.get("to", "all"), args["text"])
-                    res = {"content": [{"type": "text", "text": "Sent."}]}
-                case "tools/call", "inbox":
-                    rows = inbox(me, last, int(args.get("wait", 30)))
-                    if rows:
-                        last = rows[-1][0]
-                    text = "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows) or "No new messages."
-                    res = {"content": [{"type": "text", "text": text}]}
-                case "ping", _:
-                    res = {}
-                case method, name:
-                    raise ValueError(f"unknown: {method} {name or ''}")
-            reply = {"jsonrpc": "2.0", "id": req["id"], "result": res}
-        except Exception as e:
-            reply = {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32603, "message": str(e)}}
-        emit(out, reply)
+            msg = json.loads(line)
+        except ValueError:
+            reply = error(None, -32700, "Parse error: send one JSON-RPC message per line")
+        else:
+            reply = handle(session, msg)
+        if reply is not None:
+            emit(out, reply)
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
