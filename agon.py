@@ -14,7 +14,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
+# One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
+DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
@@ -71,6 +72,7 @@ def db():
     """This thread's connection to agon.db (SQLite connections must stay in the thread that made them)."""
     con = getattr(_local, "con", None)
     if con is None:
+        Path(DB).parent.mkdir(parents=True, exist_ok=True)
         # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
         con = sqlite3.connect(DB, timeout=5, isolation_level=None)
         try:
