@@ -370,6 +370,11 @@ raw = sam.p.stdout.readline()
 assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox"]
 sam.close()
 
+# 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons
+ci = (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+for needed in ("ubuntu-latest", "windows-latest", "macos-latest", '"3.10"', '"3.13"', "run: python test_agon.py"):
+    assert needed in ci, needed
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
