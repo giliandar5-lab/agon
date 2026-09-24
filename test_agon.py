@@ -761,6 +761,21 @@ with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
 if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
     with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
         f.write(f"written by {app}\n")
+if app in os.environ.get("FAKE_LIMIT", "").split(","):  # the usage limit as each app reports it
+    if app == "claude":
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+                          "result": "You've hit your limit · resets 3pm (Europe/Berlin)"}))
+    elif app == "codex":
+        said = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 7:48" \
+               " PM."
+        for event in ({"type": "turn.started"}, {"type": "error", "message": said},
+                      {"type": "turn.failed", "error": {"message": said}}):
+            print(json.dumps(event))
+    else:
+        print(json.dumps({"conversation_id": "c", "status": "ERROR", "response": "", "error": "API error (attempt 7):"
+                          " Error 429, Message: You exceeded your current quota. Your quota will reset after 2h3m4s.,"
+                          " Status: RESOURCE_EXHAUSTED, Details: []"}))
+    sys.exit(1)
 if "HANG" in prompt:  # a child that keeps writing, to see that the whole process tree goes
     subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
                       "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
@@ -890,6 +905,77 @@ subprocess.run(["git", "init", "-q"], cwd=empty_repo, check=True)
 for where, why in ((project, f"{project} isn't in a git repository"), (empty_repo, "this repository has none yet")):
     res, text = asked(rev, agent="gpt", prompt="EDIT x.txt", mode="task", cwd=str(where))
     assert res["isError"] is True and text.startswith("Nothing asked: a task ") and why in text, text
+
+# Phase 3, 7. An agent that is out of quota, or whose app reports a usage limit, is marked (and the team told), and
+# the next agent in AGON_FALLBACK (claude,gpt,gemini) answers instead; the reply says who answered. Never the asker
+assert agon.fallbacks("gpt", "claude") == ["gemini"] and agon.fallbacks("gemini", "rev") == ["claude", "gpt"]
+
+
+def mark(name, seconds):  # out of quota for `seconds` from now; 0: not any more
+    agon.touch(name)
+    con.execute("UPDATE agents SET out_of_quota_until = ? WHERE name = ?", (time.time() + seconds if seconds else None,
+                                                                           name))
+
+
+def team_heard():  # the latest line Agon wrote for the whole team
+    return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'all' ORDER BY id DESC").fetchone()[0]
+
+
+mark("gpt", 7200)
+runs = len(fake_runs())
+lead = Agent("claude", env=ASK)
+res, text = asked(lead, agent="gpt", prompt="Please review", cwd=str(project))
+assert re.match(r"gpt is out of quota until ~\d\d:\d\d, so gemini answered in \d+s \(review, VERDICT: approve\):",
+                text), text
+assert [run["app"] for run in fake_runs()[runs:]] == ["agy"]  # gpt's app never ran, and claude doesn't ask itself
+assert re.fullmatch(r"claude asked gpt for a review: gpt is out of quota until ~\d\d:\d\d, so gemini answered in \d+s,"
+                    r" VERDICT: approve\.", agon_said()), agon_said()
+lead.close()
+mark("gpt", 0)
+limited, runs, t0 = Agent("rev2", env=ASK | {"FAKE_LIMIT": "agy"}), len(fake_runs()), time.time()
+res, text = asked(limited, agent="gemini", prompt="Please review", cwd=str(project))
+assert re.match(r"gemini hit its usage limit, so claude answered in \d+s \(review, VERDICT: approve\):", text), text
+assert [run["app"] for run in fake_runs()[runs:]] == ["agy", "claude"]
+assert abs(agent_row("gemini", "out_of_quota_until") - (t0 + 7384)) < 10  # "Your quota will reset after 2h3m4s."
+assert team_heard().startswith("gemini hit its usage limit, resets ~"), team_heard()
+limited.close()
+alone = Agent("rev3", env=ASK | {"AGON_FALLBACK": ""})
+res, text = asked(alone, agent="gemini", prompt="Please review", cwd=str(project))
+assert res["isError"] is True and re.fullmatch(r"Nobody could answer: gemini is out of quota until ~\d\d:\d\d\.", text)
+alone.close()
+chain, runs = Agent("rev4", env=ASK | {"FAKE_LIMIT": "codex,claude"}), len(fake_runs())
+res, text = asked(chain, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
+assert re.fullmatch(r"Nobody could answer: gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\);"
+                    r" claude hit its usage limit \(what it did is on branch agon/claude-[\d-]+\); gemini is out of"
+                    r" quota until ~\d\d:\d\d\.", text), text  # a task keeps what each of them did
+assert [run["app"] for run in fake_runs()[runs:]] == ["codex", "claude"] and res["isError"] is True
+three = datetime.datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+assert agent_row("claude", "out_of_quota_until") == (three + datetime.timedelta(days=three.timestamp() <= time.time())
+                                                      ).timestamp()  # "You've hit your limit · resets 3pm"
+chain.close()
+mark("gpt", 0)
+mark("claude", 0)
+once = Agent("rev5", env=ASK | {"FAKE_LIMIT": "codex"})
+res, text = asked(once, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
+assert re.match(r"gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\), so claude finished the task in"
+                r" \d+s on branch agon/claude-[\d-]+:\n part\.txt \| 1 \+\n", text), text
+claude_branch = re.findall(r"agon/claude-[\d-]+", text)[0]
+assert in_repo("show", f"{claude_branch}:part.txt") == "written by claude"
+once.close()
+mark("gpt", 7200)
+mark("gemini", 0)
+gone = Agent("rev6", env=ASK | {"AGON_CMD_CLAUDE": json.dumps([str(Path(TMP, "no", "claude"))])})
+res, text = asked(gone, agent="gpt", prompt="Please review", cwd=str(project))  # a missing app is skipped, and why
+assert re.match(r"gpt is out of quota until ~\d\d:\d\d; Can't run claude: .+? doesn't exist or can't be run\. Install"
+                r" it, or set AGON_CMD_CLAUDE to its full command \(`python agon\.py setup` prints it\), so gemini"
+                r" answered in \d+s \(review, VERDICT: approve\):", text), text
+gone.close()
+for name in ("gpt", "claude", "gemini"):
+    mark(name, 0)
+odd = Agent("rev7", env=ASK | {"AGON_FALLBACK": "claude,bard"})
+res, text = asked(odd, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and text.startswith("AGON_FALLBACK must list agents Agon can ask"), text
+odd.close()
 
 # Phase 3, 8. The timeout (AGON_ASK_TIMEOUT, default 900 s) kills the app's whole process tree
 assert agon.ASK_TIMEOUT == 900
