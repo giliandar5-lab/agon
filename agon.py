@@ -215,6 +215,7 @@ def handle(session, msg):
         params = {} if msg.get("params") is None else msg["params"]
         if not isinstance(params, dict):
             raise RpcError(-32602, "Invalid params: `params` must be an object")
+        touch(session.me)  # presence: every request moves last_seen
         return {"jsonrpc": "2.0", "id": msg["id"], "result": dispatch(session, msg["method"], params)}
     except RpcError as e:
         return error(msg["id"], e.code, str(e))
