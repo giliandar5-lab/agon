@@ -67,6 +67,14 @@ old.close()
 fresh = dict(os.environ, AGON_DB=str(Path(TMP, "fresh.db")))  # several agents create one database at once
 starts = [subprocess.Popen([sys.executable, "-c", "import agon; agon.db()"], cwd=HERE, env=fresh) for _ in range(4)]
 assert [p.wait() for p in starts] == [0, 0, 0, 0]
+holder = sqlite3.connect(Path(TMP, "held.db"), isolation_level=None, check_same_thread=False)
+holder.execute("BEGIN IMMEDIATE")  # another agent is still creating the new file: the WAL switch must wait
+release = threading.Timer(0.5, holder.rollback)
+release.start()
+held = dict(os.environ, AGON_DB=str(Path(TMP, "held.db")))
+assert subprocess.run([sys.executable, "-c", "import agon; agon.db()"], cwd=HERE, env=held).returncode == 0
+release.join()
+holder.close()
 
 # 3. wait_for_change(): wakes up when another connection commits, otherwise times out
 v = agon.data_version()
