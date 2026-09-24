@@ -2,6 +2,7 @@
 
 python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
 python agon.py hook <name>   Stop hook that wakes the agent with its new messages (--help for options)
+python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
@@ -10,7 +11,10 @@ import json
 import os
 import queue
 import re
+import shlex
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -795,6 +799,68 @@ class Web(BaseHTTPRequestHandler):
         pass
 
 
+def command_line(args):
+    """`args` quoted for a terminal on this system (PowerShell and cmd take Windows quoting)."""
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+def setup(out=None):
+    """Print how to connect each app to this copy of agon.py, with absolute paths: plugin commands, then the MCP
+    server and Stop hook by hand. Agon never edits the apps' config files, so this only prints."""
+    py, script, home, windows = sys.executable, str(Path(__file__).resolve()), Path.home(), os.name == "nt"
+
+    def say(*lines):
+        print(*lines, sep="\n", file=out or sys.stdout)
+
+    def app(title, cli):
+        found = shutil.which(cli)
+        say("", f"== {title}: " + (f"{cli} is {found}" if found else f"{cli} isn't on PATH (all this works for the"
+                                                                     " app too)"))
+
+    say("Agon setup. Nothing is written: copy what you need.", "", f"Python  {py}", f"Agon    {script}",
+        f"Chat    {DB}", "        (one team at a time: set AGON_DB to a different file per project for separate teams)")
+    legacy = Path(script).with_name("agon.db")
+    if "AGON_DB" not in os.environ and legacy.exists():
+        say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
+
+    claude_hook = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 60}]}]
+    app("Claude Code", "claude")
+    say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
+        "  claude plugin marketplace add giliandar5-lab/agon",
+        "  " + command_line(["claude", "plugin", "install", "agon@agon", "--config", f"python={py}"]),
+        "By hand:",
+        "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", py, script, "claude"]),
+        f"  and the hooks, merged into {home / '.claude' / 'settings.json'}:",
+        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook}}),
+        "Channels (research preview), to wake an idle Claude:",
+        "  claude --dangerously-load-development-channels plugin:agon@agon   (by hand: server:agon)")
+
+    if windows:  # Codex runs hook commands through PowerShell there: & and single quotes (literal) around the paths
+        codex_hook = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in (py, script)) + " hook gpt"
+    else:
+        codex_hook = shlex.join([py, script, "hook", "gpt"])
+    forward = ["--env", f"AGON_DB={os.environ['AGON_DB']}"] if os.environ.get("AGON_DB") else []  # Codex won't pass it
+    app("Codex", "codex")
+    say("Plugin:", "  codex plugin marketplace add giliandar5-lab/agon", "  codex plugin add agon@agon",
+        "  then start Codex and trust the hook when it asks (or in /hooks)",
+        "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
+        f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
+        "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
+                                                          "timeout": 60}]}]}}))
+
+    # Antigravity runs hook commands with sh -c, or with cmd /c on Windows, where quotes don't survive
+    agy_hook = " ".join([py, script, "hook", "gemini"]) if windows else shlex.join([py, script, "hook", "gemini"])
+    app("Antigravity", "agy")
+    say("Plugin:", "  git clone https://github.com/giliandar5-lab/agon", "  agy plugin install ./agon",
+        f"  (Antigravity IDE: clone it into {home / '.gemini' / 'config' / 'plugins' / 'agon'} instead)",
+        "By hand:", "  " + command_line(["agy", "mcp", "add", "agon", py, script, "gemini"]),
+        f"  and the hook, merged into {home / '.gemini' / 'config' / 'hooks.json'}:",
+        "  " + json.dumps({"agon": {"enabled": True, "Stop": [{"type": "command", "command": agy_hook,
+                                                               "timeout": 60}]}}))
+    if windows and " " in py + script:
+        say("  This hook can't work: Antigravity can't run a path with a space. Use the plugin or paths without one.")
+
+
 class Args(argparse.ArgumentParser):
     def error(self, message):  # argparse exits with 2, which Claude Code and Codex read as "keep the agent going"
         self.exit(1, f"{self.prog}: error: {message}\n")
@@ -817,6 +883,8 @@ def main(argv):
         except Exception as e:  # the app shows it and lets the agent stop; its messages stay unread
             print(f"agon hook: {e}", file=sys.stderr)
             return 1
+    elif argv == ["setup"]:
+        setup()
     elif argv:
         serve_mcp(argv[0])
     else:
