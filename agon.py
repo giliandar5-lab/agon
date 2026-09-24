@@ -18,6 +18,8 @@ DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
 PORT = 8765
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
+MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
+MAX_WAIT = 55  # seconds an inbox call may wait: Codex cancels tool calls after 60 s by default
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
 
@@ -176,17 +178,34 @@ def recap(me, cursor, start):
     return "\n".join(["Recap of the messages before this session (already read):", *lines]) if lines else ""
 
 
-def inbox(me, after, wait, stop=lambda: False):
-    end = time.monotonic() + min(wait, 55)  # Codex cancels tool calls after 60 s by default
+FOR_ME = "FROM msgs WHERE id > ? AND sender != ? AND rcpt IN ('all', ?)"  # what `me` hasn't read after id ?
+
+
+def pending(me, after, budget):
+    """Messages for `me` after id `after` whose lines fit in `budget` characters (always at least one),
+    and how many more are waiting."""
+    rows, size = [], 0
+    cur = db().execute(f"SELECT id, sender, rcpt, text {FOR_ME} ORDER BY id", (after, me, me))
+    try:
+        for row in cur:
+            size += len(line(row)) + 1
+            if rows and size > budget:
+                break
+            rows.append(row)
+    finally:
+        cur.close()
+    more = db().execute(f"SELECT COUNT(*) {FOR_ME}", (rows[-1][0], me, me)).fetchone()[0] if rows else 0
+    return rows, more
+
+
+def inbox(me, after, wait, budget=MAX_INBOX, stop=lambda: False):
+    """Wait up to `wait` s for messages to `me` after id `after`: (the ones that fit in `budget`, how many more)."""
+    end = time.monotonic() + min(wait, MAX_WAIT)
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
-        rows = db().execute(
-            "SELECT id, sender, rcpt, text FROM msgs"
-            " WHERE id > ? AND sender != ? AND rcpt IN ('all', ?) ORDER BY id LIMIT 50",
-            (after, me, me),
-        ).fetchall()
+        rows, more = pending(me, after, budget)
         if rows or not wait_for_change(version, end - time.monotonic(), stop):
-            return rows
+            return rows, more
 
 
 OUT_LOCK = threading.Lock()  # guards the only way to the client: see emit()
@@ -253,8 +272,10 @@ def tool_inbox(session, args):
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
     wait = 0 if head or not wait > 0 else wait  # a recap comes back at once; NaN means no wait
-    rows = inbox(session.me, cursor, wait, session.stopped)
+    rows, more = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
     text = "\n".join(line(row) for row in rows) or "No new messages."
+    if more:
+        text += f"\n{more} more — call inbox again."
     if head and rows:
         text = f"{head}\n\nNew messages:\n{text}"
     elif head:
