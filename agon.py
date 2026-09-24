@@ -27,7 +27,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.2.0"  # also in the plugin manifests
+VERSION = "0.3.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -48,6 +48,10 @@ LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON
     r"^rate_limit$",  # Claude Code's StopFailure error type
 ]
 ASK_TIMEOUT = 900  # seconds one ask may take (AGON_ASK_TIMEOUT); then Agon kills the run's whole process tree
+TOOL_TIMEOUT = ASK_TIMEOUT + 60  # Codex's tool_timeout_sec for Agon: its default of 60 s would cut every ask short
+# The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
+ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
+            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS"]
 # How ask runs each agent's app headless, on the user's own plan. AGON_CMD_CLAUDE, AGON_CMD_GPT and AGON_CMD_GEMINI
 # replace a command (a JSON list or a command line): {prompt} marks where the prompt goes (otherwise it goes on stdin)
 # and {cwd} the folder the run works in. Checked with claude 2.1.281, codex 0.156.1 and agy 1.2.10
@@ -1324,7 +1328,10 @@ def setup(out=None):
         "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
         "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
-                                                          "timeout": 60}]}]}}))
+                                                          "timeout": 60}]}]}}),
+        f"  and under [mcp_servers.agon] in {home / '.codex' / 'config.toml'} (ask takes minutes, and Codex passes"
+        " Agon only the variables it names):", f"  tool_timeout_sec = {TOOL_TIMEOUT}",
+        f"  env_vars = {json.dumps(ENV_VARS)}")
 
     # Antigravity runs hook commands with sh -c, or with cmd /c on Windows, where quotes don't survive
     agy_hook = " ".join([py, script, "hook", "gemini"]) if windows else shlex.join([py, script, "hook", "gemini"])
@@ -1337,6 +1344,23 @@ def setup(out=None):
                                                                "timeout": 60}]}}))
     if windows and " " in py + script:
         say("  This hook can't work: Antigravity can't run a path with a space. Use the plugin or paths without one.")
+
+    # ask runs the apps by name, and an app may start Agon with a shorter PATH than this terminal has (npm's
+    # claude.cmd and codex.cmd on Windows), so give it the full paths found here
+    say("", "== ask: how Agon runs each app for a second opinion, with the full paths found here",
+        "Run these in PowerShell (they set user variables), then restart the apps:" if windows else
+        "Add these to your shell profile (~/.zshrc or ~/.bashrc), then start the apps from a new terminal:")
+    for name, (program, *args) in COMMANDS.items():
+        var, found = f"AGON_CMD_{name.upper()}", shutil.which(program)
+        if not found:
+            say(f"  {program} isn't on PATH: ask can't run {name} until it is, or until {var} names it")
+            continue
+        value = json.dumps([found, *args])
+        if windows:  # PowerShell keeps a single-quoted string as it is, but for '' (one ')
+            quoted = value.replace("'", "''")
+            say(f"  [Environment]::SetEnvironmentVariable('{var}', '{quoted}', 'User')")
+        else:
+            say(f"  export {var}={shlex.quote(value)}")
 
 
 class Args(argparse.ArgumentParser):

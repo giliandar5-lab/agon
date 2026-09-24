@@ -645,7 +645,10 @@ for event in ("Stop", "StopFailure"):  # a turn that ends in an API error (a usa
     assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": 60,
                                                          "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
 assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gpt"], "cwd": ".",
-                                                "env_vars": ["AGON_DB"]}}  # Codex passes only listed variables
+                                                "env_vars": agon.ENV_VARS,  # Codex passes only listed variables
+                                                "tool_timeout_sec": 960}}  # Phase 3: ask takes minutes, not 60 s
+assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI",
+                         "AGON_FALLBACK", "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS"] and agon.TOOL_TIMEOUT == 960
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
 antigravity = manifest("plugin.json")
@@ -697,6 +700,18 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db"))}):
         assert script in snippet["command"] and snippet["command"].endswith(f"hook {name}"), snippet
     assert ("--env AGON_DB=" in out) == bool(extra)  # Codex passes only the variables it is told to
     assert not any(setup_home.iterdir()) and not Path(TMP, "team2.db").exists()  # nothing written, no database
+    # Phase 3: Codex needs a longer tool timeout for ask and the variables named; and ask gets each app's full path,
+    # since an app may start Agon with a shorter PATH (npm's claude.cmd and codex.cmd on Windows)
+    assert f"  tool_timeout_sec = 960\n  env_vars = {json.dumps(agon.ENV_VARS)}\n" in out, out
+    value = re.search(r"AGON_CMD_CLAUDE\W*'(\[.*\])'", out)[1]
+    assert json.loads(value)[1:] == agon.COMMANDS["claude"][1:] and json.loads(value)[0].lower() == str(fake).lower()
+    assert agon.split_command(value, "AGON_CMD_CLAUDE") == json.loads(value)  # what ask reads
+    for program, name in (("codex", "gpt"), ("agy", "gemini")):
+        assert f"  {program} isn't on PATH: ask can't run {name} until it is, or until AGON_CMD_{name.upper()}" in out
+    if not windows:  # the export line works as printed
+        [export] = [row.strip() for row in out.splitlines() if "export AGON_CMD_CLAUDE=" in row]
+        shell = subprocess.run(["sh", "-c", f'{export}; printf %s "$AGON_CMD_CLAUDE"'], capture_output=True, text=True)
+        assert shell.stdout == value, (export, shell)
 
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
@@ -853,7 +868,16 @@ me_too = Agent("gpt", env=ASK)
 res, text = asked(me_too, agent="gpt", prompt="hi", cwd=str(project))
 assert res["isError"] is True and "you are gpt, and a second opinion comes from another agent: claude or gemini" in text
 me_too.close()
+plugged = Agent("plugged", env=ASK, cwd=str(HERE))  # the Codex and Antigravity plugins start Agon in its own folder
+res, text = asked(plugged, agent="gpt", prompt="hi")
+assert res["isError"] is True and "pass `cwd`, the absolute path of your project folder" in text, text
+plugged.close()
 assert len(fake_runs()) == runs  # none of them ran an app
+for where, env in ((str(project), ASK), (str(HERE), ASK | {"CLAUDE_PROJECT_DIR": str(project)})):
+    near = Agent("near", env=env, cwd=where)  # without cwd: Claude Code's project folder, else the server's folder
+    assert "isError" not in near.call("ask", agent="gpt", prompt="hi")
+    assert Path(fake_runs()[-1]["cwd"]).resolve() == project.resolve()
+    near.close()
 
 # Phase 3, 6. A task runs in a temporary git worktree, on a new branch from the last commit: Agon commits what the app
 # changed and returns its summary, diff stat and branch; the worktree goes, and merging is the caller's call
