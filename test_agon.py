@@ -375,6 +375,11 @@ ci = (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
 for needed in ("ubuntu-latest", "windows-latest", "macos-latest", '"3.10"', '"3.13"', "run: python test_agon.py"):
     assert needed in ci, needed
 
+# 18. The contributing guide keeps the ground rules
+guide = (HERE / "CONTRIBUTING.md").read_text(encoding="utf-8")
+for rule in ("`agon.py`", "Zero dependencies", "`python test_agon.py`", "English"):
+    assert rule in guide, rule
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
