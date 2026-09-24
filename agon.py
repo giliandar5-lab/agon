@@ -122,6 +122,12 @@ def paused():
     return bool(row) and isinstance(row[0], str) and row[0].strip() == "STOP"
 
 
+def bad_recipient(to):
+    """Why `to` can't be a recipient, or None when it can."""
+    if not isinstance(to, str) or not 0 < len(to.strip()) <= 64 or any(c.isspace() for c in to.strip()):
+        return "`to` must be all, human or one agent's name, such as claude, gemini or gpt."
+
+
 def too_long(text):
     """Why `text` can't be one message, or None when it can."""
     if len(text) > MAX_TEXT:
@@ -271,12 +277,15 @@ def tool_send(session, args):
     text, to = args.get("text"), args.get("to", "all")
     if not isinstance(text, str) or not text.strip():
         raise ToolError("Nothing sent: `text` must be a non-empty string.")
-    if not isinstance(to, str) or not to.strip():
-        raise ToolError("Nothing sent: `to` must be all, human or an agent name such as claude, gemini or gpt.")
-    if problem := too_long(text):
+    if problem := bad_recipient(to) or too_long(text):
         raise ToolError(f"Nothing sent: {problem}")
-    post(session.me, to.strip(), text)
-    return "Sent.", None
+    to = to.strip()
+    post(session.me, to, text)
+    agents = sorted(name for (name,) in db().execute("SELECT name FROM agents"))
+    if to in ("all", "human", *agents):
+        return "Sent.", None
+    return (f"Sent, but no agent named {to!r} has connected yet (so far: {', '.join(agents)})."
+            " It gets the message when it does.", None)
 
 
 def tool_inbox(session, args):
@@ -537,7 +546,7 @@ class Web(BaseHTTPRequestHandler):
             text, to = msg["text"], msg.get("to", "all")
         except Exception:
             text = to = None
-        if not isinstance(text, str) or not text.strip() or not isinstance(to, str) or not to.strip():
+        if not isinstance(text, str) or not text.strip() or bad_recipient(to):
             return self.answer(400, 'Send JSON like {"to": "all", "text": "..."}.')
         if problem := too_long(text):
             return self.answer(413, problem)

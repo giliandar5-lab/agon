@@ -178,6 +178,11 @@ for args in ({}, {"text": "  "}, {"text": 5}, {"text": "hi", "to": ["gpt"]}):
 res = tess.call("inbox", wait="soon")
 assert res["isError"] is True and "`wait` must be a number" in res["content"][0]["text"], res
 assert "isError" not in tess.call("inbox", wait="0")  # numbers as strings still work, as in v0.1
+for to in ("gemini, gpt", "x" * 65, "   "):  # found in review: such messages used to vanish without a word
+    res = tess.call("send", text="hi", to=to)
+    assert res["isError"] is True and "`to` must be all, human or one agent's name" in res["content"][0]["text"], res
+assert tess("send", text="hi", to="codex").startswith("Sent, but no agent named 'codex' has connected yet")
+assert tess("send", text="hi", to=" vera ") == "Sent."  # a known agent (spaces around are fine)
 tess.close()
 
 
@@ -356,6 +361,7 @@ status, text = arena_post(json.dumps({"to": "all", "text": "z" * 8001}))
 assert status == 413 and "Put long content in a file and send its path." in text, (status, text)
 assert arena_post(json.dumps({"to": "sam", "text": "hello from the arena"}))[0] == 204
 assert arena_post(b"{broken")[0] == 400 and arena_post(json.dumps({"to": "all"}))[0] == 400
+assert arena_post(json.dumps({"to": "gpt claude", "text": "hi"}))[0] == 400
 arena.shutdown()
 arena.server_close()
 
