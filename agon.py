@@ -410,17 +410,21 @@ def work(session, todo):
         while (msg := todo.get()) is not EOF:
             rid = msg.get("id") if isinstance(msg, dict) else None
             session.current = rid if isinstance(rid, (str, int)) else None
-            if session.current in session.cancelled:
-                continue  # cancelled while it waited in the queue: don't run it at all
+            if session.current in session.cancelled:  # cancelled while it waited in the queue: don't run it
+                session.cancelled.discard(session.current)
+                continue
             reply, after = handle(session, msg)
-            if session.current in session.cancelled:
-                continue  # the client dropped this request: no reply, and its messages stay unread
+            if session.current in session.cancelled:  # cancelled while it ran: no reply, messages stay unread
+                session.cancelled.discard(session.current)
+                continue
             if reply is not None:
                 try:
                     emit(session.out, reply)
                 except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
                     return
-            if after:  # only now that the reply is out: at-least-once delivery
+            # Only now that the reply is out (at-least-once), and only if the client still reads: one that has
+            # closed our stdin is shutting down and won't see this reply, so its messages stay unread.
+            if after and not session.closed:
                 try:
                     after()
                 except Exception as e:  # the cursor stays put and the messages come again
