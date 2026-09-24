@@ -82,6 +82,8 @@ Run the tests before you finish, and end with a short summary: what you changed 
 The task from {asker}:
 {prompt}"""
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows: the apps and git start without a console window
+# Every process Agon starts gets its own stdin (DEVNULL at least). On Windows, a child that inherited the MCP server's
+# stdin blocks as soon as it touches it, while the server's main thread waits there for the client's next message
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -524,21 +526,30 @@ def feed(pipe, data):
 
 def kill_tree(p):
     """Stop process p and everything it started: SIGTERM to its process group, so the apps can clean up, and SIGKILL
-    to whatever is left after 5 s. On Windows taskkill /T finds the tree through the parent processes."""
+    to whatever is left after 5 s. On Windows taskkill /T finds the tree through the parent processes. Never waits
+    for good: at worst the app itself is killed."""
     if os.name == "nt":
         taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
-        subprocess.run([str(taskkill), "/F", "/T", "/PID", str(p.pid)], capture_output=True)
+        try:
+            subprocess.run([str(taskkill), "/F", "/T", "/PID", str(p.pid)], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     else:
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(p.pid, sig)
-            except ProcessLookupError:  # the whole group is gone
+            except (ProcessLookupError, PermissionError):  # the group is gone (macOS says EPERM when only zombies are)
                 break
             try:
                 p.wait(5)
             except subprocess.TimeoutExpired:
                 pass
-    p.wait()
+    try:
+        p.wait(10)
+    except subprocess.TimeoutExpired:  # the tree didn't go: at least the app itself does
+        p.kill()
+        p.wait()
 
 
 JOB = None  # Windows: the job object the apps that ask starts belong to (see contain())
@@ -664,8 +675,8 @@ def verdict(answer):
 
 def git(cwd, *args):
     """Run git in folder `cwd` and return what it printed; ToolError with git's own words when it fails."""
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                       creationflags=NO_WINDOW)
+    p = subprocess.run(["git", *args], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     if p.returncode:
         command = next(a for a in args if not a.startswith("-") and "=" not in a)  # commit, not the -c before it
         raise ToolError(f"git {command} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")

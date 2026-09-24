@@ -1,5 +1,6 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
 import datetime
+import faulthandler
 import http.client
 import io
 import json
@@ -16,6 +17,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+faulthandler.dump_traceback_later(240, exit=True)  # a test that hangs shows where, long before CI gives up
 TMP = tempfile.mkdtemp()
 HERE = Path(__file__).resolve().parent
 SERVER = str(HERE / "agon.py")
@@ -836,6 +838,31 @@ def agon_said():  # the latest line Agon wrote for the human
     return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human' ORDER BY id DESC").fetchone()[0]
 
 
+def beating():  # whether the child of a HANG app still writes
+    size = BEAT.stat().st_size if BEAT.exists() else -1
+    time.sleep(0.4)
+    return (BEAT.stat().st_size if BEAT.exists() else -1) != size
+
+
+def until(condition, seconds=15):
+    end = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < end, "timed out"
+        time.sleep(0.1)
+
+
+# Phase 3, 3 and 8, in this process first: run_cli hands an app its prompt on stdin and returns what it printed; an
+# app that hangs is stopped at the deadline, with the child it started
+code, out, err = agon.run_cli([sys.executable, str(FAKE), "claude"], "Look 🙂", str(project), ASK,
+                              time.monotonic() + 60, lambda: None)
+assert code == 0 and agon.final_answer(out)[0].startswith("claude looked at project"), (code, out, err)
+assert fake_runs()[-1]["prompt"] == "Look 🙂" and fake_runs()[-1]["via"] == "stdin"
+t0 = time.monotonic()
+code, out, err = agon.run_cli([sys.executable, str(FAKE), "agy", "-p=HANG"], None, str(project), ASK,
+                              time.monotonic() + 2, lambda: None)
+assert code is None and time.monotonic() - t0 < 30 and not beating(), (code, out, err, time.monotonic() - t0)
+
+
 # Phase 3, 1 and 3-5, 10. A review: claude and codex get the prompt on stdin, agy as -p=...; the run works in the
 # project folder and knows who asked; the reply is the app's final answer with its verdict; the arena logs the ask
 rev = Agent("rev", env=ASK)
@@ -1074,19 +1101,6 @@ assert agent_row("gpt", "last_seen") == seen
 # Phase 3, threads. An ask gets a thread of its own, so the agent's send and inbox answer while it runs (Claude Code
 # moves a long tool call to the background, and the agent goes on). A cancel, STOP or a closed client stops the app,
 # with its whole process tree, and no new ask starts while the team is paused
-def beating():  # whether the child of a HANG app still writes
-    size = BEAT.stat().st_size if BEAT.exists() else -1
-    time.sleep(0.4)
-    return (BEAT.stat().st_size if BEAT.exists() else -1) != size
-
-
-def until(condition, seconds=15):
-    end = time.monotonic() + seconds
-    while not condition():
-        assert time.monotonic() < end, "timed out"
-        time.sleep(0.1)
-
-
 busy = Agent("busy", env=ASK)
 while busy("inbox", wait=0) != "No new messages.":
     pass
