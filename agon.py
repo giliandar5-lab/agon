@@ -15,6 +15,7 @@ from pathlib import Path
 
 DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
 PORT = 8765
+PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -158,8 +159,9 @@ def serve_mcp(me, inp=None, out=None):
         try:
             match req["method"], p.get("name"):
                 case "initialize", _:
+                    asked = p.get("protocolVersion")
                     res = {
-                        "protocolVersion": p.get("protocolVersion", "2025-06-18"),
+                        "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "agon", "version": "0.1"},
                         "instructions": INSTRUCTIONS.format(me=me),
