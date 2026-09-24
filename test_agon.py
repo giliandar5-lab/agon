@@ -571,6 +571,30 @@ for text, when in (
     ("look at 3 files", None),
 ):
     assert agon.reset_time(text, now) == when, (text, agon.reset_time(text, now), when)
+
+# Phase 2, 7. The hook keeps an agent going at most AGON_MAX_AUTORUNS times (25) before the human speaks again
+assert "AGON_MAX_AUTORUNS" not in os.environ and agon.max_autoruns() == 25
+caught_up("kai")
+os.environ["AGON_MAX_AUTORUNS"] = "2"
+for i in range(2):
+    agon.post("gpt", "kai", f"ping {i}")
+    assert f"ping {i}" in hook("kai")[0]["reason"]
+agon.post("gpt", "kai", "ping 2")
+t0 = time.monotonic()
+assert hook("kai", wait=5) == (None, b"") and time.monotonic() - t0 < 2  # used up: it may stop, no waiting
+assert [t for (t,) in con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human'")] == [
+    "kai paused after 2 automatic turns, waiting for the human"]
+assert hook("kai") == (None, b"") and len(notices("kai")) == 1  # said once
+agon.post("human", "gpt", "go on")  # any message from the human, to anyone, gives the turns back
+assert agent_row("kai", "autoruns") == 0 and "ping 2" in hook("kai")[0]["reason"]
+assert agent_row("kai", "autoruns") == 1
+os.environ["AGON_MAX_AUTORUNS"] = "many"
+try:
+    hook("kai")
+    raise AssertionError("a bad AGON_MAX_AUTORUNS must be reported")
+except ValueError as e:
+    assert "AGON_MAX_AUTORUNS" in str(e)
+del os.environ["AGON_MAX_AUTORUNS"]
 HOOKS = dict(os.environ, AGON_DB=str(Path(TMP, "hooks.db")))  # a chat of its own, so names like gpt are free
 
 
