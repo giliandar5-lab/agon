@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 os.environ["AGON_DB"] = str(Path(tempfile.mkdtemp()) / "test.db")
@@ -38,4 +39,12 @@ con = agon.db()
 assert con.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 assert con.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
 assert con.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+
+# 2. One connection per thread
+assert agon.db() is con  # the same thread reuses its connection
+seen = []
+t = threading.Thread(target=lambda: (seen.append(id(agon.db())), agon.close_db()))
+t.start()
+t.join()
+assert seen and seen[0] != id(con)  # another thread gets its own
 print("ok")
