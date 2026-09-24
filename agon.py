@@ -17,6 +17,8 @@ from pathlib import Path
 DB = os.environ.get("AGON_DB") or str(Path(__file__).with_name("agon.db"))
 PORT = 8765
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
+RECAP = 20  # messages recapped by the first inbox call of a server process...
+RECAP_CHARS = 150  # ...each cut to this many characters
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -141,6 +143,31 @@ def advance(me, last):
     db().execute("UPDATE agents SET cursor = MAX(cursor, ?) WHERE name = ?", (last, me))
 
 
+def newest_id():
+    return db().execute("SELECT COALESCE(MAX(id), 0) FROM msgs").fetchone()[0]
+
+
+def line(row, cut=None):
+    """One message as agents see it: #id sender -> rcpt: text (squeezed onto one line when cut short)."""
+    i, sender, rcpt, text = row
+    if cut:
+        text = " ".join(str(text).split())
+        text = text if len(text) <= cut else text[: cut - 1] + "…"
+    return f"#{i} {sender} -> {rcpt}: {text}"
+
+
+def recap(me, cursor, start):
+    """The last RECAP messages `me` knew before this server process started (message `start` was the newest):
+    the ones delivered to it and its own. A restarted session reads them to remember what the team was doing."""
+    rows = db().execute(
+        "SELECT * FROM (SELECT id, sender, rcpt, text FROM msgs WHERE id <= ? AND (sender = ?"
+        " OR (id <= ? AND rcpt IN ('all', ?))) ORDER BY id DESC LIMIT ?) ORDER BY id",
+        (start, me, cursor, me, RECAP),
+    ).fetchall()
+    lines = [line(row, RECAP_CHARS) for row in rows]
+    return "\n".join(["Recap of the messages before this session (already read):", *lines]) if lines else ""
+
+
 def inbox(me, after, wait, stop=lambda: False):
     end = time.monotonic() + min(wait, 55)  # Codex cancels tool calls after 60 s by default
     while True:
@@ -187,6 +214,8 @@ class Session:
     def __init__(self, me, out):
         self.me, self.out = me, out
         self.client = None  # the app, from initialize.clientInfo.name
+        self.start = None  # the newest message id when this process got its first request: bounds the recap
+        self.recap = True  # the first inbox call starts with a recap
         self.current = None  # id of the request being handled
         self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
         self.closed = False  # the client closed our stdin
@@ -211,11 +240,22 @@ def tool_inbox(session, args):
         wait = float(args.get("wait", 30))
     except (TypeError, ValueError):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
-    rows = inbox(session.me, cursor_of(session.me), wait if wait > 0 else 0, session.stopped)  # NaN: no wait
-    if not rows:
-        return "No new messages.", None
-    last = rows[-1][0]
-    return "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows), lambda: advance(session.me, last)
+    cursor = cursor_of(session.me)
+    head = recap(session.me, cursor, session.start) if session.recap else ""
+    wait = 0 if head or not wait > 0 else wait  # a recap comes back at once; NaN means no wait
+    rows = inbox(session.me, cursor, wait, session.stopped)
+    text = "\n".join(line(row) for row in rows) or "No new messages."
+    if head and rows:
+        text = f"{head}\n\nNew messages:\n{text}"
+    elif head:
+        text = f"{head}\n\n{text}"
+
+    def delivered():
+        session.recap = False
+        if rows:
+            advance(session.me, rows[-1][0])
+
+    return text, delivered
 
 
 TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox}  # each returns (text, what to run once it's delivered)
@@ -235,6 +275,8 @@ def handle(session, msg):
         if not isinstance(params, dict):
             raise RpcError(-32602, "Invalid params: `params` must be an object")
         touch(session.me)  # presence: every request moves last_seen
+        if session.start is None:
+            session.start = newest_id()
         result, after = dispatch(session, msg["method"], params)
         return {"jsonrpc": "2.0", "id": msg["id"], "result": result}, after
     except RpcError as e:
