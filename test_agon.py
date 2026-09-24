@@ -713,7 +713,7 @@ assert vic.hello["capabilities"]["experimental"] == {"claude/channel": {}}  # de
 for a in (cleo, vic):
     while a("inbox", wait=0) != "No new messages.":  # caught up; the first tool call
         pass
-caught_up("dora")  # dora has called no tool: her client may not be listening yet
+caught_up("dora")  # dora has called no tool: its client may not be listening yet
 for name in ("cleo", "dora", "vic"):
     agon.post("gpt", name, f"pr ready for {name}")
 time.sleep(agon.RING_DELAY + 1.5)
