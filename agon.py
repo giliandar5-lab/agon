@@ -58,7 +58,8 @@ COMMANDS = {
     "gemini": ["agy", "-p={prompt}", "--output-format", "json", "--add-dir", "{cwd}"],
 }
 MODE_ARGS = {  # added at the end: a review only reads, a task writes (in a git worktree of its own)
-    "review": {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"], "gemini": ["--mode", "plan"]},
+    "review": {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"],
+               "gemini": ["--mode", "plan"]},
     "task": {"claude": ["--permission-mode", "acceptEdits"], "gpt": ["--sandbox", "workspace-write"],
              "gemini": ["--mode", "accept-edits"]},
 }
@@ -69,6 +70,14 @@ End it with one line: VERDICT: approve, or VERDICT: changes.
 
 What {asker} asks:
 {prompt}"""
+TASK = """{asker} asks you to do a task through Agon, where AI agents from different companies build one project.
+You work in a git worktree of your own. When you finish, Agon commits what you changed to branch {branch}, and
+{asker} decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, ask).
+Run the tests before you finish, and end with a short summary: what you changed and what the tests said.
+
+The task from {asker}:
+{prompt}"""
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows: the apps and git start without a console window
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -80,7 +89,7 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete; put long content in a file and send its path.
 - ask gets a second opinion from another agent's app, which takes minutes: a review (read-only; it runs the
-  tests and ends with a VERDICT)."""
+  tests and ends with a VERDICT) or a task done on a new git branch that you may merge."""
 
 # Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
 LOCAL = {"destructiveHint": False, "openWorldHint": False}
@@ -110,14 +119,15 @@ TOOLS = [
     {
         "name": "ask",
         "description": "Get a second opinion from another agent's app (claude, gpt or gemini), run headless on the"
-        " user's plan; it takes minutes. A review is read-only, runs the tests and ends with VERDICT: approve or"
-        " changes.",
+        " user's plan; it takes minutes. review: read-only, runs the tests, ends with VERDICT: approve or changes."
+        " task: works on a new git branch from your last commit and returns its summary, diff stat and branch;"
+        " merging it is your call.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "claude, gpt or gemini (not yourself)"},
-                "prompt": {"type": "string", "description": "what to review (at most 8,000 characters)"},
-                "mode": {"type": "string", "enum": ["review"], "default": "review"},
+                "prompt": {"type": "string", "description": "what to review or do (at most 8,000 characters)"},
+                "mode": {"type": "string", "enum": ["review", "task"], "default": "review"},
                 "cwd": {"type": "string", "description": "your project folder (absolute path)"},
             },
             "required": ["agent", "prompt"],
@@ -417,8 +427,8 @@ def ask_args(session, args):
     if problem := too_long(prompt, "prompt"):
         raise ToolError(f"Nothing asked: {problem}")
     mode = "review" if mode is None else mode
-    if mode != "review":
-        raise ToolError("Nothing asked: `mode` must be review.")
+    if mode not in MODE_ARGS:
+        raise ToolError("Nothing asked: `mode` must be review or task.")
     if cwd is None:  # Claude Code says where the project is; Codex and Antigravity start Agon in its plugin folder
         cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
         if Path(cwd).resolve() == Path(__file__).resolve().parent:
@@ -522,7 +532,7 @@ def run_cli(argv, stdin, cwd, env, end, stopped):
         p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err,
                              stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                              start_new_session=True,  # a process group of its own, killed as one (POSIX)
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # no console window (Windows)
+                             creationflags=NO_WINDOW)
         if stdin is not None:
             threading.Thread(target=feed, args=(p.stdin, stdin.encode()), daemon=True).start()
         code = None
@@ -597,10 +607,84 @@ def verdict(answer):
     return found[-1].lower() if found else None
 
 
+def git(cwd, *args):
+    """Run git in folder `cwd` and return what it printed; ToolError with git's own words when it fails."""
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW)
+    if p.returncode:
+        raise ToolError(f"git {args[0]} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
+    return p.stdout.strip()
+
+
+def repository(cwd):
+    """The top folder of the git repository that `cwd` is in, which must have a commit to start a task from."""
+    if not shutil.which("git"):
+        raise ToolError("Nothing asked: a task works on a git branch, and there is no git on Agon's PATH.")
+    try:
+        top = git(cwd, "rev-parse", "--show-toplevel")
+    except ToolError:
+        raise ToolError(f"Nothing asked: a task works on a git branch, and {cwd} isn't in a git repository.") from None
+    try:
+        git(top, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    except ToolError:
+        raise ToolError("Nothing asked: a task starts from your last commit, and this repository has none"
+                        " yet.") from None
+    return top
+
+
+def new_worktree(top, name):
+    """A new branch for agent `name`'s task at the last commit, checked out in a temporary git worktree: (the
+    worktree's folder, the branch, the commit it starts from)."""
+    base = git(top, "rev-parse", "HEAD")
+    branch = f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    taken = git(top, "branch", "--list", "--format=%(refname:short)", f"{branch}*").splitlines()
+    branch = next(b for b in (branch, *(f"{branch}-{i}" for i in range(2, 1000))) if b not in taken)
+    path = tempfile.mkdtemp(prefix=f"agon-{name}-")
+    try:
+        git(top, "worktree", "add", "-q", "-b", branch, path, base)
+    except ToolError:
+        os.rmdir(path)
+        raise
+    return path, branch, base
+
+
+def same_folder(top, path, cwd):
+    """The folder of worktree `path` that matches `cwd` in the repository at `top` (the worktree's top if none)."""
+    try:
+        folder = Path(path, Path(cwd).resolve().relative_to(Path(top).resolve()))
+    except ValueError:
+        return path
+    return str(folder) if folder.is_dir() else path
+
+
+def keep_work(top, path, branch, base, name, message):
+    """Commit what agent `name`'s app changed in worktree `path` to its branch, remove the worktree and return the
+    branch's `git diff --stat` from `base`: None when nothing changed, and then the branch goes too."""
+    if git(path, "status", "--porcelain"):
+        try:
+            git(path, "add", "-A")
+            git(path, "-c", f"user.name={name} (Agon)", "-c", "user.email=agon@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-q", "--no-verify", "-m", message)
+        except ToolError as e:
+            raise ToolError(f"{e} The work stays in {path}, on branch {branch}.") from None
+    stat = git(top, "-c", "core.quotepath=off", "diff", "--stat", f"{base}..{branch}").splitlines()
+    try:
+        git(top, "worktree", "remove", "--force", path)
+    except ToolError:  # a file still in use (Windows): `git worktree prune` forgets it once the folder is gone
+        pass
+    if not stat:
+        try:
+            git(top, "branch", "-D", branch)
+        except ToolError:
+            pass
+        return None
+    return "\n".join(stat if len(stat) <= 41 else [*stat[:40], " …", stat[-1]])
+
+
 def ask_run(asker, name, mode, prompt, cwd, end, stopped):
-    """Run agent `name`'s app once for an ask from `asker`: (its answer or None, why it failed or None, the texts that
-    show a usage limit or None)."""
-    argv, stdin = ask_command(name, mode, REVIEW.format(asker=asker, prompt=prompt), cwd)
+    """Run agent `name`'s app once for an ask from `asker`, with `prompt` (the whole text it gets) in folder `cwd`:
+    (its answer or None, why it failed or None, the texts that show a usage limit or None)."""
+    argv, stdin = ask_command(name, mode, prompt, cwd)
     started = time.monotonic()
     env = dict(os.environ, AGON_ASKED_BY=asker)
     try:
@@ -614,20 +698,41 @@ def ask_run(asker, name, mode, prompt, cwd, end, stopped):
         return None, f"{name} {why} after {spent}.", None
     if code or answer is None and error is not None:
         why = error or tail(err) or tail(out) or "no output"
-        return None, f"{name} failed after {spent} (exit code {code}): {why}", shows_limit([error, tail(out), tail(err)])
+        limit = shows_limit([error, tail(out), tail(err)])
+        return None, f"{name} failed after {spent} (exit code {code}): {why}", limit
     return (tail(out, MAX_INBOX) or tail(err, MAX_INBOX) if answer is None else answer), None, None
 
 
 def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
-    started = time.monotonic()
-    answer, problem, _ = ask_run(session.me, agent, mode, prompt, cwd, started + ask_timeout(), session.stopped)
-    head = f"{session.me} asked {agent} for a {mode}"
+    top = repository(cwd) if mode == "task" else None
+    me, started = session.me, time.monotonic()
+    end, head = started + ask_timeout(), f"{me} asked {agent} for a {mode}"
+    if top:  # a task works on a branch of its own, in a temporary worktree
+        path, branch, base = new_worktree(top, agent)
+        try:
+            answer, problem, _ = ask_run(me, agent, mode, TASK.format(asker=me, branch=branch, prompt=prompt),
+                                         same_folder(top, path, cwd), end, session.stopped)
+        finally:
+            stat = keep_work(top, path, branch, base, agent, f"{agent}: {' '.join(prompt.split())[:72]}")
+    else:
+        answer, problem, _ = ask_run(me, agent, mode, REVIEW.format(asker=me, prompt=prompt), cwd, end,
+                                     session.stopped)
+    spent = took(time.monotonic() - started)
     if problem:
+        if top and stat:
+            problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
         post("agon", "human", f"{head}: {problem}")  # every ask shows in the arena, and wakes no agent
         raise ToolError(problem)
+    if top and stat:
+        post("agon", "human", f"{head}: {agent} finished in {spent} on branch {branch}:"
+                              f" {stat.splitlines()[-1].strip()}.")
+        return (f"{agent} finished the task in {spent} on branch {branch}:\n{stat}\nMerge it if you want it: git merge"
+                f" {branch} (or drop it: git branch -D {branch}).\n\nIts summary:\n{clip(answer)}"), None
+    if top:
+        post("agon", "human", f"{head}: {agent} finished in {spent} without changing any file.")
+        return f"{agent} finished the task in {spent} without changing any file.\n\nIts summary:\n{clip(answer)}", None
     seal = f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict"
-    spent = took(time.monotonic() - started)
     post("agon", "human", f"{head}: {agent} answered in {spent}, {seal}.")
     return f"{agent} answered in {spent} ({mode}, {seal}):\n\n{clip(answer)}", None
 

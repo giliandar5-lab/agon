@@ -746,7 +746,7 @@ assert agon.COMMANDS == {"claude": ["claude", "-p", "--output-format", "json"], 
 assert agon.MODE_ARGS["review"] == {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"],
                                     "gemini": ["--mode", "plan"]}
 # The tests run fake apps through the same AGON_CMD_* variables: each writes down what it got and answers the way its
-# app does (the prompt says how: HANG, CRASH, PLAIN)
+# app does (the prompt says how: EDIT a file, HANG, CRASH, PLAIN)
 FAKE, FAKE_LOG, BEAT = Path(TMP, "fake_app.py"), Path(TMP, "fake.log"), Path(TMP, "beat.txt")
 FAKE.write_text(r'''"""A fake Claude Code, Codex or Antigravity for ask: python fake_app.py claude|codex|agy ARGS..."""
 import json, os, subprocess, sys, time
@@ -758,6 +758,9 @@ if prompt is None:
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
                           "asked_by": os.environ.get("AGON_ASKED_BY")}) + "\n")
+if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
+    with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
+        f.write(f"written by {app}\n")
 if "HANG" in prompt:  # a child that keeps writing, to see that the whole process tree goes
     subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
                       "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
@@ -826,7 +829,7 @@ for args, why in (({"agent": "bard", "prompt": "hi"}, "`agent` must be claude, g
                   ({"agent": ["gpt"], "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
                   ({"agent": "gpt", "prompt": "  "}, "`prompt` must be a non-empty string."),
                   ({"agent": "gpt", "prompt": "x" * 8001}, "The prompt is 8,001 characters; the limit is 8,000."),
-                  ({"agent": "gpt", "prompt": "hi", "mode": "dance"}, "`mode` must be review"),
+                  ({"agent": "gpt", "prompt": "hi", "mode": "dance"}, "`mode` must be review or task."),
                   ({"agent": "gpt", "prompt": "hi", "cwd": "project"}, "`cwd` must be the absolute path"),
                   ({"agent": "gpt", "prompt": "hi", "cwd": str(Path(TMP, "nowhere"))}, "`cwd` must be the absolute")):
     res, text = asked(rev, **args)
@@ -836,6 +839,57 @@ res, text = asked(me_too, agent="gpt", prompt="hi", cwd=str(project))
 assert res["isError"] is True and "you are gpt, and a second opinion comes from another agent: claude or gemini" in text
 me_too.close()
 assert len(fake_runs()) == runs  # none of them ran an app
+
+# Phase 3, 6. A task runs in a temporary git worktree, on a new branch from the last commit: Agon commits what the app
+# changed and returns its summary, diff stat and branch; the worktree goes, and merging is the caller's call
+repo = Path(TMP, "repo")
+(repo / "sub").mkdir(parents=True)
+
+
+def in_repo(*args):
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
+
+
+in_repo("init", "-q")
+(repo / "sub" / "app.py").write_text("print('hi')\n")
+in_repo("add", "-A")
+in_repo("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+assert agon.MODE_ARGS["task"] == {"claude": ["--permission-mode", "acceptEdits"],
+                                  "gpt": ["--sandbox", "workspace-write"], "gemini": ["--mode", "accept-edits"]}
+res, text = asked(rev, agent="gpt", prompt="EDIT notes.txt, please", mode="task", cwd=str(repo / "sub"))
+run, branch = fake_runs()[-1], re.search(r"on branch (agon/gpt-[\d-]+):", text)[1]
+assert "isError" not in res and text.startswith("gpt finished the task in "), text
+assert "notes.txt | 1 +\n 1 file changed, 1 insertion(+)\n" in text, text
+assert f"Merge it if you want it: git merge {branch} (or drop it: git branch -D {branch})." in text, text
+assert text.endswith("Its summary:\ncodex looked at sub: 3 tests passed.\nVERDICT: approve"), text  # the same subfolder
+assert run["args"] == ["exec", "--json", "--sandbox", "workspace-write"] and run["via"] == "stdin", run
+assert f"Agon commits what you changed to branch {branch}, and\nrev decides" in run["prompt"], run["prompt"]
+assert run["prompt"].endswith("The task from rev:\nEDIT notes.txt, please") and Path(run["cwd"]).name == "sub"
+assert not Path(run["cwd"]).exists() and len(in_repo("worktree", "list").splitlines()) == 1  # the worktree is gone
+assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"  # committed on the branch...
+assert in_repo("log", "-1", "--format=%an <%ae>|%s", branch) == "gpt (Agon) <agon@localhost>|gpt: EDIT notes.txt," \
+                                                                " please"
+assert not (repo / "sub" / "notes.txt").exists() and in_repo("status", "--porcelain") == ""  # ...not in the caller's
+assert re.fullmatch(rf"rev asked gpt for a task: gpt finished in \d+s on branch {branch}: 1 file changed,"
+                    r" 1 insertion\(\+\)\.", agon_said()), agon_said()
+res, text = asked(rev, agent="gemini", prompt="EDIT g.txt and then CRASH", mode="task", cwd=str(repo))
+run = fake_runs()[-1]
+assert run["args"][-4:] == ["--add-dir", run["args"][-3], "--mode", "accept-edits"], run["args"]
+assert Path(run["args"][-3]).resolve() == Path(run["cwd"]).resolve()  # agy's --add-dir is the worktree
+assert res["isError"] is True and "gemini failed after" in text and "What it changed is on branch agon/gemini-" in text
+assert "g.txt | 1 +" in text and agon_said().endswith("1 file changed, 1 insertion(+)"), text  # the work is kept
+res, text = asked(rev, agent="claude", prompt="Just look around", mode="task", cwd=str(repo))
+assert re.fullmatch(r"claude finished the task in \d+s without changing any file\.\n\nIts summary:\n"
+                    r"claude looked at agon-claude-\w+: 3 tests passed\.\nVERDICT: approve", text), text
+assert fake_runs()[-1]["args"][-2:] == ["--permission-mode", "acceptEdits"]
+assert in_repo("branch", "--list", "agon/claude-*") == "" and len(in_repo("worktree", "list").splitlines()) == 1
+assert agon_said().startswith("rev asked claude for a task: claude finished in ") and "without changing" in agon_said()
+empty_repo = Path(TMP, "empty-repo")
+empty_repo.mkdir()
+subprocess.run(["git", "init", "-q"], cwd=empty_repo, check=True)
+for where, why in ((project, f"{project} isn't in a git repository"), (empty_repo, "this repository has none yet")):
+    res, text = asked(rev, agent="gpt", prompt="EDIT x.txt", mode="task", cwd=str(where))
+    assert res["isError"] is True and text.startswith("Nothing asked: a task ") and why in text, text
 
 # Phase 3, 8. The timeout (AGON_ASK_TIMEOUT, default 900 s) kills the app's whole process tree
 assert agon.ASK_TIMEOUT == 900
@@ -865,7 +919,8 @@ for bad in ("[1, 2]", "[]", '"unclosed'):
         raise AssertionError(f"{bad} must be refused")
     except agon.ToolError as e:
         assert str(e).startswith("AGON_CMD_GPT must be a command line or a JSON list") and '"codex"' in str(e), e
-assert agon.split_command('["C:\\\\apps\\\\agy.exe", "-p={prompt}"]', "AGON_CMD_GEMINI") == ["C:\\apps\\agy.exe", "-p={prompt}"]
+windows_json = '["C:\\\\apps\\\\agy.exe", "-p={prompt}"]'  # JSON needs doubled backslashes
+assert agon.split_command(windows_json, "AGON_CMD_GEMINI") == ["C:\\apps\\agy.exe", "-p={prompt}"]
 empty = Path(TMP, "empty-bin")
 empty.mkdir()
 lost = Agent("lost", env={k: v for k, v in ASK.items() if not k.startswith("AGON_CMD_")} | {"PATH": str(empty)})
