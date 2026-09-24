@@ -2,7 +2,8 @@
 
 Thanks for helping! Agon stays small on purpose, so a few rules:
 
-- **One file.** All of Agon is `agon.py`: no packages, no build step.
+- **One file.** All of Agon is `agon.py`: no packages, no build step. The plugin manifests and the two launchers
+  (`agon`, `agon.cmd`) only start it.
 - **Zero dependencies.** Python 3.10+ standard library only, on Windows, macOS and Linux.
 - **Tests are required.** Every change in behavior comes with an assert-based check in `test_agon.py`.
   Run `python test_agon.py` before you open a pull request: it must print `ok`. CI runs it on all three systems.

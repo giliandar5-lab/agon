@@ -25,6 +25,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
+VERSION = "0.2.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -400,7 +401,7 @@ def dispatch(session, method, params):
                 "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
                 # Claude Code channels (research preview): run with --dangerously-load-development-channels
                 "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
-                "serverInfo": {"name": "agon", "version": "0.1"},
+                "serverInfo": {"name": "agon", "version": VERSION},
                 "instructions": INSTRUCTIONS.format(me=session.me),
             }, None
         case "ping":

@@ -628,10 +628,14 @@ def manifest(path):
     return json.loads((HERE / path).read_text(encoding="utf-8"))
 
 
+lvy = Agent("lvy")  # the version the MCP server reports is the plugins' version
+served_version = lvy.hello["serverInfo"]["version"]
+lvy.close()
 claude_plugin, codex_plugin, market = (manifest(p) for p in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json",
                                                               ".claude-plugin/marketplace.json"))
 assert market["name"] == "agon" and [(p["name"], p["source"]) for p in market["plugins"]] == [("agon", "./")]
-assert claude_plugin["name"] == codex_plugin["name"] == "agon" and claude_plugin["version"] == codex_plugin["version"]
+assert claude_plugin["name"] == codex_plugin["name"] == "agon"
+assert claude_plugin["version"] == codex_plugin["version"] == agon.VERSION == served_version, served_version
 python = "${user_config.python}"  # Claude Code has no per-OS fields: on Windows the user picks py
 option = claude_plugin["userConfig"]["python"]
 assert option["default"] == "python3" and "On Windows use py" in option["description"], option
@@ -756,10 +760,18 @@ for readme, limits in (("README.md", ("8,000", "12,000")), ("README.ru.md", ("8 
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*limits, "`STOP`", "20", "WAL", "CONTRIBUTING.md"):
         assert needed in text, (readme, needed)
-# Phase 2, A: the shared database and how to run separate teams
+# Phase 2, A and 14: the shared database; plugins first, then setup, then the manual setup; channels; the limits
 for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "одну команду за раз")):
     text = (HERE / readme).read_text(encoding="utf-8")
     assert "`~/.agon/agon.db`" in text and one_team in text and "`AGON_DB`" in text, readme
+    order = [text.index(step) for step in ("/plugin marketplace add giliandar5-lab/agon", "python agon.py setup",
+                                           "claude mcp add --scope user agon")]
+    assert order == sorted(order), (readme, order)
+    for needed in ("codex plugin marketplace add giliandar5-lab/agon", "codex plugin add agon@agon", "/hooks",
+                   "agy plugin install ./agon", "--config python=py", "agon.cmd", '"StopFailure"', "hook gemini",
+                   "--dangerously-load-development-channels plugin:agon@agon", "server:agon", "AGON_MAX_AUTORUNS",
+                   "AGON_LIMIT_PATTERNS", "`--wait`", "v0.2"):
+        assert needed in text, (readme, needed)
 
 for a in (claude, gemini, gpt):
     a.close()
