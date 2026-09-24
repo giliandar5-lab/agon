@@ -20,6 +20,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 1 — Solid core
 - [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [x] Phase 3 — Cross-vendor second opinion (`ask`)
+- [ ] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
 - [ ] Phase 4 — Task board (no downtime)
 - [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [ ] Phase 6 — The arena
@@ -99,7 +100,8 @@ When asked to do "the next phase":
      out of quota (parse the reset time if it is printed), post a short system message to the team, allow the stop;
   3. unread messages → deliver them as the continuation prompt and advance the cursor;
   4. otherwise wait up to `--wait` seconds (default 25) for a message, then allow the stop.
-  Output per app: Claude Code and Codex → exit code 2 with the prompt on stderr; Antigravity → stdout
+  Output per app, always a JSON decision on stdout with exit code 0 (Windows shells turn exit code 2 into 1):
+  Claude Code and Codex → `{"decision": "block", "reason": "<prompt>"}`; Antigravity →
   `{"decision": "continue", "reason": "<prompt>"}`. The default format follows the name
   (claude → claude, gpt → codex, gemini → antigravity).
 - Auto-turn budget: `AGON_MAX_AUTORUNS` (default 25) continuations per agent, reset by any human message; at the
@@ -136,6 +138,37 @@ When asked to do "the next phase":
 - Timeout (default 900 s) kills the whole process tree; a missing CLI gives a clear error; every call is
   logged to the chat (who asked whom, duration, verdict).
 - Tests use fake CLI scripts through the same environment variables.
+
+## Phase 3.1 — Review evidence (fix found in a real-CLI audit)
+
+An audit on a Windows 11 PC ran `ask` in review mode with the **real** apps on a tiny repository whose test is
+`python test_app.py`. Neither reviewer could run the test, and both still answered `VERDICT: approve`:
+- Claude Code 2.1.280 (`-p --permission-mode plan`, model haiku): the Bash call got "This command requires
+  approval": plan mode in `-p` has no one to approve commands, so every non-read-only command is denied.
+- Codex CLI 0.144.2 (`exec --json --sandbox read-only`): the command ran in Codex's Windows sandbox, where PowerShell
+  said `python` is not recognized: the sandbox's PATH doesn't reach the user's Python.
+- Fake CLIs can't show this; that is why the tests passed. The same limits hit task mode ("run the tests before you
+  finish"), since `acceptEdits` doesn't approve shell commands in `-p` either.
+
+Fix, so that every verdict rests on evidence Agon itself produced:
+- **Agon runs the tests, not the reviewer.** `AGON_TEST_CMD` (a command line or a JSON list, set by the human in the
+  environment or the plugin config; never taken from a tool argument, so an agent can't use it to run commands
+  outside its own app's sandbox) runs with a timeout (`AGON_TEST_TIMEOUT`, default 300 s), no shell, its own stdin
+  and the same process-tree kill as `ask`. Review: in the project folder before the reviewer starts (for gemini, in
+  its throwaway copy). Task: in the task's worktree after the app finishes, before Agon commits. Its exit code and
+  output tail go into the reviewer's prompt ("Test results, run by Agon: …") and into the ask's result.
+- **A verdict states its evidence.** The result says `VERDICT: approve (tests passed)`, `VERDICT: approve (tests
+  failed)` or `VERDICT: approve (no tests run: set AGON_TEST_CMD)`; the arena line says the same. The review prompt
+  tells the reviewer to approve only if the tests Agon ran passed, and to report failing tests as changes.
+- **No AGON_TEST_CMD:** the ask still works, the result says clearly that no tests ran, and `setup`/README explain
+  how to set it (examples: `python -m pytest -q`, `npm test`, `python test_agon.py`).
+- Keep the reviewers read-only (plan mode, read-only sandbox, gemini's copy): with Agon running the tests they no
+  longer need shell access.
+- README: correct the claims that reviewers run the tests; document `AGON_TEST_CMD`, `AGON_TEST_TIMEOUT`.
+- Tests: fake CLIs plus a fake test command that passes, fails, prints a lot, hangs past the timeout; verdict labels
+  for each; `AGON_TEST_CMD` passed as a tool argument is ignored; a task's tests run in its worktree.
+- Manual test on Windows: repeat the audit (a tiny repo, `AGON_TEST_CMD=python test_app.py`, a real claude review)
+  and check that the result quotes Agon's test run and the verdict label.
 
 ## Phase 4 — Task board (no downtime)
 
