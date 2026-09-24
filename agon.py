@@ -59,7 +59,14 @@ def db():
     if con is None:
         # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
         con = sqlite3.connect(DB, timeout=5, isolation_level=None)
-        con.execute("PRAGMA journal_mode=WAL")  # readers and the writer don't block each other
+        for tries in range(50):  # WAL: readers and the writer don't block each other
+            try:
+                con.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError:  # two agents switching a new file at once skip the busy timeout
+                if tries == 49:
+                    raise
+                time.sleep(0.1)
         con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
         migrate(con)
         _local.con = con
