@@ -5,6 +5,7 @@ import io
 import json
 import os
 import queue
+import re
 import sqlite3
 import subprocess
 import sys
@@ -24,9 +25,9 @@ import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line 
 class Agent:
     """A fake MCP client (like Claude Code or Codex) talking to `python agon.py <name>` over stdio."""
 
-    def __init__(self, name, client="fake-client", version="2025-06-18", argv=None):
+    def __init__(self, name, client="fake-client", version="2025-06-18", argv=None, env=None, cwd=None):
         argv = argv or [sys.executable, SERVER, name]
-        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, cwd=cwd)
         info = {"name": client, "version": "1.0"}
         self.hello = self.rpc("initialize", {"protocolVersion": version, "clientInfo": info})["result"]
         assert self.hello["serverInfo"]["name"] == "agon"
@@ -737,12 +738,191 @@ agon.post("human", "all", "go on")
 for a in (cleo, dora, vic):
     a.close()
 
+# Phase 3, 2-3. ask runs each agent's app headless with the roadmap's commands (checked against claude 2.1.281, codex
+# 0.156.1 and agy 1.2.10); a review adds the read-only flags. agy takes no prompt on stdin, and works in a folder
+# only when it is given with --add-dir
+assert agon.COMMANDS == {"claude": ["claude", "-p", "--output-format", "json"], "gpt": ["codex", "exec", "--json"],
+                         "gemini": ["agy", "-p={prompt}", "--output-format", "json", "--add-dir", "{cwd}"]}
+assert agon.MODE_ARGS["review"] == {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"],
+                                    "gemini": ["--mode", "plan"]}
+# The tests run fake apps through the same AGON_CMD_* variables: each writes down what it got and answers the way its
+# app does (the prompt says how: HANG, CRASH, PLAIN)
+FAKE, FAKE_LOG, BEAT = Path(TMP, "fake_app.py"), Path(TMP, "fake.log"), Path(TMP, "beat.txt")
+FAKE.write_text(r'''"""A fake Claude Code, Codex or Antigravity for ask: python fake_app.py claude|codex|agy ARGS..."""
+import json, os, subprocess, sys, time
+app, args = sys.argv[1], sys.argv[2:]
+prompt = next((a[3:] for a in args if a.startswith("-p=")), None)
+via = "stdin" if prompt is None else "args"
+if prompt is None:
+    prompt = sys.stdin.buffer.read().decode("utf-8")
+with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
+                          "asked_by": os.environ.get("AGON_ASKED_BY")}) + "\n")
+if "HANG" in prompt:  # a child that keeps writing, to see that the whole process tree goes
+    subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
+                      "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
+    time.sleep(600)
+if "CRASH" in prompt:
+    sys.stderr.write("boom: the fake crashed\n")
+    sys.exit(3)
+if "PLAIN" in prompt:
+    print("plain words, no JSON")
+    sys.exit()
+answer = f"{app} looked at {os.path.basename(os.getcwd())}: 3 tests passed.\nVERDICT: approve"
+if app == "claude":
+    events = [{"type": "result", "subtype": "success", "is_error": False, "result": answer}]
+elif app == "codex":
+    events = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"},
+              {"type": "item.completed", "item": {"id": "i0", "type": "error", "message": "just a warning"}},
+              {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": answer}},
+              {"type": "turn.completed", "usage": {"input_tokens": 1}}]
+else:
+    events = [{"conversation_id": "c1", "status": "SUCCESS", "response": answer + "\n"}]
+for event in events:
+    print(json.dumps(event))
+''', encoding="utf-8")
+APPS = {"claude": "claude", "gpt": "codex", "gemini": "agy"}
+ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT))
+for name, app in APPS.items():  # the default command, with the fake in place of the app
+    ASK[f"AGON_CMD_{name.upper()}"] = json.dumps([sys.executable, str(FAKE), app, *agon.COMMANDS[name][1:]])
+project = Path(TMP, "project")
+project.mkdir()
+
+
+def fake_runs():
+    return [json.loads(row) for row in FAKE_LOG.read_text(encoding="utf-8").splitlines()] if FAKE_LOG.exists() else []
+
+
+def asked(asker, **args):  # an ask: (the whole tools/call result, its text)
+    res = asker.call("ask", **args)
+    return res, res["content"][0]["text"]
+
+
+def agon_said():  # the latest line Agon wrote for the human
+    return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human' ORDER BY id DESC").fetchone()[0]
+
+
+# Phase 3, 1 and 3-5, 10. A review: claude and codex get the prompt on stdin, agy as -p=...; the run works in the
+# project folder and knows who asked; the reply is the app's final answer with its verdict; the arena logs the ask
+rev = Agent("rev", env=ASK)
+for name, app in APPS.items():
+    res, text = asked(rev, agent=name, prompt="Please review utils.py 🙂", cwd=str(project))
+    run = fake_runs()[-1]
+    template = [*agon.COMMANDS[name][1:], *agon.MODE_ARGS["review"][name]]
+    assert run["args"] == [a.replace("{prompt}", run["prompt"]).replace("{cwd}", str(project)) for a in template], run
+    assert run["via"] == ("args" if name == "gemini" else "stdin") and run["asked_by"] == "rev", run
+    assert "Review only: don't change any files." in run["prompt"] and run["prompt"].endswith("review utils.py 🙂")
+    assert "VERDICT: approve, or VERDICT: changes" in run["prompt"] and Path(run["cwd"]).resolve() == project.resolve()
+    assert "isError" not in res and text.startswith(f"{name} answered in "), text
+    assert f"s (review, VERDICT: approve):\n\n{app} looked at project: 3 tests passed.\nVERDICT: approve" in text, text
+    assert re.fullmatch(rf"rev asked {name} for a review: {name} answered in \d+s, VERDICT: approve\.", agon_said())
+res, text = asked(rev, agent="gpt", prompt="PLAIN, please", cwd=str(project))  # no JSON: the output is the answer
+assert "isError" not in res and text.endswith(" (review, no verdict):\n\nplain words, no JSON"), text
+res, text = asked(rev, agent="claude", prompt="CRASH, please", cwd=str(project))
+assert res["isError"] is True and re.match(r"claude failed after \d+s \(exit code 3\): boom: the fake crashed$", text)
+assert agon_said() == f"rev asked claude for a review: {text}"
+runs = len(fake_runs())
+for args, why in (({"agent": "bard", "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
+                  ({"agent": ["gpt"], "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
+                  ({"agent": "gpt", "prompt": "  "}, "`prompt` must be a non-empty string."),
+                  ({"agent": "gpt", "prompt": "x" * 8001}, "The prompt is 8,001 characters; the limit is 8,000."),
+                  ({"agent": "gpt", "prompt": "hi", "mode": "dance"}, "`mode` must be review"),
+                  ({"agent": "gpt", "prompt": "hi", "cwd": "project"}, "`cwd` must be the absolute path"),
+                  ({"agent": "gpt", "prompt": "hi", "cwd": str(Path(TMP, "nowhere"))}, "`cwd` must be the absolute")):
+    res, text = asked(rev, **args)
+    assert res["isError"] is True and text.startswith("Nothing asked: ") and why in text, (args, text)
+me_too = Agent("gpt", env=ASK)
+res, text = asked(me_too, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and "you are gpt, and a second opinion comes from another agent: claude or gemini" in text
+me_too.close()
+assert len(fake_runs()) == runs  # none of them ran an app
+
+# Phase 3, 8. The timeout (AGON_ASK_TIMEOUT, default 900 s) kills the app's whole process tree
+assert agon.ASK_TIMEOUT == 900
+slow = Agent("slow", env=ASK | {"AGON_ASK_TIMEOUT": "2"})
+t0 = time.monotonic()
+res, text = asked(slow, agent="gemini", prompt="HANG, please", cwd=str(project))
+assert res["isError"] is True and "gemini ran out of time (AGON_ASK_TIMEOUT) and was stopped after" in text, text
+assert time.monotonic() - t0 < 15
+size = BEAT.stat().st_size
+time.sleep(0.5)
+assert size > 0 and BEAT.stat().st_size == size  # the app's child is gone too
+slow.close()
+bad_timeout = Agent("bad-timeout", env=ASK | {"AGON_ASK_TIMEOUT": "soon"})
+res, text = asked(bad_timeout, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and "AGON_ASK_TIMEOUT must be a number of seconds" in text, text
+bad_timeout.close()
+
+# Phase 3, 2 and 9. AGON_CMD_* may also be a command line (as setup prints it). An app that isn't there gives a clear
+# error that says where Agon looked (apps may give Agon a shorter PATH than the terminal has)
+liner = Agent("liner", env=ASK | {"AGON_CMD_GPT": agon.command_line([sys.executable, str(FAKE), "codex", "exec"])})
+res, text = asked(liner, agent="gpt", prompt="review", cwd=str(project))
+assert "isError" not in res and fake_runs()[-1]["args"] == ["exec", "--sandbox", "read-only"], text
+liner.close()
+for bad in ("[1, 2]", "[]", '"unclosed'):
+    try:
+        agon.split_command(bad, "AGON_CMD_GPT")
+        raise AssertionError(f"{bad} must be refused")
+    except agon.ToolError as e:
+        assert str(e).startswith("AGON_CMD_GPT must be a command line or a JSON list") and '"codex"' in str(e), e
+assert agon.split_command('["C:\\\\apps\\\\agy.exe", "-p={prompt}"]', "AGON_CMD_GEMINI") == ["C:\\apps\\agy.exe", "-p={prompt}"]
+empty = Path(TMP, "empty-bin")
+empty.mkdir()
+lost = Agent("lost", env={k: v for k, v in ASK.items() if not k.startswith("AGON_CMD_")} | {"PATH": str(empty)})
+res, text = asked(lost, agent="gpt", prompt="review", cwd=str(project))
+assert res["isError"] is True and text.startswith("Can't run gpt: no codex") and str(empty) in text, text
+assert "set AGON_CMD_GPT to its full command (`python agon.py setup` prints it)" in text, text
+missing = Agent("missing", env=ASK | {"AGON_CMD_GEMINI": json.dumps([str(Path(TMP, "no", "agy.exe")), "-p={prompt}"])})
+res, text = asked(missing, agent="gemini", prompt="review", cwd=str(project))
+assert res["isError"] is True and f"{Path(TMP, 'no', 'agy.exe')} doesn't exist or can't be run" in text, text
+for a in (lost, missing):
+    a.close()
+if windows:  # cmd.exe would read a prompt passed to a batch file as commands: Agon refuses
+    (empty / "agy.cmd").write_text("@echo off\n")
+    guard = Agent("guard", env=ASK | {"AGON_CMD_GEMINI": json.dumps([str(empty / "agy.cmd"), "-p={prompt}"])})
+    res, text = asked(guard, agent="gemini", prompt="hi & calc", cwd=str(project))
+    assert res["isError"] is True and "is a batch file, and cmd.exe could run commands hidden" in text, text
+    guard.close()
+
+# Phase 3, 4. The final message of each app's format, else nothing (then the raw output tail is the answer)
+assert agon.final_answer(json.dumps({"type": "result", "is_error": False, "result": "fine"})) == ("fine", None)
+assert agon.final_answer(json.dumps([{"type": "system"}, {"type": "result", "result": "v"}])) == ("v", None)
+claude_429 = {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,  # seen with 2.1.281
+              "result": "API Error: Request rejected (429) · This request would exceed your account's rate limit."}
+assert agon.final_answer(json.dumps(claude_429)) == (None, claude_429["result"])
+codex_limit = [{"type": "thread.started", "thread_id": "t"},  # seen with codex 0.156.1
+               {"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Model metadata..."}},
+               {"type": "turn.started"},
+               {"type": "error", "message": "You’ve hit your usage limit. Upgrade to Pro or try again at 7:48 PM."},
+               {"type": "turn.failed", "error": {"message": "You’ve hit your usage limit. Upgrade to Pro or try"
+                                                            " again at 7:48 PM."}}]
+answer, error = agon.final_answer("Reading prompt from stdin...\n" + "\n".join(map(json.dumps, codex_limit)))
+assert answer is None and error.startswith("You’ve hit your usage limit.") and agon.shows_limit([error]), error
+agy_quota = {"conversation_id": "c", "status": "ERROR", "response": "", "error": "API error (attempt 7): Error 429,"
+             " Message: You exceeded your current quota. Your quota will reset after 2h3m4s., Status:"
+             " RESOURCE_EXHAUSTED, Details: []"}  # seen with agy 1.2.10
+assert agon.final_answer(json.dumps(agy_quota)) == (None, agy_quota["error"]) and agon.shows_limit([agy_quota["error"]])
+stream = {"event": "result", "result": {"conversation_id": "c", "status": "SUCCESS", "response": "apple\n"}}
+assert agon.final_answer(json.dumps(stream)) == ("apple\n", None)
+assert agon.final_answer("plain words\n[1, 2]\n{not json") == (None, None)
+assert agon.shows_limit([claude_429["result"]]) is None  # an API key's rate limit isn't a plan's usage limit
+assert agon.verdict("Tests fail.\n**VERDICT: Changes**: fix x") == "changes"
+assert agon.verdict("VERDICT: changes, then\nVERDICT: approve") == "approve" and agon.verdict("fine") is None
+long_answer = "start " + "x" * 20000 + " VERDICT: approve"
+cut = agon.clip(long_answer)
+assert len(cut) < agon.MAX_INBOX and cut.startswith("start ") and cut.endswith("VERDICT: approve") and "cut)" in cut
+assert (agon.took(0.4), agon.took(59.6), agon.took(102)) == ("0s", "1m 0s", "1m 42s")
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
-assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox"]
-for tool in json.loads(raw)["result"]["tools"]:  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
+assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "ask"]
+send_tool, inbox_tool, ask_tool = json.loads(raw)["result"]["tools"]
+for tool in (send_tool, inbox_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
     assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
+# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
+assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
+assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
 sam.close()
 
 # 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons
