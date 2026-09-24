@@ -1,7 +1,7 @@
 {
   "name": "agon",
-  "version": "0.2.0",
-  "description": "Your AI rivals, one team: GPT joins Claude (Claude Code) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox) and a Stop hook that keeps Codex going with new messages.",
+  "version": "0.3.0",
+  "description": "Your AI rivals, one team: GPT joins Claude (Claude Code) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, and ask for a second opinion from another company's agent) and a Stop hook that keeps Codex going with new messages.",
   "mcpServers": {
     "agon": {
       "command": "./agon",
@@ -10,8 +10,16 @@
       ],
       "cwd": ".",
       "env_vars": [
-        "AGON_DB"
-      ]
+        "AGON_DB",
+        "AGON_ASKED_BY",
+        "AGON_CMD_CLAUDE",
+        "AGON_CMD_GPT",
+        "AGON_CMD_GEMINI",
+        "AGON_FALLBACK",
+        "AGON_ASK_TIMEOUT",
+        "AGON_LIMIT_PATTERNS"
+      ],
+      "tool_timeout_sec": 960
     }
   },
   "hooks": {

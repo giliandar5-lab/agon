@@ -13,9 +13,12 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -25,7 +28,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.2.0"  # also in the plugin manifests
+VERSION = "0.3.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -45,6 +48,49 @@ LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON
     r"(?:reached|exceeded|exhausted) (?:your|the) (?:\w+ ){0,2}quota|QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED",  # Gemini
     r"^rate_limit$",  # Claude Code's StopFailure error type
 ]
+ASK_TIMEOUT = 900  # seconds one ask may take (AGON_ASK_TIMEOUT); then Agon kills the run's whole process tree
+TOOL_TIMEOUT = ASK_TIMEOUT + 60  # Codex's tool_timeout_sec for Agon: its default of 60 s would cut every ask short
+# The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
+ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
+            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS"]
+# How ask runs each agent's app headless, on the user's own plan. AGON_CMD_CLAUDE, AGON_CMD_GPT and AGON_CMD_GEMINI
+# replace a command (a JSON list or a command line): {prompt} marks where the prompt goes (otherwise it goes on stdin)
+# and {cwd} the folder the run works in. Checked with claude 2.1.281, codex 0.156.1 and agy 1.2.10
+COMMANDS = {
+    "claude": ["claude", "-p", "--output-format", "json"],
+    "gpt": ["codex", "exec", "--json"],
+    # agy takes no prompt on stdin, and without --add-dir it works in a scratch folder of its own
+    "gemini": ["agy", "-p={prompt}", "--output-format", "json", "--add-dir", "{cwd}"],
+}
+MODE_ARGS = {  # added at the end: a review only reads, a task writes (in a git worktree of its own)
+    "review": {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"],
+               "gemini": ["--mode", "plan"]},
+    "task": {"claude": ["--permission-mode", "acceptEdits"], "gpt": ["--sandbox", "workspace-write"],
+             "gemini": ["--mode", "accept-edits"]},
+}
+REVIEW = """{asker} asks you for a code review through Agon, where AI agents from different companies build one project.
+Review only: don't change any files.{copy} Run the project's tests and cite the commands you ran and what they printed.
+Your final message is the answer; don't use Agon's tools (send, inbox, ask).
+End it with one line: VERDICT: approve, or VERDICT: changes.
+
+What {asker} asks:
+{prompt}"""
+# Claude Code's plan mode and Codex's read-only sandbox keep a reviewer from editing the files. agy's --mode plan only
+# puts /plan before the prompt: only its permission settings stop a write, and 1.2.10 writes in a temporary folder or
+# where a write_file rule allows it, even during a review. So its reviews work in a throwaway copy of the project
+REVIEW_COPY = {"gemini"}
+COPY = (" You work in a throwaway copy of the project that has its uncommitted changes; what .gitignore leaves out,"
+        " such as installed dependencies, and links that lead out of the project aren't in it.")
+TASK = """{asker} asks you to do a task through Agon, where AI agents from different companies build one project.
+You work in a git worktree of your own. When you finish, Agon commits what you changed to branch {branch}, and
+{asker} decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, ask).
+Run the tests before you finish, and end with a short summary: what you changed and what the tests said.
+
+The task from {asker}:
+{prompt}"""
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows: the apps and git start without a console window
+# Every process Agon starts gets its own stdin (DEVNULL at least). On Windows, a child that inherited the MCP server's
+# stdin blocks as soon as it touches it, while the server's main thread waits there for the client's next message
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -54,7 +100,11 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - When you end your turn, Agon may start the next one with your new messages. A <channel source="agon">
   event only says that messages wait: call inbox to read them.
 - Announce a file before editing it, so two agents never edit the same file at once.
-- Keep messages short and concrete; put long content in a file and send its path."""
+- Keep messages short and concrete; put long content in a file and send its path.
+- ask gets a second opinion from another agent's app, which takes minutes: a review (read-only; it runs the
+  tests and ends with a VERDICT) or a task done on a new git branch that you may merge."""
+ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
+off here and team messages don't come to you."""
 
 # Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
 LOCAL = {"destructiveHint": False, "openWorldHint": False}
@@ -80,6 +130,25 @@ TOOLS = [
         " says when the human has paused the team.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
         "annotations": LOCAL,
+    },
+    {
+        "name": "ask",
+        "description": "Get a second opinion from another agent's app (claude, gpt or gemini), run headless on the"
+        " user's plan; it takes minutes. review: read-only, runs the tests, ends with VERDICT: approve or changes."
+        " task: works on a new git branch from your last commit and returns its summary, diff stat and branch;"
+        " merging it is your call.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent": {"type": "string", "description": "claude, gpt or gemini (not yourself)"},
+                "prompt": {"type": "string", "description": "what to review or do (at most 8,000 characters)"},
+                "mode": {"type": "string", "enum": ["review", "task"], "default": "review"},
+                "cwd": {"type": "string", "description": "your project folder (absolute path)"},
+            },
+            "required": ["agent", "prompt"],
+        },
+        # it sends the project to another company's app and spends the user's plan there: apps may ask first
+        "annotations": {"destructiveHint": False, "openWorldHint": True},
     },
 ]
 
@@ -164,10 +233,10 @@ def bad_recipient(to):
         return "`to` must be all, human or one agent's name, such as claude, gemini or gpt."
 
 
-def too_long(text):
-    """Why `text` can't be one message, or None when it can."""
+def too_long(text, what="message"):
+    """Why `text` can't be one message (or one ask prompt), or None when it can."""
     if len(text) > MAX_TEXT:
-        return (f"The message is {len(text):,} characters; the limit is {MAX_TEXT:,}."
+        return (f"The {what} is {len(text):,} characters; the limit is {MAX_TEXT:,}."
                 " Put long content in a file and send its path.")
 
 
@@ -306,11 +375,22 @@ class Session:
         self.client = None  # the app, from initialize.clientInfo.name
         self.start = None  # the newest message id when this process got its first request: bounds the recap
         self.recap = True  # the first inbox call starts with a recap
-        self.current = None  # id of the request being handled
+        self.local = threading.local()  # the request each thread is handling: asks run in threads of their own
         self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
         self.closed = False  # the client closed our stdin
         self.called = False  # a tool was called: the client is set up (and Claude Code listens to its channel)
         self.doorbell = False  # the channel doorbell thread runs (Claude Code clients only)
+        # An app that ask started for another agent: it answers that agent only, so Agon's tools are off
+        self.asked_by = os.environ.get("AGON_ASKED_BY")
+
+    @property
+    def current(self):
+        """The id of the request this thread is handling."""
+        return getattr(self.local, "rid", None)
+
+    @current.setter
+    def current(self, rid):
+        self.local.rid = rid
 
     def stopped(self):
         """Nobody waits for the current request any more (cancelled, or the client left): stop waiting."""
@@ -359,7 +439,505 @@ def tool_inbox(session, args):
     return text, delivered
 
 
-TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox}  # each returns (text, what to run once it's delivered)
+def ask_args(session, args):
+    """The checked arguments of an ask: (agent, prompt, mode, the project folder to work in)."""
+    agent, prompt, mode, cwd = (args.get(key) for key in ("agent", "prompt", "mode", "cwd"))
+    agent = agent.strip() if isinstance(agent, str) else None
+    if agent not in COMMANDS:
+        raise ToolError("Nothing asked: `agent` must be claude, gpt or gemini.")
+    if agent == session.me:
+        others = " or ".join(name for name in COMMANDS if name != agent)
+        raise ToolError(f"Nothing asked: you are {agent}, and a second opinion comes from another agent: {others}.")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ToolError("Nothing asked: `prompt` must be a non-empty string.")
+    if problem := too_long(prompt, "prompt"):
+        raise ToolError(f"Nothing asked: {problem}")
+    mode = "review" if mode is None else mode
+    if mode not in MODE_ARGS:
+        raise ToolError("Nothing asked: `mode` must be review or task.")
+    if cwd is None:  # Claude Code says where the project is; Codex and Antigravity start Agon in its plugin folder
+        cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        if Path(cwd).resolve() == Path(__file__).resolve().parent:
+            raise ToolError("Nothing asked: pass `cwd`, the absolute path of your project folder (your app runs Agon"
+                            " in a folder of its own).")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
+        raise ToolError("Nothing asked: `cwd` must be the absolute path of your project folder.")
+    return agent, prompt, mode, cwd
+
+
+def ask_timeout():
+    """AGON_ASK_TIMEOUT: how many seconds one ask may take (900)."""
+    try:
+        seconds = float(os.environ.get("AGON_ASK_TIMEOUT") or ASK_TIMEOUT)
+    except ValueError:
+        seconds = 0
+    if not seconds > 0:  # NaN too
+        raise ToolError("AGON_ASK_TIMEOUT must be a number of seconds, such as 900.")
+    return seconds
+
+
+def split_command(raw, var):
+    """A command from AGON_CMD_*: a JSON list of arguments, or a command line quoted the way this system quotes."""
+    try:
+        argv = json.loads(raw)
+    except ValueError:
+        argv = raw
+    try:
+        if isinstance(argv, str) and os.name == "nt":  # backslashes separate folders; quotes only group
+            argv = [a[1:-1] if len(a) > 1 and a[0] == a[-1] == '"' else a for a in shlex.split(argv, posix=False)]
+        elif isinstance(argv, str):
+            argv = shlex.split(argv)
+    except ValueError:  # an unclosed quote
+        argv = None
+    if not isinstance(argv, list) or not argv or not argv[0] or not all(isinstance(a, str) for a in argv):
+        raise ToolError(f"{var} must be a command line or a JSON list of arguments, such as"
+                        f" {json.dumps(COMMANDS[var[9:].lower()])}.")
+    return argv
+
+
+PLACEHOLDER = re.compile(r"\{(prompt|cwd)\}")
+
+
+def ask_command(name, mode, prompt, cwd):
+    """How to run agent `name`'s app for an ask: (its arguments, the text for its stdin or None). Found with
+    shutil.which and run without a shell; when it isn't found, the error says where Agon looked, since an app may
+    hand Agon a shorter PATH than your terminal has (npm's claude.cmd and codex.cmd on Windows, say)."""
+    var = f"AGON_CMD_{name.upper()}"
+    template = [*(split_command(os.environ[var], var) if os.environ.get(var) else COMMANDS[name]),
+                *MODE_ARGS[mode][name]]
+    program = shutil.which(template[0])
+    if program is None:
+        if os.path.dirname(template[0]):
+            where = f"{template[0]} doesn't exist or can't be run"
+        else:
+            folders = "; ".join(d for d in os.environ.get("PATH", "").split(os.pathsep) if d) or "PATH is empty"
+            also = f" (also with the endings in PATHEXT: {os.environ.get('PATHEXT', '')})" if os.name == "nt" else ""
+            where = f"no {template[0]}{also} in the folders on Agon's PATH: {folders}"
+        raise ToolError(f"Can't run {name}: {where}. Install it, or set {var} to its full command"
+                        " (`python agon.py setup` prints it).")
+    if os.name == "nt" and program.lower().endswith((".bat", ".cmd")) and any(map(PLACEHOLDER.search, template)):
+        raise ToolError(f"Can't run {name}: {program} is a batch file, and cmd.exe could run commands hidden in the"
+                        f" prompt or the folder name. Set {var} to start the .exe itself.")
+    filled = [PLACEHOLDER.sub(lambda m: prompt if m[1] == "prompt" else cwd, a) for a in template[1:]]
+    return [program, *filled], (None if any("{prompt}" in a for a in template) else prompt)
+
+
+def feed(pipe, data):
+    """Write the prompt to an app's stdin and close it; from a thread, so an app that doesn't read can't block Agon."""
+    try:
+        with pipe:
+            pipe.write(data)
+    except OSError:  # it exited without reading all of it
+        pass
+
+
+def kill_tree(p):
+    """Stop process p and everything it started: SIGTERM to its process group, so the apps can clean up, and SIGKILL
+    to whatever is left after 5 s. On Windows taskkill /T finds the tree through the parent processes. Never waits
+    for good: at worst the app itself is killed."""
+    if os.name == "nt":
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
+        try:
+            subprocess.run([str(taskkill), "/F", "/T", "/PID", str(p.pid)], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=30, creationflags=NO_WINDOW)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(p.pid, sig)
+            except (ProcessLookupError, PermissionError):  # the group is gone (macOS says EPERM when only zombies are)
+                break
+            try:
+                p.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
+    try:
+        p.wait(10)
+    except subprocess.TimeoutExpired:  # the tree didn't go: at least the app itself does
+        p.kill()
+        p.wait()
+
+
+JOB = None  # Windows: the job object the apps that ask starts belong to (see contain())
+
+
+def contain(p):
+    """Windows: put process p (and what it starts) in a job that ends with Agon's server. A host app may end the
+    server with TerminateProcess, which no cleanup survives, and an ask's app must not go on without it. Best effort:
+    the timeout still works through taskkill."""
+    global JOB
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        if JOB is None:
+            class Limits(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                _fields_ = [("times", ctypes.c_int64 * 2), ("flags", wintypes.DWORD), ("sizes", ctypes.c_size_t * 2),
+                            ("processes", wintypes.DWORD), ("affinity", ctypes.c_size_t),
+                            ("classes", wintypes.DWORD * 2), ("io", ctypes.c_uint64 * 6),
+                            ("memory", ctypes.c_size_t * 4)]
+            limits = Limits(flags=0x2000)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            job = k32.CreateJobObjectW(None, None)  # 9: JobObjectExtendedLimitInformation
+            if not job or not k32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                return
+            JOB = job  # never closed: Windows closes it, and so ends the apps, when this process ends
+        process = k32.OpenProcess(0x0101, False, p.pid)  # PROCESS_TERMINATE | PROCESS_SET_QUOTA
+        if process:
+            k32.AssignProcessToJobObject(JOB, process)
+            k32.CloseHandle(process)
+    except Exception:  # no ctypes, an old Windows...
+        pass
+
+
+def run_cli(argv, stdin, cwd, env, end, stopped):
+    """Run a headless app until it exits: (its exit code, or None when time.monotonic() passed `end` or stopped()
+    became true and Agon killed its process tree; its stdout; its stderr). The output goes to temporary files, so
+    nothing blocks however much it prints."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(argv, cwd=cwd, env=env, stdout=out, stderr=err,
+                             stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                             start_new_session=True,  # a process group of its own, killed as one (POSIX)
+                             creationflags=NO_WINDOW)
+        if os.name == "nt":
+            contain(p)
+        if stdin is not None:
+            threading.Thread(target=feed, args=(p.stdin, stdin.encode()), daemon=True).start()
+        code = None
+        while code is None:
+            try:
+                code = p.wait(0.2)
+            except subprocess.TimeoutExpired:
+                if stopped() or time.monotonic() >= end:
+                    kill_tree(p)
+                    break
+        out.seek(0)
+        err.seek(0)
+        return code, out.read().decode("utf-8", "replace"), err.read().decode("utf-8", "replace")
+
+
+def final_answer(out):
+    """What a headless app printed as its answer, and the error it reported: (text or None, error or None). Reads
+    Claude Code's JSON result, Codex's JSON events (the last agent message) and Antigravity's JSON envelope."""
+    answer = error = None
+    for raw in out.splitlines():
+        try:
+            events = json.loads(raw)
+        except ValueError:
+            continue
+        for event in events if isinstance(events, list) else [events]:  # claude --verbose prints a list
+            if not isinstance(event, dict):
+                continue
+            if isinstance(event.get("result"), dict):  # agy stream-json ends with {"event": "result", "result": ...}
+                event = event["result"]
+            kind, item = event.get("type"), event.get("item")
+            if kind == "result":  # Claude Code
+                if event.get("is_error"):
+                    error = event.get("result") or event.get("subtype") or "error"
+                else:
+                    answer = event.get("result")
+            elif "status" in event and "response" in event:  # Antigravity
+                if event["status"] == "SUCCESS":
+                    answer = event["response"]
+                else:
+                    error = event.get("error") or event["status"]
+            elif kind == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+                answer = item.get("text")  # Codex; its items of type "error" are warnings, not failures
+            elif kind == "turn.failed" and isinstance(event.get("error"), dict):
+                error = event["error"].get("message") or "turn failed"
+            elif kind == "error":
+                error = event.get("message") or "error"
+    return (answer if isinstance(answer, str) else None), (None if error is None else str(error))
+
+
+def tail(text, size=2000):
+    """The end of an app's output, where the error usually is."""
+    text = text.strip()
+    return text if len(text) <= size else "…" + text[-size:]
+
+
+def clip(text, size=MAX_INBOX - 500):
+    """An answer cut to about `size` characters: its start and its end (where the verdict is)."""
+    if len(text) <= size:
+        return text
+    keep = size // 2
+    return f"{text[:keep]}\n… ({len(text) - 2 * keep:,} characters cut) …\n{text[-keep:]}"
+
+
+def took(seconds):
+    seconds = round(seconds)
+    return f"{seconds // 60}m {seconds % 60}s" if seconds >= 60 else f"{seconds}s"
+
+
+def verdict(answer):
+    """approve or changes, from the answer's last VERDICT; None when it has none."""
+    found = re.findall(r"VERDICT\W{0,5}(approve|changes)", answer, re.I)
+    return found[-1].lower() if found else None
+
+
+def git(cwd, *args, feed=None):
+    """Run git in folder `cwd`, with `feed` on its stdin, and return what it printed; ToolError with git's own words
+    when it fails."""
+    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW, **({"stdin": subprocess.DEVNULL} if feed is None else {"input": feed}))
+    if p.returncode:
+        command = next(a for a in args if not a.startswith("-") and "=" not in a)  # commit, not the -c before it
+        raise ToolError(f"git {command} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
+    return p.stdout.rstrip()  # the first line of --stat starts with a space too
+
+
+def repository(cwd):
+    """The top folder of the git repository that `cwd` is in, which has a commit; else a ToolError that says why."""
+    if not shutil.which("git"):
+        raise ToolError("there is no git on Agon's PATH")
+    try:
+        top = git(cwd, "rev-parse", "--show-toplevel")
+    except ToolError:
+        raise ToolError(f"{cwd} isn't in a git repository") from None
+    try:
+        git(top, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    except ToolError:
+        raise ToolError("this repository has no commit yet") from None
+    return top
+
+
+def rmtree(path):
+    """Delete a folder Agon made, read-only files too (git makes some on Windows). Best effort."""
+    def writable(func, name, _):
+        os.chmod(name, stat.S_IWRITE)
+        func(name)
+
+    try:
+        shutil.rmtree(path, **{"onexc" if sys.version_info >= (3, 12) else "onerror": writable})
+    except OSError:  # a file still in use (Windows): it stays in the temporary folder
+        pass
+
+
+def review_copy(top, cwd, name):
+    """A throwaway copy of the repository at `top` for agent `name`'s review, where git shows what it shows in the
+    user's: the same branches, tags and HEAD (a clone that borrows the history), the same index, and the files as they
+    are now, uncommitted changes and new files included (what .gitignore leaves out stays out, and so do links that
+    lead out of the repository). It has no remote, and the user's repository is only read, whatever the reviewer does
+    in the copy, git included (a worktree would share the branches, the stash and the config). Returns (the copy, its
+    folder that matches `cwd`)."""
+    path = tempfile.mkdtemp(prefix=f"agon-review-{name}-")
+    try:
+        git(path, "clone", "-q", "--mirror", "--shared", top, ".git")  # every ref, not the user's hooks or config
+        git(path, "config", "core.bare", "false")
+        git(path, "config", "--remove-section", "remote.origin")  # nothing in the copy leads back to the user's
+        head = git(top, "rev-parse", "--symbolic-full-name", "HEAD")  # refs/heads/<branch>, or HEAD when detached
+        if head.startswith("refs/"):
+            git(path, "symbolic-ref", "HEAD", head)
+        else:
+            git(path, "update-ref", "--no-deref", "HEAD", git(top, "rev-parse", "HEAD"))
+        git(path, "update-index", "-z", "--index-info", feed=git(top, "ls-files", "-z", "--stage"))  # what's staged
+        inside = Path(os.path.realpath(top))
+        for file in filter(None, git(top, "ls-files", "-z", "--cached", "--others", "--exclude-standard").split("\0")):
+            source, target = Path(top, file), Path(path, file)
+            if source.is_symlink() and not Path(os.path.realpath(source)).is_relative_to(inside):
+                continue  # a link out of the repository stays out: a write through it would reach the user's files
+            if source.is_file() or source.is_symlink():  # not a file the user deleted
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    shutil.copy2(source, target, follow_symlinks=False)
+                except OSError:  # a file that just went, or a link Windows won't make: the review goes on
+                    pass
+            elif source.is_dir():  # a submodule or another repository inside: an empty folder, as if not cloned
+                target.mkdir(parents=True, exist_ok=True)
+    except BaseException:
+        rmtree(path)
+        raise
+    return path, same_folder(top, path, cwd)
+
+
+def spelled(top, cwd):
+    """The top folder of the repository, `top` as git gives it, as the path to `cwd` spells it: through a link, with a
+    Windows short name... (or `top` when it can't)."""
+    real, path = Path(top).resolve(), Path(os.path.abspath(cwd))
+    return str(next((folder for folder in (path, *path.parents) if folder.resolve() == real), Path(top)))
+
+
+def repath(text, olds, new):
+    """`text` with the paths into any of the folders `olds` pointing into folder `new` instead, in the same slashes
+    (on Windows either, in any case). Whole folder names only: /a/proj isn't in /a/project, /a/proj.old or /b/a/proj."""
+    forms = dict.fromkeys(form for old in olds for form in (str(Path(old)), Path(old).as_posix()))
+    return re.sub(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])",
+                  lambda found: str(Path(new)) if "\\" in found.group() else Path(new).as_posix(), text,
+                  flags=re.I if os.name == "nt" else 0)
+
+
+def new_worktree(top, name):
+    """A new branch for agent `name`'s task at the last commit, checked out in a temporary git worktree: (the
+    worktree's folder, the branch, the commit it starts from)."""
+    base = git(top, "rev-parse", "HEAD")
+    branch = f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    taken = git(top, "branch", "--list", "--format=%(refname:short)", f"{branch}*").splitlines()
+    branch = next(b for b in (branch, *(f"{branch}-{i}" for i in range(2, 1000))) if b not in taken)
+    path = tempfile.mkdtemp(prefix=f"agon-{name}-")
+    try:
+        git(top, "worktree", "add", "-q", "-b", branch, path, base)
+    except ToolError:
+        os.rmdir(path)
+        raise
+    return path, branch, base
+
+
+def same_folder(top, path, cwd):
+    """The folder of worktree `path` that matches `cwd` in the repository at `top` (the worktree's top if none)."""
+    try:
+        folder = Path(path, Path(cwd).resolve().relative_to(Path(top).resolve()))
+    except ValueError:
+        return path
+    return str(folder) if folder.is_dir() else path
+
+
+def keep_work(top, path, branch, base, name, message):
+    """Commit what agent `name`'s app changed in worktree `path` to its branch, remove the worktree and return the
+    branch's `git diff --stat` from `base`: None when nothing changed, and then the branch goes too."""
+    if git(path, "status", "--porcelain"):
+        try:
+            git(path, "add", "-A")
+            git(path, "-c", f"user.name={name} (Agon)", "-c", "user.email=agon@localhost", "-c", "commit.gpgsign=false",
+                "commit", "-q", "--no-verify", "-m", message)
+        except ToolError as e:
+            raise ToolError(f"{e} The work stays in {path}, on branch {branch}.") from None
+    stat = git(top, "-c", "core.quotepath=off", "diff", "--stat", f"{base}..{branch}").splitlines()
+    try:
+        git(top, "worktree", "remove", "--force", path)
+    except ToolError:  # a file still in use (Windows): `git worktree prune` forgets it once the folder is gone
+        pass
+    if not stat:
+        try:
+            git(top, "branch", "-D", branch)
+        except ToolError:
+            pass
+        return None
+    return "\n".join(stat if len(stat) <= 41 else [*stat[:40], " …", stat[-1]])
+
+
+def ask_run(asker, name, mode, prompt, cwd, end, stopped):
+    """Run agent `name`'s app once for an ask from `asker`, with `prompt` (the whole text it gets) in folder `cwd`,
+    until time `end` or until stopped() gives a reason: (its answer or None, why it failed or None, the texts that
+    show a usage limit or None)."""
+    argv, stdin = ask_command(name, mode, prompt, cwd)
+    started = time.monotonic()
+    env = dict(os.environ, AGON_ASKED_BY=asker)
+    try:
+        code, out, err = run_cli(argv, stdin, cwd, env, end, stopped)
+    except OSError as e:  # not a program, no permission...
+        return None, f"{name} couldn't start ({argv[0]}): {e}", None
+    spent = took(time.monotonic() - started)
+    answer, error = final_answer(out)
+    if code is None:
+        reason = stopped()
+        return None, (f"{name} was stopped after {spent}: {reason}." if reason
+                      else f"{name} ran out of time (AGON_ASK_TIMEOUT) and was stopped after {spent}."), None
+    if code or answer is None and error is not None:
+        why = error or tail(err) or tail(out) or "no output"
+        limit = shows_limit([error, tail(out), tail(err)])
+        return None, f"{name} failed after {spent} (exit code {code}): {why}", limit
+    return (tail(out, MAX_INBOX) or tail(err, MAX_INBOX) if answer is None else answer), None, None
+
+
+def fallbacks(agent, asker):
+    """Who else may answer when `agent` is out of quota: AGON_FALLBACK (claude,gpt,gemini), without the asker."""
+    names = [name.strip() for name in os.environ.get("AGON_FALLBACK", ",".join(COMMANDS)).split(",") if name.strip()]
+    if any(name not in COMMANDS for name in names):
+        raise ToolError("AGON_FALLBACK must list agents Agon can ask, such as claude,gpt,gemini (or be empty).")
+    return [name for name in dict.fromkeys(names) if name not in (agent, asker)]
+
+
+def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
+    """Agent `name`'s go at an ask: (its answer or None, why it failed or None, the texts that show a usage limit or
+    None, the branch that holds a task's work or None, its diff stat or None)."""
+    if mode == "review" and name in REVIEW_COPY:  # its app can't be held to read-only: it reviews a throwaway copy
+        try:
+            source = repository(cwd)
+        except ToolError as e:
+            raise ToolError(f"Can't run {name}'s review: it works in a throwaway copy of your git repository, and"
+                            f" {e}.") from None
+        mine = spelled(source, cwd)
+        copy, folder = review_copy(source, cwd, name)
+        try:  # the paths into the user's repository in the prompt lead into the copy, and back in what it says
+            back = [copy, os.path.realpath(copy)]
+            text = repath(REVIEW.format(asker=asker, prompt=prompt, copy=COPY), [source, mine], copy)
+            answer, problem, limit = ask_run(asker, name, mode, text, folder, end, stopped)
+        finally:
+            rmtree(copy)  # and with it whatever the reviewer changed
+        return answer and repath(answer, back, mine), problem and repath(problem, back, mine), limit, None, None
+    if not top:
+        return (*ask_run(asker, name, mode, REVIEW.format(asker=asker, prompt=prompt, copy=""), cwd, end, stopped),
+                None, None)
+    path, branch, base = new_worktree(top, name)  # a task works on a branch of its own, in a temporary worktree
+    try:
+        answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt),
+                                         same_folder(top, path, cwd), end, stopped)
+    finally:
+        stat = keep_work(top, path, branch, base, name, f"{name}: {' '.join(prompt.split())[:72]}")
+    return answer, problem, limit, (branch if stat else None), stat
+
+
+def tool_ask(session, args):
+    agent, prompt, mode, cwd = ask_args(session, args)
+    if paused():
+        raise ToolError(f"Nothing asked: {PAUSED}")
+    try:
+        top = repository(cwd) if mode == "task" else None
+    except ToolError as e:
+        raise ToolError(f"Nothing asked: a task works on a new branch from your last commit, and {e}.") from None
+    me, started = session.me, time.monotonic()
+    end, head, skipped = started + ask_timeout(), f"{me} asked {agent} for a {mode}", []
+
+    def halt():  # why the app must stop now, if it must
+        if session.stopped():
+            return "the call was cancelled, or the app that asked is gone"
+        if paused():
+            return "the human paused the team"
+
+    for name in [agent, *fallbacks(agent, me)]:  # the next one answers while one is out of quota
+        if until := quota_until(name):
+            skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+            continue
+        try:
+            answer, problem, limit, branch, stat = ask_once(me, name, mode, prompt, cwd, top, end, halt)
+        except ToolError as e:  # its app isn't there, or git failed
+            if name != agent:
+                skipped.append(str(e).rstrip("."))
+                continue
+            answer, problem, limit, branch, stat = None, str(e), None, None, None
+        if limit:
+            out_of_quota(name, limit)  # marked until it resets, and the team is told
+            skipped.append(f"{name} hit its usage limit" + (f" (what it did is on branch {branch})" if branch else ""))
+            continue
+        break
+    else:
+        name, problem, branch = None, f"Nobody could answer: {'; '.join(skipped)}.", None
+    spent, lead = took(time.monotonic() - started), "; ".join(skipped) + ", so " if skipped else ""
+    if problem:
+        if branch:
+            problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
+        post("agon", "human", f"{head}: {lead if name else ''}{problem}")  # every ask shows in the arena, wakes no one
+        raise ToolError(f"{lead if name else ''}{problem}")
+    if branch:
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch}:"
+                              f" {stat.splitlines()[-1].strip()}.")
+        return (f"{lead}{name} finished the task in {spent} on branch {branch}:\n{stat}\nMerge it if you want it: git"
+                f" merge {branch} (or drop it: git branch -D {branch}).\n\nIts summary:\n{clip(answer)}"), None
+    if top:
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file.")
+        return (f"{lead}{name} finished the task in {spent} without changing any file.\n\nIts summary:\n"
+                f"{clip(answer)}"), None
+    seal = f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict"
+    post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
+    return f"{lead}{name} answered in {spent} ({mode}, {seal}):\n\n{clip(answer)}", None
+
+
+TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
 
 
 def handle(session, msg):
@@ -375,7 +953,8 @@ def handle(session, msg):
         params = {} if msg.get("params") is None else msg["params"]
         if not isinstance(params, dict):
             raise RpcError(-32602, "Invalid params: `params` must be an object")
-        touch(session.me)  # presence: every request moves last_seen
+        if not session.asked_by:  # an app that ask started isn't the team's agent
+            touch(session.me)  # presence: every request moves last_seen
         if session.start is None:
             session.start = newest_id()
         result, after = dispatch(session, msg["method"], params)
@@ -392,8 +971,9 @@ def dispatch(session, method, params):
             info = params.get("clientInfo")
             name = info.get("name") if isinstance(info, dict) else None
             session.client = name if isinstance(name, str) else None
-            touch(session.me, session.client)
-            if session.client == "claude-code" and not session.doorbell:
+            if not session.asked_by:
+                touch(session.me, session.client)
+            if session.client == "claude-code" and not session.doorbell and not session.asked_by:
                 session.doorbell = True
                 threading.Thread(target=doorbell, args=(session,), daemon=True).start()
             asked = params.get("protocolVersion")
@@ -402,12 +982,13 @@ def dispatch(session, method, params):
                 # Claude Code channels (research preview): run with --dangerously-load-development-channels
                 "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
                 "serverInfo": {"name": "agon", "version": VERSION},
-                "instructions": INSTRUCTIONS.format(me=session.me),
+                "instructions": (ASKED.format(asker=session.asked_by) if session.asked_by
+                                 else INSTRUCTIONS.format(me=session.me)),
             }, None
         case "ping":
             return {}, None
         case "tools/list":
-            return {"tools": TOOLS}, None
+            return {"tools": [] if session.asked_by else TOOLS}, None
         case "tools/call":
             return call_tool(session, params)
     raise RpcError(-32601, f"Method not found: {method}")
@@ -416,6 +997,9 @@ def dispatch(session, method, params):
 def call_tool(session, params):
     session.called = True
     name, args = params.get("name"), params.get("arguments")
+    if session.asked_by:
+        raise RpcError(-32602, f"Agon's tools are off here: ask started this session for {session.asked_by},"
+                               " and your final message is the answer.")
     tool = TOOL_HANDLERS.get(name) if isinstance(name, str) else None
     if tool is None:
         raise RpcError(-32602, f"Unknown tool: {name}. Tools: {', '.join(TOOL_HANDLERS)}")
@@ -496,31 +1080,51 @@ def read_client(session, inp, todo):
         todo.put(EOF)
 
 
+def answer(session, msg):
+    """Handle one request and write its reply; False once the client is gone."""
+    rid = msg.get("id") if isinstance(msg, dict) else None
+    session.current = rid if isinstance(rid, (str, int)) else None
+    if session.current in session.cancelled:  # cancelled while it waited in the queue: don't run it
+        session.cancelled.discard(session.current)
+        return True
+    reply, after = handle(session, msg)
+    if session.current in session.cancelled:  # cancelled while it ran: no reply, messages stay unread
+        session.cancelled.discard(session.current)
+        return True
+    if reply is not None:
+        try:
+            emit(session.out, reply)
+        except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
+            return False
+    # Only now that the reply is out (at-least-once), and only if the client still reads: one that has
+    # closed our stdin is shutting down and won't see this reply, so its messages stay unread.
+    if after and not session.closed:
+        try:
+            after()
+        except Exception as e:  # the cursor stays put and the messages come again
+            print(f"agon: {e}", file=sys.stderr)
+    return True
+
+
+def answer_apart(session, msg):
+    """answer() from a thread of its own, with its own connection to agon.db."""
+    try:
+        answer(session, msg)
+    finally:
+        close_db()
+
+
 def work(session, todo):
-    """Answer the queued requests one by one, in order."""
+    """Answer the queued requests in order. An ask runs for minutes, so it gets a thread of its own and send and inbox
+    keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the background, and the agent
+    goes on. The process waits for those threads: a closed client stops their apps first."""
     try:
         while (msg := todo.get()) is not EOF:
-            rid = msg.get("id") if isinstance(msg, dict) else None
-            session.current = rid if isinstance(rid, (str, int)) else None
-            if session.current in session.cancelled:  # cancelled while it waited in the queue: don't run it
-                session.cancelled.discard(session.current)
-                continue
-            reply, after = handle(session, msg)
-            if session.current in session.cancelled:  # cancelled while it ran: no reply, messages stay unread
-                session.cancelled.discard(session.current)
-                continue
-            if reply is not None:
-                try:
-                    emit(session.out, reply)
-                except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
-                    return
-            # Only now that the reply is out (at-least-once), and only if the client still reads: one that has
-            # closed our stdin is shutting down and won't see this reply, so its messages stay unread.
-            if after and not session.closed:
-                try:
-                    after()
-                except Exception as e:  # the cursor stays put and the messages come again
-                    print(f"agon: {e}", file=sys.stderr)
+            params = msg.get("params") if isinstance(msg, dict) else None  # msg may be any JSON value
+            if isinstance(params, dict) and msg.get("method") == "tools/call" and params.get("name") == "ask":
+                threading.Thread(target=answer_apart, args=(session, msg)).start()
+            elif not answer(session, msg):
+                return
     finally:
         close_db()
 
@@ -569,13 +1173,18 @@ def limit_patterns():
     return patterns
 
 
+def shows_limit(texts):
+    """`texts` joined if one of them shows a usage limit (limit_patterns()), else None."""
+    texts = [text for text in texts if isinstance(text, str) and text]
+    if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
+        return "\n".join(texts)
+
+
 def usage_limit(payload):
     """The error texts of a Stop hook payload if they show a usage limit, else None. The model's last message is
     read only when the turn failed (then Claude Code puts the error there): an agent writing about limits has none."""
     keys = ["error", "error_details", "terminationReason"] + ["last_assistant_message"] * turn_failed(payload)
-    texts = [value for key in keys if isinstance(value := payload.get(key), str)]
-    if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
-        return "\n".join(texts)
+    return shows_limit([payload.get(key) for key in keys])
 
 
 UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
@@ -619,6 +1228,17 @@ def reset_time(text, now):
         return when.timestamp()
 
 
+def reset_clock(until, now):
+    """A reset time as the team reads it: 14:00, or Sep 26 09:00 when it is most of a day away."""
+    return time.strftime("%H:%M" if until - now < 20 * 3600 else "%b %d %H:%M", time.localtime(until))
+
+
+def quota_until(name):
+    """When agent `name`'s usage limit resets, while it is out of quota; else None."""
+    row = db().execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (name,)).fetchone()
+    return row[0] if row and row[0] and row[0] > time.time() else None
+
+
 def out_of_quota(me, text):
     """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
     team, once per limit."""
@@ -631,9 +1251,8 @@ def out_of_quota(me, text):
         con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
                     " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
         if not (row and row[0] and row[0] > now):  # not already known
-            clock = "%H:%M" if until and until - now < 20 * 3600 else "%b %d %H:%M"
             post("agon", "all", f"{me} hit its usage limit"
-                 + (f", resets ~{time.strftime(clock, time.localtime(until))}." if until else "; reset time unknown."))
+                 + (f", resets ~{reset_clock(until, now)}." if until else "; reset time unknown."))
         con.execute("COMMIT")
     except BaseException:
         if con.in_transaction:
@@ -666,6 +1285,8 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     an exit code 2 into 1, so the other way to keep an agent going can get lost."""
     fmt = fmt or FORMATS.get(me, "claude")
     payload = read_payload(inp or sys.stdin.buffer)
+    if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
+        return
     touch(me)  # the agent's row, so its cursor can move
     if paused():  # 1. the human said STOP
         return
@@ -847,7 +1468,10 @@ def setup(out=None):
         "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
         "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
-                                                          "timeout": 60}]}]}}))
+                                                          "timeout": 60}]}]}}),
+        f"  and under [mcp_servers.agon] in {home / '.codex' / 'config.toml'} (ask takes minutes, and Codex passes"
+        " Agon only the variables it names):", f"  tool_timeout_sec = {TOOL_TIMEOUT}",
+        f"  env_vars = {json.dumps(ENV_VARS)}")
 
     # Antigravity runs hook commands with sh -c, or with cmd /c on Windows, where quotes don't survive
     agy_hook = " ".join([py, script, "hook", "gemini"]) if windows else shlex.join([py, script, "hook", "gemini"])
@@ -860,6 +1484,23 @@ def setup(out=None):
                                                                "timeout": 60}]}}))
     if windows and " " in py + script:
         say("  This hook can't work: Antigravity can't run a path with a space. Use the plugin or paths without one.")
+
+    # ask runs the apps by name, and an app may start Agon with a shorter PATH than this terminal has (npm's
+    # claude.cmd and codex.cmd on Windows), so give it the full paths found here
+    say("", "== ask: how Agon runs each app for a second opinion, with the full paths found here",
+        "Run these in PowerShell (they set user variables), then restart the apps:" if windows else
+        "Add these to your shell profile (~/.zshrc or ~/.bashrc), then start the apps from a new terminal:")
+    for name, (program, *args) in COMMANDS.items():
+        var, found = f"AGON_CMD_{name.upper()}", shutil.which(program)
+        if not found:
+            say(f"  {program} isn't on PATH: ask can't run {name} until it is, or until {var} names it")
+            continue
+        value = json.dumps([found, *args])
+        if windows:  # PowerShell keeps a single-quoted string as it is, but for '' (one ')
+            quoted = value.replace("'", "''")
+            say(f"  [Environment]::SetEnvironmentVariable('{var}', '{quoted}', 'User')")
+        else:
+            say(f"  export {var}={shlex.quote(value)}")
 
 
 class Args(argparse.ArgumentParser):
@@ -887,6 +1528,9 @@ def main(argv):
     elif argv == ["setup"]:
         setup()
     elif argv:
+        # Host apps end their MCP servers with SIGINT (Claude Code) or SIGTERM (Codex, agy after closing stdin).
+        # Take SIGTERM like Ctrl+C: the server unwinds and waits while running asks stop their apps and log it
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
         url = f"http://127.0.0.1:{PORT}"

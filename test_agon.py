@@ -1,10 +1,13 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
 import datetime
+import faulthandler
 import http.client
 import io
 import json
 import os
 import queue
+import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +17,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+faulthandler.dump_traceback_later(240, exit=True)  # a test that hangs shows where, long before CI gives up
 TMP = tempfile.mkdtemp()
 HERE = Path(__file__).resolve().parent
 SERVER = str(HERE / "agon.py")
@@ -24,9 +28,9 @@ import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line 
 class Agent:
     """A fake MCP client (like Claude Code or Codex) talking to `python agon.py <name>` over stdio."""
 
-    def __init__(self, name, client="fake-client", version="2025-06-18", argv=None):
+    def __init__(self, name, client="fake-client", version="2025-06-18", argv=None, env=None, cwd=None):
         argv = argv or [sys.executable, SERVER, name]
-        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env, cwd=cwd)
         info = {"name": client, "version": "1.0"}
         self.hello = self.rpc("initialize", {"protocolVersion": version, "clientInfo": info})["result"]
         assert self.hello["serverInfo"]["name"] == "agon"
@@ -644,7 +648,10 @@ for event in ("Stop", "StopFailure"):  # a turn that ends in an API error (a usa
     assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": 60,
                                                          "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
 assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gpt"], "cwd": ".",
-                                                "env_vars": ["AGON_DB"]}}  # Codex passes only listed variables
+                                                "env_vars": agon.ENV_VARS,  # Codex passes only listed variables
+                                                "tool_timeout_sec": 960}}  # Phase 3: ask takes minutes, not 60 s
+assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI",
+                         "AGON_FALLBACK", "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS"] and agon.TOOL_TIMEOUT == 960
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
 antigravity = manifest("plugin.json")
@@ -696,6 +703,18 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db"))}):
         assert script in snippet["command"] and snippet["command"].endswith(f"hook {name}"), snippet
     assert ("--env AGON_DB=" in out) == bool(extra)  # Codex passes only the variables it is told to
     assert not any(setup_home.iterdir()) and not Path(TMP, "team2.db").exists()  # nothing written, no database
+    # Phase 3: Codex needs a longer tool timeout for ask and the variables named; and ask gets each app's full path,
+    # since an app may start Agon with a shorter PATH (npm's claude.cmd and codex.cmd on Windows)
+    assert f"  tool_timeout_sec = 960\n  env_vars = {json.dumps(agon.ENV_VARS)}\n" in out, out
+    value = re.search(r"AGON_CMD_CLAUDE\W*'(\[.*\])'", out)[1]
+    assert json.loads(value)[1:] == agon.COMMANDS["claude"][1:] and json.loads(value)[0].lower() == str(fake).lower()
+    assert agon.split_command(value, "AGON_CMD_CLAUDE") == json.loads(value)  # what ask reads
+    for program, name in (("codex", "gpt"), ("agy", "gemini")):
+        assert f"  {program} isn't on PATH: ask can't run {name} until it is, or until AGON_CMD_{name.upper()}" in out
+    if not windows:  # the export line works as printed
+        [export] = [row.strip() for row in out.splitlines() if "export AGON_CMD_CLAUDE=" in row]
+        shell = subprocess.run(["sh", "-c", f'{export}; printf %s "$AGON_CMD_CLAUDE"'], capture_output=True, text=True)
+        assert shell.stdout == value, (export, shell)
 
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
@@ -737,12 +756,572 @@ agon.post("human", "all", "go on")
 for a in (cleo, dora, vic):
     a.close()
 
+# Phase 3, 2-3. ask runs each agent's app headless with the roadmap's commands (checked against claude 2.1.281, codex
+# 0.156.1 and agy 1.2.10); a review adds the read-only flags. agy takes no prompt on stdin, and works in a folder
+# only when it is given with --add-dir
+assert agon.COMMANDS == {"claude": ["claude", "-p", "--output-format", "json"], "gpt": ["codex", "exec", "--json"],
+                         "gemini": ["agy", "-p={prompt}", "--output-format", "json", "--add-dir", "{cwd}"]}
+assert agon.MODE_ARGS["review"] == {"claude": ["--permission-mode", "plan"], "gpt": ["--sandbox", "read-only"],
+                                    "gemini": ["--mode", "plan"]}
+# The tests run fake apps through the same AGON_CMD_* variables: each writes down what it got and answers the way its
+# app does (the prompt says how: EDIT a file, HANG, CRASH, PLAIN)
+FAKE, FAKE_LOG, BEAT = Path(TMP, "fake_app.py"), Path(TMP, "fake.log"), Path(TMP, "beat.txt")
+FAKE.write_text(r'''"""A fake Claude Code, Codex or Antigravity for ask: python fake_app.py claude|codex|agy ARGS..."""
+import json, os, subprocess, sys, time
+app, args = sys.argv[1], sys.argv[2:]
+prompt = next((a[3:] for a in args if a.startswith("-p=")), None)
+via = "stdin" if prompt is None else "args"
+if prompt is None:
+    prompt = sys.stdin.buffer.read().decode("utf-8")
+with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
+                          "asked_by": os.environ.get("AGON_ASKED_BY")}) + "\n")
+if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
+    with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
+        f.write(f"written by {app}\n")
+if "ATTACK " in prompt:  # a reviewer that ignores "don't change any files": it reports what it sees, then changes
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True).stdout.strip()
+    target = prompt.split("ATTACK ", 1)[1].split()[0]  # all, the file the prompt names by its full path too
+    def read(name):
+        path = os.path.join(top, name)
+        return open(path, encoding="utf-8").read().strip() if os.path.exists(path) else None
+    def git(*args):
+        return subprocess.run(["git", "-c", "user.name=x", "-c", "user.email=x@x", *args], cwd=top,
+                              capture_output=True, text=True).stdout.rstrip()
+    seen = {"app.py": read("app.py"), "sub/lib.py": read("sub/lib.py"), "old.txt": read("old.txt"),
+            "new.txt": read("new.txt"), "debug.log": read("debug.log"), "status": git("status", "--porcelain"),
+            "remotes": git("remote"), "refs": git("for-each-ref", "--format=%(refname)"),
+            "head": git("rev-parse", "--symbolic-full-name", "HEAD"), "target": target.replace("\\", "/")}
+    for name in ("app.py", "new.txt", "evil.txt", "debug.log", "sub/lib.py", target):
+        with open(os.path.join(top, name), "w", encoding="utf-8") as f:
+            f.write("HACKED\n")
+    os.remove(os.path.join(top, "sub", "lib.py"))
+    git("add", "-A")
+    git("commit", "-qm", "evil")
+    git("branch", "evil")
+    git("tag", "evil")
+    git("config", "user.name", "evil")
+    open(os.path.join(top, "app.py"), "w").write("HACKED AGAIN\n")
+    git("stash")
+    seen["after"] = read("app.py"), git("log", "-1", "--format=%s"), git("stash", "list")
+    print(json.dumps({"conversation_id": "c", "status": "SUCCESS", "response": json.dumps(seen)}))
+    sys.exit()
+if app in os.environ.get("FAKE_LIMIT", "").split(","):  # the usage limit as each app reports it
+    if app == "claude":
+        print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+                          "result": "You've hit your limit · resets 3pm (Europe/Berlin)"}))
+    elif app == "codex":
+        said = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 7:48" \
+               " PM."
+        for event in ({"type": "turn.started"}, {"type": "error", "message": said},
+                      {"type": "turn.failed", "error": {"message": said}}):
+            print(json.dumps(event))
+    else:
+        print(json.dumps({"conversation_id": "c", "status": "ERROR", "response": "", "error": "API error (attempt 7):"
+                          " Error 429, Message: You exceeded your current quota. Your quota will reset after 2h3m4s.,"
+                          " Status: RESOURCE_EXHAUSTED, Details: []"}))
+    sys.exit(1)
+if "HANG" in prompt:  # a child that keeps writing, to see that the whole process tree goes
+    subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
+                      "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
+    time.sleep(600)
+if "CRASH" in prompt:
+    sys.stderr.write("boom: the fake crashed\n")
+    sys.exit(3)
+if "PLAIN" in prompt:
+    print("plain words, no JSON")
+    sys.exit()
+answer = f"{app} looked at {os.path.basename(os.getcwd())}: 3 tests passed.\nVERDICT: approve"
+if app == "claude":
+    events = [{"type": "result", "subtype": "success", "is_error": False, "result": answer}]
+elif app == "codex":
+    events = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"},
+              {"type": "item.completed", "item": {"id": "i0", "type": "error", "message": "just a warning"}},
+              {"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": answer}},
+              {"type": "turn.completed", "usage": {"input_tokens": 1}}]
+else:
+    events = [{"conversation_id": "c1", "status": "SUCCESS", "response": answer + "\n"}]
+for event in events:
+    print(json.dumps(event))
+''', encoding="utf-8")
+APPS = {"claude": "claude", "gpt": "codex", "gemini": "agy"}
+ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT))
+for name, app in APPS.items():  # the default command, with the fake in place of the app
+    ASK[f"AGON_CMD_{name.upper()}"] = json.dumps([sys.executable, str(FAKE), app, *agon.COMMANDS[name][1:]])
+project, plain = Path(TMP, "project"), Path(TMP, "plain")  # a git repository with a commit, and a folder that isn't
+project.mkdir()
+plain.mkdir()
+
+
+def git_in(folder, *args):
+    return subprocess.run(["git", *args], cwd=folder, capture_output=True, text=True, check=True).stdout.strip()
+
+
+(project / "README.md").write_text("A project to review.\n")
+git_in(project, "init", "-q")
+git_in(project, "add", "-A")
+git_in(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+
+
+def fake_runs():
+    return [json.loads(row) for row in FAKE_LOG.read_text(encoding="utf-8").splitlines()] if FAKE_LOG.exists() else []
+
+
+def asked(asker, **args):  # an ask: (the whole tools/call result, its text)
+    res = asker.call("ask", **args)
+    return res, res["content"][0]["text"]
+
+
+def agon_said():  # the latest line Agon wrote for the human
+    return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human' ORDER BY id DESC").fetchone()[0]
+
+
+def beating():  # whether the child of a HANG app still writes
+    size = BEAT.stat().st_size if BEAT.exists() else -1
+    time.sleep(0.4)
+    return (BEAT.stat().st_size if BEAT.exists() else -1) != size
+
+
+def until(condition, seconds=15):
+    end = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < end, "timed out"
+        time.sleep(0.1)
+
+
+# Phase 3, 3 and 8, in this process first: run_cli hands an app its prompt on stdin and returns what it printed; an
+# app that hangs is stopped at the deadline, with the child it started
+code, out, err = agon.run_cli([sys.executable, str(FAKE), "claude"], "Look 🙂", str(project), ASK,
+                              time.monotonic() + 60, lambda: None)
+assert code == 0 and agon.final_answer(out)[0].startswith("claude looked at project"), (code, out, err)
+assert fake_runs()[-1]["prompt"] == "Look 🙂" and fake_runs()[-1]["via"] == "stdin"
+t0 = time.monotonic()
+code, out, err = agon.run_cli([sys.executable, str(FAKE), "agy", "-p=HANG"], None, str(project), ASK,
+                              time.monotonic() + 2, lambda: None)
+assert code is None and time.monotonic() - t0 < 30 and not beating(), (code, out, err, time.monotonic() - t0)
+
+
+# Phase 3, 1 and 3-5, 10. A review: claude and codex get the prompt on stdin, agy as -p=...; the run works in the
+# project folder and knows who asked; the reply is the app's final answer with its verdict; the arena logs the ask
+rev = Agent("rev", env=ASK)
+for name, app in APPS.items():
+    res, text = asked(rev, agent=name, prompt="Please review utils.py 🙂", cwd=str(project))
+    run = fake_runs()[-1]
+    where = run["args"][run["args"].index("--add-dir") + 1] if name == "gemini" else str(project)
+    template = [*agon.COMMANDS[name][1:], *agon.MODE_ARGS["review"][name]]
+    assert run["args"] == [a.replace("{prompt}", run["prompt"]).replace("{cwd}", where) for a in template], run
+    assert run["via"] == ("args" if name == "gemini" else "stdin") and run["asked_by"] == "rev", run
+    assert "Review only: don't change any files." in run["prompt"] and run["prompt"].endswith("review utils.py 🙂")
+    assert "VERDICT: approve, or VERDICT: changes" in run["prompt"]
+    assert ("You work in a throwaway copy of the project" in run["prompt"]) == (name in agon.REVIEW_COPY), run["prompt"]
+    if name in agon.REVIEW_COPY:  # agy can't be held to read-only: it reviews a copy, which is gone afterwards
+        assert Path(where).resolve() == Path(run["cwd"]).resolve() != project.resolve() and not Path(where).exists()
+    else:
+        assert Path(run["cwd"]).resolve() == project.resolve()
+    assert "isError" not in res and text.startswith(f"{name} answered in "), text
+    looked = f"{app} looked at {Path(run['cwd']).name}: 3 tests passed.\nVERDICT: approve"
+    assert f"s (review, VERDICT: approve):\n\n{looked}" in text, text
+    assert re.fullmatch(rf"rev asked {name} for a review: {name} answered in \d+s, VERDICT: approve\.", agon_said())
+res, text = asked(rev, agent="gpt", prompt="PLAIN, please", cwd=str(project))  # no JSON: the output is the answer
+assert "isError" not in res and text.endswith(" (review, no verdict):\n\nplain words, no JSON"), text
+res, text = asked(rev, agent="claude", prompt="CRASH, please", cwd=str(project))
+assert res["isError"] is True and re.match(r"claude failed after \d+s \(exit code 3\): boom: the fake crashed$", text)
+assert agon_said() == f"rev asked claude for a review: {text}"
+runs = len(fake_runs())
+for args, why in (({"agent": "bard", "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
+                  ({"agent": ["gpt"], "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
+                  ({"agent": "gpt", "prompt": "  "}, "`prompt` must be a non-empty string."),
+                  ({"agent": "gpt", "prompt": "x" * 8001}, "The prompt is 8,001 characters; the limit is 8,000."),
+                  ({"agent": "gpt", "prompt": "hi", "mode": "dance"}, "`mode` must be review or task."),
+                  ({"agent": "gpt", "prompt": "hi", "cwd": "project"}, "`cwd` must be the absolute path"),
+                  ({"agent": "gpt", "prompt": "hi", "cwd": str(Path(TMP, "nowhere"))}, "`cwd` must be the absolute")):
+    res, text = asked(rev, **args)
+    assert res["isError"] is True and text.startswith("Nothing asked: ") and why in text, (args, text)
+me_too = Agent("gpt", env=ASK)
+res, text = asked(me_too, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and "you are gpt, and a second opinion comes from another agent: claude or gemini" in text
+me_too.close()
+plugged = Agent("plugged", env=ASK, cwd=str(HERE))  # the Codex and Antigravity plugins start Agon in its own folder
+res, text = asked(plugged, agent="gpt", prompt="hi")
+assert res["isError"] is True and "pass `cwd`, the absolute path of your project folder" in text, text
+plugged.close()
+assert len(fake_runs()) == runs  # none of them ran an app
+for where, env in ((str(project), ASK), (str(HERE), ASK | {"CLAUDE_PROJECT_DIR": str(project)})):
+    near = Agent("near", env=env, cwd=where)  # without cwd: Claude Code's project folder, else the server's folder
+    assert "isError" not in near.call("ask", agent="gpt", prompt="hi")
+    assert Path(fake_runs()[-1]["cwd"]).resolve() == project.resolve()
+    near.close()
+
+# Phase 3, 6. A task runs in a temporary git worktree, on a new branch from the last commit: Agon commits what the app
+# changed and returns its summary, diff stat and branch; the worktree goes, and merging is the caller's call
+repo = Path(TMP, "repo")
+(repo / "sub").mkdir(parents=True)
+
+
+def in_repo(*args):
+    return git_in(repo, *args)
+
+
+in_repo("init", "-q")
+(repo / "sub" / "app.py").write_text("print('hi')\n")
+in_repo("add", "-A")
+in_repo("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+assert agon.MODE_ARGS["task"] == {"claude": ["--permission-mode", "acceptEdits"],
+                                  "gpt": ["--sandbox", "workspace-write"], "gemini": ["--mode", "accept-edits"]}
+res, text = asked(rev, agent="gpt", prompt="EDIT notes.txt, please", mode="task", cwd=str(repo / "sub"))
+run, branch = fake_runs()[-1], re.search(r"on branch (agon/gpt-[\d-]+):", text)[1]
+assert "isError" not in res and text.startswith("gpt finished the task in "), text
+assert "notes.txt | 1 +\n 1 file changed, 1 insertion(+)\n" in text, text
+assert f"Merge it if you want it: git merge {branch} (or drop it: git branch -D {branch})." in text, text
+assert text.endswith("Its summary:\ncodex looked at sub: 3 tests passed.\nVERDICT: approve"), text  # the same subfolder
+assert run["args"] == ["exec", "--json", "--sandbox", "workspace-write"] and run["via"] == "stdin", run
+assert f"Agon commits what you changed to branch {branch}, and\nrev decides" in run["prompt"], run["prompt"]
+assert run["prompt"].endswith("The task from rev:\nEDIT notes.txt, please") and Path(run["cwd"]).name == "sub"
+assert not Path(run["cwd"]).exists() and len(in_repo("worktree", "list").splitlines()) == 1  # the worktree is gone
+assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"  # committed on the branch...
+assert in_repo("log", "-1", "--format=%an <%ae>|%s", branch) == "gpt (Agon) <agon@localhost>|gpt: EDIT notes.txt," \
+                                                                " please"
+assert not (repo / "sub" / "notes.txt").exists() and in_repo("status", "--porcelain") == ""  # ...not in the caller's
+assert re.fullmatch(rf"rev asked gpt for a task: gpt finished in \d+s on branch {branch}: 1 file changed,"
+                    r" 1 insertion\(\+\)\.", agon_said()), agon_said()
+res, text = asked(rev, agent="gemini", prompt="EDIT g.txt and then CRASH", mode="task", cwd=str(repo))
+run = fake_runs()[-1]
+assert run["args"][-4:] == ["--add-dir", run["args"][-3], "--mode", "accept-edits"], run["args"]
+assert Path(run["args"][-3]).resolve() == Path(run["cwd"]).resolve()  # agy's --add-dir is the worktree
+assert res["isError"] is True and "gemini failed after" in text and "What it changed is on branch agon/gemini-" in text
+assert "g.txt | 1 +" in text and agon_said().endswith("1 file changed, 1 insertion(+)"), text  # the work is kept
+res, text = asked(rev, agent="claude", prompt="Just look around", mode="task", cwd=str(repo))
+assert re.fullmatch(r"claude finished the task in \d+s without changing any file\.\n\nIts summary:\n"
+                    r"claude looked at agon-claude-\w+: 3 tests passed\.\nVERDICT: approve", text), text
+assert fake_runs()[-1]["args"][-2:] == ["--permission-mode", "acceptEdits"]
+assert in_repo("branch", "--list", "agon/claude-*") == "" and len(in_repo("worktree", "list").splitlines()) == 1
+assert agon_said().startswith("rev asked claude for a task: claude finished in ") and "without changing" in agon_said()
+empty_repo = Path(TMP, "empty-repo")
+empty_repo.mkdir()
+subprocess.run(["git", "init", "-q"], cwd=empty_repo, check=True)
+for where, why in ((plain, f"{plain} isn't in a git repository."), (empty_repo, "this repository has no commit yet.")):
+    res, text = asked(rev, agent="gpt", prompt="EDIT x.txt", mode="task", cwd=str(where))
+    assert res["isError"] is True and text.startswith("Nothing asked: a task ") and text.endswith(why), text
+
+# Phase 3, a review never changes the user's files. agy's --mode plan only puts /plan before the prompt: only its
+# permission settings stop a write, and 1.2.10 writes in a temporary folder or where a write_file rule allows it, even
+# in a review. So a gemini review works in a throwaway copy: a clone with the user's branches, tags, HEAD and index,
+# and the files as they are, uncommitted changes and new files included. A fake agy that ignores "don't change any
+# files" (it rewrites, adds and deletes files, the one the prompt names by its full path too, commits, branches, tags,
+# stashes and changes the git config) changes only the copy: the user's files, index, refs, stash and config stay
+work = Path(TMP, "work")
+(work / "sub").mkdir(parents=True)
+git_in(work, "init", "-q")
+for name, content in ((".gitignore", "*.log\n"), ("app.py", "v1\n"), ("old.txt", "old\n"), ("sub/lib.py", "lib v1\n")):
+    (work / name).write_text(content)
+git_in(work, "add", "-A")
+git_in(work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+git_in(work, "branch", "agon/claude-1")  # a branch to review, say
+git_in(work, "tag", "v1")
+(work / "app.py").write_text("v2, not committed\n")  # changed
+(work / "sub" / "lib.py").write_text("lib v2, staged\n")
+git_in(work, "add", "sub/lib.py")  # staged
+(work / "old.txt").unlink()  # deleted
+(work / "new.txt").write_text("brand new\n")  # not tracked yet
+(work / "debug.log").write_text("ignored\n")  # left out by .gitignore
+
+
+def state(folder):  # all a review must leave alone: every file (bytes), the index, refs, stash, worktrees and config
+    files = {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*"))
+             if p.is_file() and ".git" not in p.relative_to(folder).parts}
+    return files, [git_in(folder, *args) for args in (("status", "--porcelain"), ("ls-files", "--stage"),
+                                                       ("for-each-ref",), ("stash", "list"), ("worktree", "list"),
+                                                       ("config", "--local", "--list"))]
+
+
+before = state(work)
+res, text = asked(rev, agent="gemini", prompt=f"ATTACK {work / 'notes.txt'} and review it", cwd=str(work / "sub"))
+run = fake_runs()[-1]
+assert "isError" not in res and state(work) == before, text  # the user's repository is exactly as it was
+sent = Path(run["prompt"].split("ATTACK ", 1)[1].split()[0])  # the path in the prompt led into the copy,
+assert sent.name == "notes.txt" and sent.parent.name.startswith("agon-review-gemini-"), run["prompt"]
+seen = json.loads(text.split(":\n\n", 1)[1])
+assert seen["target"] == (work / "notes.txt").as_posix(), seen  # and the answer's paths lead back to the user's
+assert seen["app.py"] == "v2, not committed" and seen["sub/lib.py"] == "lib v2, staged", seen  # the copy had the
+assert seen["new.txt"] == "brand new" and seen["old.txt"] is None and seen["debug.log"] is None, seen  # user's files,
+assert seen["status"].splitlines() == [" M app.py", " D old.txt", "M  sub/lib.py", "?? new.txt"], seen  # as git sees
+assert seen["status"].strip() == git_in(work, "status", "--porcelain"), seen  # them in the user's repository, with
+assert seen["refs"] == git_in(work, "for-each-ref", "--format=%(refname)"), seen  # the same branches, tags and HEAD
+assert seen["head"] == git_in(work, "rev-parse", "--symbolic-full-name", "HEAD") and "refs/heads/" in seen["head"]
+assert seen["remotes"] == "" and seen["after"][:2] == ["HACKED", "evil"] and seen["after"][2].startswith("stash@{0}")
+assert Path(run["cwd"]).name == "sub" and not Path(run["cwd"]).exists()  # it ran in the copy's sub, which is gone
+res, text = asked(rev, agent="gemini", prompt="hi", cwd=str(plain))
+assert res["isError"] is True and text == ("Can't run gemini's review: it works in a throwaway copy of your git"
+                                           f" repository, and {plain} isn't in a git repository."), text
+lone = Path(TMP, "lone")  # a detached HEAD stays detached in the copy
+lone.mkdir()
+git_in(lone, "init", "-q")
+(lone / "a.txt").write_text("a\n")
+git_in(lone, "add", "-A")
+git_in(lone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
+git_in(lone, "checkout", "-q", "--detach")
+copy, folder = agon.review_copy(git_in(lone, "rev-parse", "--show-toplevel"), str(lone), "gemini")
+assert folder == copy and git_in(Path(copy), "rev-parse", "--symbolic-full-name", "HEAD") == "HEAD"
+assert git_in(Path(copy), "rev-parse", "HEAD") == git_in(lone, "rev-parse", "HEAD") and not git_in(Path(copy), "status",
+                                                                                                "--porcelain")
+agon.rmtree(copy)
+assert not Path(copy).exists()
+if os.name != "nt":  # a link that stays in the repository comes as it is; one that leads out stays out of the copy,
+    Path(TMP, "outside.txt").write_text("the user's\n")  # so a write at its place there doesn't reach the user's file
+    for name, to in (("in.txt", "a.txt"), ("out.txt", Path(TMP, "outside.txt")), ("up.txt", "../outside.txt"),
+                     ("loop", "loop")):
+        (lone / name).symlink_to(to)
+    copy, _ = agon.review_copy(git_in(lone, "rev-parse", "--show-toplevel"), str(lone), "gemini")
+    assert os.readlink(Path(copy, "in.txt")) == "a.txt" and (Path(copy) / "in.txt").read_text() == "a\n"
+    for name in ("out.txt", "up.txt"):
+        assert not os.path.lexists(Path(copy, name)), name
+        Path(copy, name).write_text("HACKED\n")
+    assert Path(TMP, "outside.txt").read_text() == "the user's\n"
+    agon.rmtree(copy)
+top, copy = Path(TMP, "proj"), Path(TMP, "proj", "copy")
+said = f"{top}{os.sep}app.py, {top.as_posix()}/lib.py and {top}. Not {top}2, {top}.old, {top}-web or x{top}."
+assert agon.repath(said, [str(top)], str(copy)) == (f"{copy}{os.sep}app.py, {copy.as_posix()}/lib.py and {copy}."
+                                                    f" Not {top}2, {top}.old, {top}-web or x{top}.")
+if os.name == "nt":
+    assert agon.repath(f"{str(top).upper()}\\a", [str(top)], str(copy)) == f"{copy}\\a"
+else:  # the repository's folder as the path to cwd spells it: through a link here
+    link = Path(TMP, "link")
+    link.symlink_to(work)
+    assert agon.spelled(str(work.resolve()), str(link / "sub")) == str(link)
+assert agon.spelled(str(work), str(work / "sub")) == str(work) == agon.spelled(str(work), str(plain))
+
+# Phase 3, 7. An agent that is out of quota, or whose app reports a usage limit, is marked (and the team told), and
+# the next agent in AGON_FALLBACK (claude,gpt,gemini) answers instead; the reply says who answered. Never the asker
+assert agon.fallbacks("gpt", "claude") == ["gemini"] and agon.fallbacks("gemini", "rev") == ["claude", "gpt"]
+
+
+def mark(name, seconds):  # out of quota for `seconds` from now; 0: not any more
+    agon.touch(name)
+    con.execute("UPDATE agents SET out_of_quota_until = ? WHERE name = ?", (time.time() + seconds if seconds else None,
+                                                                           name))
+
+
+def team_heard():  # the latest line Agon wrote for the whole team
+    return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'all' ORDER BY id DESC").fetchone()[0]
+
+
+mark("gpt", 7200)
+runs = len(fake_runs())
+lead = Agent("claude", env=ASK)
+res, text = asked(lead, agent="gpt", prompt="Please review", cwd=str(project))
+assert re.match(r"gpt is out of quota until ~\d\d:\d\d, so gemini answered in \d+s \(review, VERDICT: approve\):",
+                text), text
+assert [run["app"] for run in fake_runs()[runs:]] == ["agy"]  # gpt's app never ran, and claude doesn't ask itself
+assert re.fullmatch(r"claude asked gpt for a review: gpt is out of quota until ~\d\d:\d\d, so gemini answered in \d+s,"
+                    r" VERDICT: approve\.", agon_said()), agon_said()
+lead.close()
+mark("gpt", 0)
+limited, runs, t0 = Agent("rev2", env=ASK | {"FAKE_LIMIT": "agy"}), len(fake_runs()), time.time()
+res, text = asked(limited, agent="gemini", prompt="Please review", cwd=str(project))
+assert re.match(r"gemini hit its usage limit, so claude answered in \d+s \(review, VERDICT: approve\):", text), text
+assert [run["app"] for run in fake_runs()[runs:]] == ["agy", "claude"]
+assert abs(agent_row("gemini", "out_of_quota_until") - (t0 + 7384)) < 10  # "Your quota will reset after 2h3m4s."
+assert team_heard().startswith("gemini hit its usage limit, resets ~"), team_heard()
+limited.close()
+alone = Agent("rev3", env=ASK | {"AGON_FALLBACK": ""})
+res, text = asked(alone, agent="gemini", prompt="Please review", cwd=str(project))
+assert res["isError"] is True and re.fullmatch(r"Nobody could answer: gemini is out of quota until ~\d\d:\d\d\.", text)
+alone.close()
+chain, runs = Agent("rev4", env=ASK | {"FAKE_LIMIT": "codex,claude"}), len(fake_runs())
+res, text = asked(chain, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
+assert re.fullmatch(r"Nobody could answer: gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\);"
+                    r" claude hit its usage limit \(what it did is on branch agon/claude-[\d-]+\); gemini is out of"
+                    r" quota until ~\d\d:\d\d\.", text), text  # a task keeps what each of them did
+assert [run["app"] for run in fake_runs()[runs:]] == ["codex", "claude"] and res["isError"] is True
+three = datetime.datetime.now().replace(hour=15, minute=0, second=0, microsecond=0)
+assert agent_row("claude", "out_of_quota_until") == (three + datetime.timedelta(days=three.timestamp() <= time.time())
+                                                      ).timestamp()  # "You've hit your limit · resets 3pm"
+chain.close()
+mark("gpt", 0)
+mark("claude", 0)
+once = Agent("rev5", env=ASK | {"FAKE_LIMIT": "codex"})
+res, text = asked(once, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
+assert re.match(r"gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\), so claude finished the task in"
+                r" \d+s on branch agon/claude-[\d-]+:\n part\.txt \| 1 \+\n", text), text
+claude_branch = re.findall(r"agon/claude-[\d-]+", text)[0]
+assert in_repo("show", f"{claude_branch}:part.txt") == "written by claude"
+once.close()
+mark("gpt", 7200)
+mark("gemini", 0)
+gone = Agent("rev6", env=ASK | {"AGON_CMD_CLAUDE": json.dumps([str(Path(TMP, "no", "claude"))])})
+res, text = asked(gone, agent="gpt", prompt="Please review", cwd=str(project))  # a missing app is skipped, and why
+assert re.match(r"gpt is out of quota until ~\d\d:\d\d; Can't run claude: .+? doesn't exist or can't be run\. Install"
+                r" it, or set AGON_CMD_CLAUDE to its full command \(`python agon\.py setup` prints it\), so gemini"
+                r" answered in \d+s \(review, VERDICT: approve\):", text), text
+gone.close()
+for name in ("gpt", "claude", "gemini"):
+    mark(name, 0)
+odd = Agent("rev7", env=ASK | {"AGON_FALLBACK": "claude,bard"})
+res, text = asked(odd, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and text.startswith("AGON_FALLBACK must list agents Agon can ask"), text
+odd.close()
+
+# Phase 3, 8. The timeout (AGON_ASK_TIMEOUT, default 900 s) kills the app's whole process tree
+assert agon.ASK_TIMEOUT == 900
+slow = Agent("slow", env=ASK | {"AGON_ASK_TIMEOUT": "2"})
+t0 = time.monotonic()
+res, text = asked(slow, agent="gemini", prompt="HANG, please", cwd=str(project))
+assert res["isError"] is True and "gemini ran out of time (AGON_ASK_TIMEOUT) and was stopped after" in text, text
+assert time.monotonic() - t0 < 15
+size = BEAT.stat().st_size
+time.sleep(0.5)
+assert size > 0 and BEAT.stat().st_size == size  # the app's child is gone too
+slow.close()
+bad_timeout = Agent("bad-timeout", env=ASK | {"AGON_ASK_TIMEOUT": "soon"})
+res, text = asked(bad_timeout, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and "AGON_ASK_TIMEOUT must be a number of seconds" in text, text
+bad_timeout.close()
+
+# Phase 3, 2 and 9. AGON_CMD_* may also be a command line (as setup prints it). An app that isn't there gives a clear
+# error that says where Agon looked (apps may give Agon a shorter PATH than the terminal has)
+liner = Agent("liner", env=ASK | {"AGON_CMD_GPT": agon.command_line([sys.executable, str(FAKE), "codex", "exec"])})
+res, text = asked(liner, agent="gpt", prompt="review", cwd=str(project))
+assert "isError" not in res and fake_runs()[-1]["args"] == ["exec", "--sandbox", "read-only"], text
+liner.close()
+for bad in ("[1, 2]", "[]", '"unclosed'):
+    try:
+        agon.split_command(bad, "AGON_CMD_GPT")
+        raise AssertionError(f"{bad} must be refused")
+    except agon.ToolError as e:
+        assert str(e).startswith("AGON_CMD_GPT must be a command line or a JSON list") and '"codex"' in str(e), e
+windows_json = '["C:\\\\apps\\\\agy.exe", "-p={prompt}"]'  # JSON needs doubled backslashes
+assert agon.split_command(windows_json, "AGON_CMD_GEMINI") == ["C:\\apps\\agy.exe", "-p={prompt}"]
+empty = Path(TMP, "empty-bin")
+empty.mkdir()
+lost = Agent("lost", env={k: v for k, v in ASK.items() if not k.startswith("AGON_CMD_")} | {"PATH": str(empty)})
+res, text = asked(lost, agent="gpt", prompt="review", cwd=str(project))
+assert res["isError"] is True and text.startswith("Can't run gpt: no codex") and str(empty) in text, text
+assert "set AGON_CMD_GPT to its full command (`python agon.py setup` prints it)" in text, text
+missing = Agent("missing", env=ASK | {"AGON_CMD_GEMINI": json.dumps([str(Path(TMP, "no", "agy.exe")), "-p={prompt}"])})
+res, text = asked(missing, agent="gemini", prompt="review", cwd=str(project))
+assert res["isError"] is True and f"{Path(TMP, 'no', 'agy.exe')} doesn't exist or can't be run" in text, text
+for a in (lost, missing):
+    a.close()
+if windows:  # cmd.exe would read a prompt passed to a batch file as commands: Agon refuses
+    (empty / "agy.cmd").write_text("@echo off\n")
+    guard = Agent("guard", env=ASK | {"AGON_CMD_GEMINI": json.dumps([str(empty / "agy.cmd"), "-p={prompt}"])})
+    res, text = asked(guard, agent="gemini", prompt="hi & calc", cwd=str(project))
+    assert res["isError"] is True and "is a batch file, and cmd.exe could run commands hidden" in text, text
+    guard.close()
+
+# Phase 3, isolation. An app that ask started must not act as the team's agent: its Stop hook would hand it that
+# agent's messages (claude -p and agy -p run the user's Stop hooks: checked with 2.1.281 and 1.2.10), and its Agon
+# server could read that agent's inbox. AGON_ASKED_BY marks such runs: the hook lets them stop at once, and the server
+# offers no tools and doesn't count as the agent being there
+say = sqlite3.connect(HOOKS["AGON_DB"], isolation_level=None)
+say.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'gpt', 'only for the real gpt')")
+say.close()
+t0 = time.monotonic()
+assert run_hook("gpt", "--wait", "5", env={"AGON_ASKED_BY": "claude"}) == (0, b"", "") and time.monotonic() - t0 < 4
+code, out, err = run_hook("gpt", "--wait", "0")
+assert code == 0 and "only for the real gpt" in json.loads(out)["reason"], (code, out, err)  # left for the agent
+seen = agent_row("gpt", "last_seen")
+inside = Agent("gpt", client="claude-code", env=dict(os.environ, AGON_ASKED_BY="claude"))
+assert inside.hello["instructions"].startswith('Agon\'s ask started this session for "claude"'), inside.hello
+assert inside.rpc("tools/list", id=2)["result"] == {"tools": []}
+reply = inside.rpc("tools/call", {"name": "inbox", "arguments": {}}, id=3)
+assert reply["error"]["code"] == -32602 and reply["error"]["message"].startswith("Agon's tools are off here"), reply
+inside.close()
+assert agent_row("gpt", "last_seen") == seen
+
+
+# Phase 3, threads. An ask gets a thread of its own, so the agent's send and inbox answer while it runs (Claude Code
+# moves a long tool call to the background, and the agent goes on). A cancel, STOP or a closed client stops the app,
+# with its whole process tree, and no new ask starts while the team is paused
+busy = Agent("busy", env=ASK)
+while busy("inbox", wait=0) != "No new messages.":
+    pass
+BEAT.unlink()
+busy.write(call(40, "ask", agent="gpt", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+t0 = time.monotonic()
+assert busy("send", text="still here", to="rev") == "Sent." and busy("inbox", wait=0) == "No new messages."
+assert time.monotonic() - t0 < 5
+busy.write(cancel(40))
+until(lambda: not beating())
+assert busy.rpc("ping", id=41) == {"jsonrpc": "2.0", "id": 41, "result": {}}  # and no reply to the cancelled ask
+until(lambda: agon_said().startswith("busy asked gpt for a review: gpt was stopped after "))
+assert agon_said().endswith("s: the call was cancelled, or the app that asked is gone."), agon_said()
+BEAT.unlink()
+busy.write(call(42, "ask", agent="gemini", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+agon.post("human", "all", "STOP")
+reply = busy.read()
+assert reply["id"] == 42 and reply["result"]["isError"] is True and not beating(), reply
+text = reply["result"]["content"][0]["text"]
+assert re.fullmatch(r"gemini was stopped after \d+s: the human paused the team\.", text), text
+res, text = asked(busy, agent="gpt", prompt="hi", cwd=str(project))
+assert res["isError"] is True and text == f"Nothing asked: {agon.PAUSED}", text
+agon.post("human", "all", "go on")
+BEAT.unlink()
+busy.write(call(43, "ask", agent="claude", prompt="HANG, please", cwd=str(project)))
+until(BEAT.exists)
+t0 = time.monotonic()
+busy.close()  # the app that asked quits: its Agon server stops the ask's app, then exits
+assert time.monotonic() - t0 < 10 and not beating()
+# The host apps end their Agon servers with SIGINT (Claude Code) or SIGTERM (Codex; agy closes stdin first), all seen
+# with stub servers; on Windows they may just terminate the process. An ask's app must not go on after its server
+for how in ("kill",) if windows else ("terminate", "interrupt"):
+    host = Agent("host", env=ASK)
+    BEAT.unlink()
+    host.write(call(50, "ask", agent="gpt", prompt="HANG, please", cwd=str(project)))
+    until(BEAT.exists)
+    if how == "terminate":
+        host.p.terminate()
+    elif how == "interrupt":
+        host.p.send_signal(signal.SIGINT)
+    else:  # TerminateProcess: nothing runs in the server any more, and Windows ends the job its apps belong to
+        host.p.kill()
+    assert host.p.wait(15) is not None and not beating(), how
+    if how != "kill":  # the server had time to stop the app and say so
+        assert agon_said().startswith("host asked gpt for a review: gpt was stopped after "), (how, agon_said())
+    host.p.stdin.close()
+    host.p.stdout.close()
+
+# Phase 3, 4. The final message of each app's format, else nothing (then the raw output tail is the answer)
+assert agon.final_answer(json.dumps({"type": "result", "is_error": False, "result": "fine"})) == ("fine", None)
+assert agon.final_answer(json.dumps([{"type": "system"}, {"type": "result", "result": "v"}])) == ("v", None)
+claude_429 = {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,  # seen with 2.1.281
+              "result": "API Error: Request rejected (429) · This request would exceed your account's rate limit."}
+assert agon.final_answer(json.dumps(claude_429)) == (None, claude_429["result"])
+codex_limit = [{"type": "thread.started", "thread_id": "t"},  # seen with codex 0.156.1
+               {"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Model metadata..."}},
+               {"type": "turn.started"},
+               {"type": "error", "message": "You’ve hit your usage limit. Upgrade to Pro or try again at 7:48 PM."},
+               {"type": "turn.failed", "error": {"message": "You’ve hit your usage limit. Upgrade to Pro or try"
+                                                            " again at 7:48 PM."}}]
+answer, error = agon.final_answer("Reading prompt from stdin...\n" + "\n".join(map(json.dumps, codex_limit)))
+assert answer is None and error.startswith("You’ve hit your usage limit.") and agon.shows_limit([error]), error
+agy_quota = {"conversation_id": "c", "status": "ERROR", "response": "", "error": "API error (attempt 7): Error 429,"
+             " Message: You exceeded your current quota. Your quota will reset after 2h3m4s., Status:"
+             " RESOURCE_EXHAUSTED, Details: []"}  # seen with agy 1.2.10
+assert agon.final_answer(json.dumps(agy_quota)) == (None, agy_quota["error"]) and agon.shows_limit([agy_quota["error"]])
+stream = {"event": "result", "result": {"conversation_id": "c", "status": "SUCCESS", "response": "apple\n"}}
+assert agon.final_answer(json.dumps(stream)) == ("apple\n", None)
+assert agon.final_answer("plain words\n[1, 2]\n{not json") == (None, None)
+assert agon.shows_limit([claude_429["result"]]) is None  # an API key's rate limit isn't a plan's usage limit
+assert agon.verdict("Tests fail.\n**VERDICT: Changes**: fix x") == "changes"
+assert agon.verdict("VERDICT: changes, then\nVERDICT: approve") == "approve" and agon.verdict("fine") is None
+long_answer = "start " + "x" * 20000 + " VERDICT: approve"
+cut = agon.clip(long_answer)
+assert len(cut) < agon.MAX_INBOX and cut.startswith("start ") and cut.endswith("VERDICT: approve") and "cut)" in cut
+assert (agon.took(0.4), agon.took(59.6), agon.took(102)) == ("0s", "1m 0s", "1m 42s")
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
-assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox"]
-for tool in json.loads(raw)["result"]["tools"]:  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
+assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "ask"]
+send_tool, inbox_tool, ask_tool = json.loads(raw)["result"]["tools"]
+for tool in (send_tool, inbox_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
     assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
+# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
+assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
+assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
 sam.close()
 
 # 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons
@@ -772,6 +1351,27 @@ for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "
                    "--dangerously-load-development-channels plugin:agon@agon", "server:agon", "AGON_MAX_AUTORUNS",
                    "AGON_LIMIT_PATTERNS", "`--wait`", "v0.2"):
         assert needed in text, (readme, needed)
+
+# Phase 3: both READMEs explain ask (the modes, the commands and their flags, how to replace them, the fallback, the
+# timeout, Codex's approval and timeout settings), and the roadmap has the phase ticked
+for readme in ("README.md", "README.ru.md"):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in ("`ask`", "`VERDICT: approve`", "`VERDICT: changes`", "`git worktree`", "`git diff --stat`",
+                   "`AGON_FALLBACK`", "`claude,gpt,gemini`", "`AGON_ASK_TIMEOUT`", "`AGON_CMD_CLAUDE`",
+                   "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
+                   "`tool_timeout_sec`",
+                   '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
+                   "`[mcp_servers.agon.tools.ask]`", "`permissions.allow`", "`git worktree remove --force", "(v0.3)"):
+        assert needed in text, (readme, needed)
+    for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
+        for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
+            assert f"`{' '.join(args)}`" in text, (readme, name, args)
+# They say gemini reviews a throwaway copy, what stays out of it, and where a copy may stay behind
+for readme, copy in (("README.md", "gemini\n  reviews a throwaway copy of your git repository"),
+                     ("README.ru.md", "gemini проверяет одноразовую копию твоего git-репозитория")):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert copy in text and "`.gitignore`" in text and "`agon-review-gemini-...`" in text, readme
+assert "- [x] Phase 3 — Cross-vendor second opinion (`ask`)" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
 for a in (claude, gemini, gpt):
     a.close()
