@@ -197,4 +197,17 @@ class Gone(io.RawIOBase):  # a client that closed its end of the pipe
 
 
 agon.serve_mcp("gone", io.BytesIO(b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'), Gone())  # returns quietly
+
+
+# 7. The app's name from initialize.clientInfo is stored per agent
+def agent_row(name, column):
+    return con.execute(f"SELECT {column} FROM agents WHERE name = ?", (name,)).fetchone()[0]
+
+
+cody = Agent("cody", client="claude-code")
+assert agent_row("cody", "client") == "claude-code"
+cody.rpc("initialize", {"protocolVersion": "2025-06-18"})  # no clientInfo: keep what we know
+assert agent_row("cody", "client") == "claude-code"
+cody.rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "codex-mcp-client"}})
+assert agent_row("cody", "client") == "codex-mcp-client"
 print("ok")

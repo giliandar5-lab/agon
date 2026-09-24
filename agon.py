@@ -103,6 +103,15 @@ def post(sender, rcpt, text):
     db().execute("INSERT INTO msgs(sender, rcpt, text) VALUES (?, ?, ?)", (sender, rcpt, text))
 
 
+def touch(me, client=None):
+    """Note that agent `me` was just seen; `client` (the app, from initialize) is kept until a new one comes."""
+    db().execute(
+        "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
+        " client = COALESCE(excluded.client, client), last_seen = excluded.last_seen",
+        (me, client, time.time()),
+    )
+
+
 def data_version():
     """A number that changes whenever another connection commits to agon.db."""
     return db().execute("PRAGMA data_version").fetchone()[0]
@@ -165,6 +174,7 @@ class Session:
 
     def __init__(self, me):
         self.me = me
+        self.client = None  # the app, from initialize.clientInfo.name
         self.last = 0  # in-memory cursor: a fresh agent session starts from the history and catches up
 
 
@@ -215,6 +225,10 @@ def handle(session, msg):
 def dispatch(session, method, params):
     match method:
         case "initialize":
+            info = params.get("clientInfo")
+            name = info.get("name") if isinstance(info, dict) else None
+            session.client = name if isinstance(name, str) else None
+            touch(session.me, session.client)
             asked = params.get("protocolVersion")
             return {
                 "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
