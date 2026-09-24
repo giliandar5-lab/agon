@@ -13,6 +13,35 @@ team working on your project, and shows it live in an arena. Two pillars:
 Who it is for: people who already use two or more AI coding tools, including people who work in GUI apps
 (VS Code, Codex app, Antigravity IDE) and on Windows, not only in tmux on macOS/Linux.
 
+## Progress
+
+Tick a phase in the same pull request that completes it.
+
+- [ ] Phase 1 — Solid core
+- [ ] Phase 2 — Agents wake up on their own, one-command install, limit awareness
+- [ ] Phase 3 — Cross-vendor second opinion (`ask`)
+- [ ] Phase 4 — Task board (no downtime)
+- [ ] Phase 5 — The arena
+- [ ] Phase 6 — Packaging
+
+## How every session works
+
+When asked to do "the next phase":
+
+1. Take the **first phase in Progress that is not ticked**. Implement only that phase; later phases come in
+   separate sessions.
+2. Read this whole file (including "Working rules" and "Verified platform facts"), then README.md, agon.py and
+   test_agon.py.
+3. Turn every bullet of the phase into a numbered checklist. Show the checklist and a short plan to the user and
+   wait for approval.
+4. Work item by item: implement, add assert-based checks to test_agon.py, run `python test_agon.py`, commit.
+   Never move on while tests fail.
+5. If something is ambiguous, pick the simplest option that satisfies this roadmap and note it in the pull request.
+6. Done means: every checklist item is implemented and covered by a test, `python test_agon.py` prints `ok`, the
+   phase is ticked in Progress, and a pull request lists each item with how it was verified, what could not be
+   verified, and step-by-step manual test instructions for Windows.
+7. Reply in the language the user writes in.
+
 ## Design principles (and why)
 
 | Principle | Evidence |
