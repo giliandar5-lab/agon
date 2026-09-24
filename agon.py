@@ -612,8 +612,9 @@ def git(cwd, *args):
     p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                        creationflags=NO_WINDOW)
     if p.returncode:
-        raise ToolError(f"git {args[0]} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
-    return p.stdout.strip()
+        command = next(a for a in args if not a.startswith("-") and "=" not in a)  # commit, not the -c before it
+        raise ToolError(f"git {command} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
+    return p.stdout.rstrip()  # the first line of --stat starts with a space too
 
 
 def repository(cwd):
@@ -703,38 +704,69 @@ def ask_run(asker, name, mode, prompt, cwd, end, stopped):
     return (tail(out, MAX_INBOX) or tail(err, MAX_INBOX) if answer is None else answer), None, None
 
 
+def fallbacks(agent, asker):
+    """Who else may answer when `agent` is out of quota: AGON_FALLBACK (claude,gpt,gemini), without the asker."""
+    names = [name.strip() for name in os.environ.get("AGON_FALLBACK", ",".join(COMMANDS)).split(",") if name.strip()]
+    if any(name not in COMMANDS for name in names):
+        raise ToolError("AGON_FALLBACK must list agents Agon can ask, such as claude,gpt,gemini (or be empty).")
+    return [name for name in dict.fromkeys(names) if name not in (agent, asker)]
+
+
+def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
+    """Agent `name`'s go at an ask: (its answer or None, why it failed or None, the texts that show a usage limit or
+    None, the branch that holds a task's work or None, its diff stat or None)."""
+    if not top:
+        return (*ask_run(asker, name, mode, REVIEW.format(asker=asker, prompt=prompt), cwd, end, stopped), None, None)
+    path, branch, base = new_worktree(top, name)  # a task works on a branch of its own, in a temporary worktree
+    try:
+        answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt),
+                                         same_folder(top, path, cwd), end, stopped)
+    finally:
+        stat = keep_work(top, path, branch, base, name, f"{name}: {' '.join(prompt.split())[:72]}")
+    return answer, problem, limit, (branch if stat else None), stat
+
+
 def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
     top = repository(cwd) if mode == "task" else None
     me, started = session.me, time.monotonic()
-    end, head = started + ask_timeout(), f"{me} asked {agent} for a {mode}"
-    if top:  # a task works on a branch of its own, in a temporary worktree
-        path, branch, base = new_worktree(top, agent)
+    end, head, skipped = started + ask_timeout(), f"{me} asked {agent} for a {mode}", []
+    for name in [agent, *fallbacks(agent, me)]:  # the next one answers while one is out of quota
+        if until := quota_until(name):
+            skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+            continue
         try:
-            answer, problem, _ = ask_run(me, agent, mode, TASK.format(asker=me, branch=branch, prompt=prompt),
-                                         same_folder(top, path, cwd), end, session.stopped)
-        finally:
-            stat = keep_work(top, path, branch, base, agent, f"{agent}: {' '.join(prompt.split())[:72]}")
+            answer, problem, limit, branch, stat = ask_once(me, name, mode, prompt, cwd, top, end, session.stopped)
+        except ToolError as e:  # its app isn't there, or git failed
+            if name != agent:
+                skipped.append(str(e).rstrip("."))
+                continue
+            answer, problem, limit, branch, stat = None, str(e), None, None, None
+        if limit:
+            out_of_quota(name, limit)  # marked until it resets, and the team is told
+            skipped.append(f"{name} hit its usage limit" + (f" (what it did is on branch {branch})" if branch else ""))
+            continue
+        break
     else:
-        answer, problem, _ = ask_run(me, agent, mode, REVIEW.format(asker=me, prompt=prompt), cwd, end,
-                                     session.stopped)
-    spent = took(time.monotonic() - started)
+        name, problem, branch = None, f"Nobody could answer: {'; '.join(skipped)}.", None
+    spent, lead = took(time.monotonic() - started), "; ".join(skipped) + ", so " if skipped else ""
     if problem:
-        if top and stat:
+        if branch:
             problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
-        post("agon", "human", f"{head}: {problem}")  # every ask shows in the arena, and wakes no agent
-        raise ToolError(problem)
-    if top and stat:
-        post("agon", "human", f"{head}: {agent} finished in {spent} on branch {branch}:"
+        post("agon", "human", f"{head}: {lead if name else ''}{problem}")  # every ask shows in the arena, wakes no one
+        raise ToolError(f"{lead if name else ''}{problem}")
+    if branch:
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch}:"
                               f" {stat.splitlines()[-1].strip()}.")
-        return (f"{agent} finished the task in {spent} on branch {branch}:\n{stat}\nMerge it if you want it: git merge"
-                f" {branch} (or drop it: git branch -D {branch}).\n\nIts summary:\n{clip(answer)}"), None
+        return (f"{lead}{name} finished the task in {spent} on branch {branch}:\n{stat}\nMerge it if you want it: git"
+                f" merge {branch} (or drop it: git branch -D {branch}).\n\nIts summary:\n{clip(answer)}"), None
     if top:
-        post("agon", "human", f"{head}: {agent} finished in {spent} without changing any file.")
-        return f"{agent} finished the task in {spent} without changing any file.\n\nIts summary:\n{clip(answer)}", None
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file.")
+        return (f"{lead}{name} finished the task in {spent} without changing any file.\n\nIts summary:\n"
+                f"{clip(answer)}"), None
     seal = f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict"
-    post("agon", "human", f"{head}: {agent} answered in {spent}, {seal}.")
-    return f"{agent} answered in {spent} ({mode}, {seal}):\n\n{clip(answer)}", None
+    post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
+    return f"{lead}{name} answered in {spent} ({mode}, {seal}):\n\n{clip(answer)}", None
 
 
 TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
@@ -1002,6 +1034,17 @@ def reset_time(text, now):
         return when.timestamp()
 
 
+def reset_clock(until, now):
+    """A reset time as the team reads it: 14:00, or Sep 26 09:00 when it is most of a day away."""
+    return time.strftime("%H:%M" if until - now < 20 * 3600 else "%b %d %H:%M", time.localtime(until))
+
+
+def quota_until(name):
+    """When agent `name`'s usage limit resets, while it is out of quota; else None."""
+    row = db().execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (name,)).fetchone()
+    return row[0] if row and row[0] and row[0] > time.time() else None
+
+
 def out_of_quota(me, text):
     """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
     team, once per limit."""
@@ -1014,9 +1057,8 @@ def out_of_quota(me, text):
         con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
                     " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
         if not (row and row[0] and row[0] > now):  # not already known
-            clock = "%H:%M" if until and until - now < 20 * 3600 else "%b %d %H:%M"
             post("agon", "all", f"{me} hit its usage limit"
-                 + (f", resets ~{time.strftime(clock, time.localtime(until))}." if until else "; reset time unknown."))
+                 + (f", resets ~{reset_clock(until, now)}." if until else "; reset time unknown."))
         con.execute("COMMIT")
     except BaseException:
         if con.in_transaction:
