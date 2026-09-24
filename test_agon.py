@@ -210,4 +210,12 @@ cody.rpc("initialize", {"protocolVersion": "2025-06-18"})  # no clientInfo: keep
 assert agent_row("cody", "client") == "claude-code"
 cody.rpc("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "codex-mcp-client"}})
 assert agent_row("cody", "client") == "codex-mcp-client"
+
+# 6. Presence: every request moves last_seen (Unix time)
+before = agent_row("cody", "last_seen")
+assert abs(time.time() - before) < 60
+time.sleep(0.1)
+cody.rpc("tools/list")
+assert agent_row("cody", "last_seen") > before
+cody.close()
 print("ok")
