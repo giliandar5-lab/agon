@@ -329,6 +329,22 @@ assert arena_post(b"{broken")[0] == 400 and arena_post(json.dumps({"to": "all"})
 arena.shutdown()
 arena.server_close()
 
+# 10. One inbox result is at most ~12,000 characters; the rest waits: "N more — call inbox again"
+while sam("inbox", wait=0) != "No new messages.":  # sam is new: first it reads the history
+    pass
+for i in range(5):
+    agon.post("test", "sam", f"part {i} " + "z" * 5000)
+parts = []
+while (text := sam("inbox", wait=0)) != "No new messages.":
+    parts.append(text)
+assert len(parts) == 3 and all(len(text) <= agon.MAX_INBOX == 12000 for text in parts), [len(t) for t in parts]
+assert parts[0].endswith("\n3 more — call inbox again.") and parts[1].endswith("\n1 more — call inbox again.")
+assert "part 4 " in parts[2] and "more — call" not in parts[2]
+agon.post("test", "sam", "legacy " + "w" * 13000)  # longer than a whole result (v0.1 had no limit)
+text = sam("inbox", wait=0)
+assert text.startswith("#") and "legacy" in text and len(text) > 12000  # still delivered, alone
+assert sam("inbox", wait=0) == "No new messages."
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
