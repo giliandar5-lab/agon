@@ -126,7 +126,9 @@ When asked to do "the next phase":
   `--sandbox read-only`), `agy -p=<prompt> --output-format json --add-dir <folder>` (review adds `--mode plan`; agy
   takes no prompt on stdin, see the facts below). Pass the prompt on stdin where supported. Parse the final message
   from each format, falling back to the raw output tail.
-- Review prompt template: run the tests, cite the output, end with `VERDICT: approve` or `VERDICT: changes`.
+- Review prompt template: run the tests, cite the output, end with `VERDICT: approve` or `VERDICT: changes`. A review
+  never changes the user's files: a reviewer whose app can't be held to read-only (agy, see the facts below) works
+  in a throwaway copy of the repository, uncommitted changes included, which is deleted afterwards.
 - Task mode runs in a temporary `git worktree` with write access and returns the summary, `git diff --stat` and
   the branch name; the caller decides whether to merge.
 - Out of quota: if the target is marked out of quota or its output matches `AGON_LIMIT_PATTERNS`, mark it and
@@ -334,8 +336,14 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   `-p`. `--print-timeout` defaults to 0 (no limit), though the [docs](https://antigravity.google/docs/cli/headless)
   say 5 minutes.
 - Without `--add-dir`, `agy -p` has no workspace: it tells the model "The user does not have any active workspace"
-  and would write into a scratch folder of its own. With `--add-dir <folder>` that folder is the workspace, and its
-  `.agents/hooks.json` runs. The global Stop hooks run in `-p` mode, with the caller's environment.
+  and would write into a scratch folder of its own. With `--add-dir <folder>` that folder is the workspace (the
+  system prompt maps it as `[URI] -> [CorpusName]`), and its `.agents/hooks.json` runs. The global Stop hooks run in
+  `-p` mode, with the caller's environment.
+- Writes in `-p` mode (1.2.10, a mock model that calls `write_to_file`): in `--mode plan` and `default`, a write in
+  the workspace that no rule allows is refused ("a tool required the "write_file" permission that headless mode
+  cannot prompt for, so it was auto-denied"), and so is one outside it; `accept-edits` writes. `--mode plan` doesn't
+  stop a write the permissions allow: with `write_file(<project>)` in `permissions.allow`, a review overwrote the
+  project's uncommitted file, and writes into a temporary folder go through without a rule.
 - API-key mode (`"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json`, `GEMINI_API_KEY`,
   `GOOGLE_GEMINI_BASE_URL`) runs headless without a Google login. A 429 `RESOURCE_EXHAUSTED` is retried 7 times (about
   100 s), then `status: "ERROR"`, `error: "API error (attempt 7): Error 429, Message: ... Status: RESOURCE_EXHAUSTED"`.

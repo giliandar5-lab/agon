@@ -157,7 +157,10 @@ answer. It takes minutes, and meanwhile Agon keeps answering the asking agent's 
 a tool call that takes over two minutes to the background and goes on).
 
 - **Review** (the default): the reviewer may only read. Agon tells it to run the tests, cite what they printed, and
-  end with `VERDICT: approve` or `VERDICT: changes`.
+  end with `VERDICT: approve` or `VERDICT: changes`. Antigravity's plan mode doesn't keep it from writing, so gemini
+  reviews a throwaway copy of your git repository: your branches, what you staged and your files as they are,
+  uncommitted changes included. Paths into your project in the prompt lead to the copy, and Agon deletes the copy
+  afterwards, with whatever the reviewer changed in it.
 - **Task:** the other agent works on a new branch, `agon/<agent>-<time>`, from your last commit, in a temporary
   `git worktree` (your uncommitted changes aren't in it). Agon commits what it changed, removes the worktree and
   returns its summary, `git diff --stat` and the branch. Merging is your call: `git merge agon/gpt-...`.
@@ -231,7 +234,10 @@ Agon only runs the vendors' official command-line apps, logged in as you, within
 - Codex runs the hook only after you trust it, and doesn't tell hooks about usage limits.
 - Each agent runs on its own app's plan and usage limits; an `ask` spends the plan of the agent it asks.
 - A task starts from your last commit. If the asking app is closed in the middle of a task, its temporary worktree
-  may stay behind: `git worktree list` shows it, and `git worktree remove --force <path>` removes it.
+  may stay behind: `git worktree list` shows it, and `git worktree remove --force <path>` removes it. A gemini
+  review's copy (`agon-review-gemini-...` in your temporary folder) may stay behind the same way; delete it.
+- A gemini review needs a git repository with a commit, and its copy leaves out what `.gitignore` does, such as
+  installed dependencies: tests that need them may not run there.
 - There is no file locking: "announce before you edit" is a team rule, not a lock.
 
 ## Test
