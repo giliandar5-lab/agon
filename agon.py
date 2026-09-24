@@ -5,6 +5,7 @@ python agon.py          browser arena at http://127.0.0.1:8765
 """
 import json
 import os
+import queue
 import sqlite3
 import sys
 import threading
@@ -117,19 +118,30 @@ def data_version():
     return db().execute("PRAGMA data_version").fetchone()[0]
 
 
-def wait_for_change(since, timeout):
-    """True once another connection commits after data_version() returned `since`, False after `timeout` s.
-    One cheap PRAGMA every 0.2 s: near-zero CPU, at most 0.2 s latency."""
+def wait_for_change(since, timeout, stop=lambda: False):
+    """True once another connection commits after data_version() returned `since`; False after `timeout` s,
+    or as soon as stop() is true. One cheap PRAGMA every 0.2 s: near-zero CPU, at most 0.2 s latency."""
     end = time.monotonic() + timeout
     while data_version() == since:
         left = end - time.monotonic()
-        if left <= 0:
+        if left <= 0 or stop():
             return False
         time.sleep(min(0.2, left))
     return True
 
 
-def inbox(me, after, wait):
+def cursor_of(me):
+    """Id of the last message delivered to `me`; 0 for a new agent, which then reads the whole history."""
+    row = db().execute("SELECT cursor FROM agents WHERE name = ?", (me,)).fetchone()
+    return row[0] if row else 0
+
+
+def advance(me, last):
+    """Move `me`'s cursor to message `last`, never back (two sessions of one agent may overlap)."""
+    db().execute("UPDATE agents SET cursor = MAX(cursor, ?) WHERE name = ?", (last, me))
+
+
+def inbox(me, after, wait, stop=lambda: False):
     end = time.monotonic() + min(wait, 55)  # Codex cancels tool calls after 60 s by default
     while True:
         version = data_version()  # read before the query: a message committed right after it still wakes us
@@ -138,7 +150,7 @@ def inbox(me, after, wait):
             " WHERE id > ? AND sender != ? AND rcpt IN ('all', ?) ORDER BY id LIMIT 50",
             (after, me, me),
         ).fetchall()
-        if rows or not wait_for_change(version, end - time.monotonic()):
+        if rows or not wait_for_change(version, end - time.monotonic(), stop):
             return rows
 
 
@@ -172,10 +184,16 @@ def error(rid, code, message):
 class Session:
     """What one server process keeps about its agent outside the database."""
 
-    def __init__(self, me):
-        self.me = me
+    def __init__(self, me, out):
+        self.me, self.out = me, out
         self.client = None  # the app, from initialize.clientInfo.name
-        self.last = 0  # in-memory cursor: a fresh agent session starts from the history and catches up
+        self.current = None  # id of the request being handled
+        self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
+        self.closed = False  # the client closed our stdin
+
+    def stopped(self):
+        """Nobody waits for the current request any more (cancelled, or the client left): stop waiting."""
+        return self.closed or self.current in self.cancelled
 
 
 def tool_send(session, args):
@@ -185,7 +203,7 @@ def tool_send(session, args):
     if not isinstance(to, str) or not to.strip():
         raise ToolError("Nothing sent: `to` must be all, human or an agent name such as claude, gemini or gpt.")
     post(session.me, to.strip(), text)
-    return "Sent."
+    return "Sent.", None
 
 
 def tool_inbox(session, args):
@@ -193,34 +211,36 @@ def tool_inbox(session, args):
         wait = float(args.get("wait", 30))
     except (TypeError, ValueError):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
-    rows = inbox(session.me, session.last, wait if wait > 0 else 0)  # negative or NaN: no wait
-    if rows:
-        session.last = rows[-1][0]
-    return "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows) or "No new messages."
+    rows = inbox(session.me, cursor_of(session.me), wait if wait > 0 else 0, session.stopped)  # NaN: no wait
+    if not rows:
+        return "No new messages.", None
+    last = rows[-1][0]
+    return "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows), lambda: advance(session.me, last)
 
 
-TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox}  # schemas are in TOOLS
+TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox}  # each returns (text, what to run once it's delivered)
 
 
 def handle(session, msg):
-    """Answer one message from the client: a JSON-RPC reply, or None when none is due."""
+    """Answer one message from the client: (JSON-RPC reply or None, what to run once the reply is written)."""
     if not isinstance(msg, dict) or not isinstance(msg.get("method"), str):
         if isinstance(msg, dict) and ("result" in msg or "error" in msg):
-            return None  # a response, but we never send requests
+            return None, None  # a response, but we never send requests
         rid = msg.get("id") if isinstance(msg, dict) else None
-        return error(rid, -32600, "Invalid Request: expected a JSON-RPC 2.0 request object")
+        return error(rid, -32600, "Invalid Request: expected a JSON-RPC 2.0 request object"), None
     if "id" not in msg:
-        return None  # a notification (initialized, cancelled, ...): never answered
+        return None, None  # a notification (initialized, ...): never answered
     try:
         params = {} if msg.get("params") is None else msg["params"]
         if not isinstance(params, dict):
             raise RpcError(-32602, "Invalid params: `params` must be an object")
         touch(session.me)  # presence: every request moves last_seen
-        return {"jsonrpc": "2.0", "id": msg["id"], "result": dispatch(session, msg["method"], params)}
+        result, after = dispatch(session, msg["method"], params)
+        return {"jsonrpc": "2.0", "id": msg["id"], "result": result}, after
     except RpcError as e:
-        return error(msg["id"], e.code, str(e))
+        return error(msg["id"], e.code, str(e)), None
     except Exception as e:
-        return error(msg["id"], -32603, f"Internal error: {e}")
+        return error(msg["id"], -32603, f"Internal error: {e}"), None
 
 
 def dispatch(session, method, params):
@@ -236,11 +256,11 @@ def dispatch(session, method, params):
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "agon", "version": "0.1"},
                 "instructions": INSTRUCTIONS.format(me=session.me),
-            }
+            }, None
         case "ping":
-            return {}
+            return {}, None
         case "tools/list":
-            return {"tools": TOOLS}
+            return {"tools": TOOLS}, None
         case "tools/call":
             return call_tool(session, params)
     raise RpcError(-32601, f"Method not found: {method}")
@@ -255,18 +275,21 @@ def call_tool(session, params):
     if not isinstance(args, dict):
         raise RpcError(-32602, "Invalid params: `arguments` must be an object")
     try:
-        return {"content": [{"type": "text", "text": tool(session, args)}]}
+        text, after = tool(session, args)
+        return {"content": [{"type": "text", "text": text}]}, after
     except ToolError as e:
         text = str(e)
     except Exception as e:  # e.g. agon.db stayed locked for 5 s: tell the agent, keep serving
         text = f"Agon failed: {e}. Try again in a moment."
-    return {"content": [{"type": "text", "text": text}], "isError": True}
+    return {"content": [{"type": "text", "text": text}], "isError": True}, None
 
 
-def serve_mcp(me, inp=None, out=None):
-    """MCP server for agent `me`: one JSON-RPC message per line on stdin and stdout."""
-    inp, out = inp or sys.stdin.buffer, out or sys.stdout.buffer
-    session = Session(me)
+EOF = object()  # queued after the client's last message
+
+
+def read_client(session, inp, todo):
+    """Read the client's messages: queue requests for work() and handle at once what can't wait behind a long
+    inbox call (cancellations, pings, unreadable lines). When the client closes stdin, mark the session closed."""
     try:
         for line in inp:
             if not line.strip():
@@ -274,13 +297,58 @@ def serve_mcp(me, inp=None, out=None):
             try:
                 msg = json.loads(line)
             except Exception:  # bad JSON or UTF-8, nesting too deep, a number too long...
-                reply = error(None, -32700, "Parse error: send one JSON-RPC message per line")
+                emit(session.out, error(None, -32700, "Parse error: send one JSON-RPC message per line"))
+                continue
+            method = msg.get("method") if isinstance(msg, dict) else None
+            if method == "notifications/cancelled":
+                params = msg.get("params")
+                rid = params.get("requestId") if isinstance(params, dict) else None
+                if isinstance(rid, (str, int)):
+                    session.cancelled.add(rid)
+            elif method == "ping" and "id" in msg:
+                emit(session.out, {"jsonrpc": "2.0", "id": msg["id"], "result": {}})
             else:
-                reply = handle(session, msg)
-            if reply is not None:
-                emit(out, reply)
-    except (OSError, ValueError):  # the client closed the pipes (ValueError: write to a closed file)
+                todo.put(msg)
+    except (OSError, ValueError):  # the client closed the pipes (ValueError: I/O on a closed file)
         pass
+    finally:
+        session.closed = True
+        todo.put(EOF)
+
+
+def work(session, todo):
+    """Answer the queued requests one by one, in order."""
+    try:
+        while (msg := todo.get()) is not EOF:
+            rid = msg.get("id") if isinstance(msg, dict) else None
+            session.current = rid if isinstance(rid, (str, int)) else None
+            if session.current in session.cancelled:
+                continue  # cancelled while it waited in the queue: don't run it at all
+            reply, after = handle(session, msg)
+            if session.current in session.cancelled:
+                continue  # the client dropped this request: no reply, and its messages stay unread
+            if reply is not None:
+                try:
+                    emit(session.out, reply)
+                except (OSError, ValueError):  # the client is gone: unread messages wait for its next session
+                    return
+            if after:  # only now that the reply is out: at-least-once delivery
+                try:
+                    after()
+                except Exception as e:  # the cursor stays put and the messages come again
+                    print(f"agon: {e}", file=sys.stderr)
+    finally:
+        close_db()
+
+
+def serve_mcp(me, inp=None, out=None):
+    """MCP server for agent `me`: one JSON-RPC message per line on stdin and stdout. This thread reads and a
+    worker answers, so a cancel or a closed pipe is noticed even while inbox waits."""
+    session, todo = Session(me, out or sys.stdout.buffer), queue.Queue()
+    worker = threading.Thread(target=work, args=(session, todo))
+    worker.start()
+    read_client(session, inp or sys.stdin.buffer, todo)
+    worker.join()
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
