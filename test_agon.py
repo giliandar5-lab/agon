@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1117,6 +1118,24 @@ until(BEAT.exists)
 t0 = time.monotonic()
 busy.close()  # the app that asked quits: its Agon server stops the ask's app, then exits
 assert time.monotonic() - t0 < 10 and not beating()
+# The host apps end their Agon servers with SIGINT (Claude Code) or SIGTERM (Codex; agy closes stdin first), all seen
+# with stub servers; on Windows they may just terminate the process. An ask's app must not go on after its server
+for how in ("kill",) if windows else ("terminate", "interrupt"):
+    host = Agent("host", env=ASK)
+    BEAT.unlink()
+    host.write(call(50, "ask", agent="gpt", prompt="HANG, please", cwd=str(project)))
+    until(BEAT.exists)
+    if how == "terminate":
+        host.p.terminate()
+    elif how == "interrupt":
+        host.p.send_signal(signal.SIGINT)
+    else:  # TerminateProcess: nothing runs in the server any more, and Windows ends the job its apps belong to
+        host.p.kill()
+    assert host.p.wait(15) is not None and not beating(), how
+    if how != "kill":  # the server had time to stop the app and say so
+        assert agon_said().startswith("host asked gpt for a review: gpt was stopped after "), (how, agon_said())
+    host.p.stdin.close()
+    host.p.stdout.close()
 
 # Phase 3, 4. The final message of each app's format, else nothing (then the raw output tail is the answer)
 assert agon.final_answer(json.dumps({"type": "result", "is_error": False, "result": "fine"})) == ("fine", None)
