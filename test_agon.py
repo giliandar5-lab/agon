@@ -86,14 +86,15 @@ assert old.execute("SELECT COUNT(*) FROM agents").fetchone()[0] == 0
 assert old.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
 old.close()
 fresh = dict(os.environ, AGON_DB=str(Path(TMP, "fresh.db")))  # several agents create one database at once
-starts = [subprocess.Popen([sys.executable, "-c", "import agon; agon.db()"], cwd=HERE, env=fresh) for _ in range(4)]
+OPEN = [sys.executable, "-c", "import agon; agon.db(); agon.close_db()"]  # an agent opening agon.db
+starts = [subprocess.Popen(OPEN, cwd=HERE, env=fresh) for _ in range(4)]
 assert [p.wait() for p in starts] == [0, 0, 0, 0]
 holder = sqlite3.connect(Path(TMP, "held.db"), isolation_level=None, check_same_thread=False)
 holder.execute("BEGIN IMMEDIATE")  # another agent is still creating the new file: the WAL switch must wait
 release = threading.Timer(0.5, holder.rollback)
 release.start()
 held = dict(os.environ, AGON_DB=str(Path(TMP, "held.db")))
-assert subprocess.run([sys.executable, "-c", "import agon; agon.db()"], cwd=HERE, env=held).returncode == 0
+assert subprocess.run(OPEN, cwd=HERE, env=held).returncode == 0
 release.join()
 holder.close()
 
@@ -102,7 +103,15 @@ v = agon.data_version()
 t0 = time.monotonic()
 assert not agon.wait_for_change(v, 0.3) and time.monotonic() - t0 >= 0.25
 posted = []
-threading.Timer(0.3, lambda: (posted.append(time.monotonic()), agon.post("test", "nobody", "wake up"), agon.close_db())).start()
+
+
+def post_later():  # another thread, so another connection
+    posted.append(time.monotonic())
+    agon.post("test", "nobody", "wake up")
+    agon.close_db()
+
+
+threading.Timer(0.3, post_later).start()
 assert agon.wait_for_change(v, 10) and time.monotonic() - posted[0] < 1
 got = []  # an agent waiting in inbox gets a new message right away
 t = threading.Thread(target=lambda: got.append(gemini("inbox", wait=20)))
@@ -173,14 +182,15 @@ def locked(*args):
 
 
 agon.post, real_post = locked, agon.post  # a failure inside the tool itself
-res = agon.call_tool(agon.Session("tess"), {"name": "send", "arguments": {"text": "hi"}})
+res, after = agon.call_tool(agon.Session("tess", io.BytesIO()), {"name": "send", "arguments": {"text": "hi"}})
 agon.post = real_post
 assert res["isError"] is True and "database is locked" in res["content"][0]["text"], res
 
 # 16. Bad input never crashes the server: every bad line gets an error and the next request still works
 bea = Agent("bea")
 for line in (b"\xff\xfe\x00 not utf-8", b"[" * 100_000, b"1" * 5000, b"123", b'"text"', b"null", b"{}",
-             b'{"jsonrpc": "2.0", "id": 4, "method": 5}', b'{"jsonrpc": "2.0", "id": 5, "method": "ping", "params": 1}',
+             b'{"jsonrpc": "2.0", "id": 4, "method": 5}',
+             b'{"jsonrpc": "2.0", "id": 5, "method": "tools/list", "params": 1}',
              b'{"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": ["send"]}}',
              b'{"jsonrpc": "2.0", "id": 7, "method": "initialize", "params": {"clientInfo": 42}}'):
     bea.write(line + b"\n")
@@ -218,4 +228,53 @@ time.sleep(0.1)
 cody.rpc("tools/list")
 assert agent_row("cody", "last_seen") > before
 cody.close()
+
+# 5. Each agent's cursor lives in agon.db and moves only after the reply is written (at-least-once)
+gpt.close()
+claude("send", text="while gpt was away")
+gpt = Agent("gpt")  # a new session of the same agent
+assert gpt("inbox", wait=0) == f"#{agon.cursor_of('gpt')} claude -> all: while gpt was away"  # nothing old again
+agon.post("test", "zed", "for zed")
+line = b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "inbox", "arguments": {}}}\n'
+agon.serve_mcp("zed", io.BytesIO(line), Gone())  # the reply can't be written...
+assert agent_row("zed", "cursor") == 0  # ...so the message stays unread
+buf = io.BytesIO()
+agon.serve_mcp("zed", io.BytesIO(line), buf)
+assert "for zed" in json.loads(buf.getvalue())["result"]["content"][0]["text"]
+assert agent_row("zed", "cursor") == con.execute("SELECT MAX(id) FROM msgs").fetchone()[0]
+
+
+def call(id, tool, **args):  # a tools/call request to write without waiting for the reply
+    return {"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": tool, "arguments": args}}
+
+
+def cancel(id):  # what a client sends when the user interrupts a call (Esc)
+    return {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": id}}
+
+
+walt = Agent("walt")  # a cancelled inbox gets no reply, and what it found stays unread
+walt.write(call(5, "inbox", wait=30))
+walt.write(cancel(5))
+agon.post("test", "walt", "after the cancel")
+t0 = time.monotonic()
+reply = walt.rpc("tools/call", {"name": "inbox", "arguments": {"wait": 0}}, id=6)
+assert reply["id"] == 6 and "after the cancel" in reply["result"]["content"][0]["text"], reply
+walt.write(call(7, "inbox", wait=30))
+walt.write(cancel(7))
+assert walt.rpc("tools/list", id=8)["id"] == 8 and time.monotonic() - t0 < 5  # the cancelled wait ends early
+walt.write(call(10, "inbox", wait=30))
+walt.write(call(11, "send", text="never sent"))  # queued behind the wait, then cancelled: never runs
+walt.write(cancel(11))
+walt.write(cancel(10))
+assert walt.rpc("tools/list", id=12)["id"] == 12
+assert con.execute("SELECT COUNT(*) FROM msgs WHERE text = 'never sent'").fetchone()[0] == 0
+walt.write(call(9, "inbox", wait=30))
+time.sleep(0.3)
+t0 = time.monotonic()
+walt.close()  # a client that quits mid-wait doesn't leave the server waiting
+assert time.monotonic() - t0 < 5
+
+for a in (claude, gemini, gpt):
+    a.close()
+agon.close_db()
 print("ok")
