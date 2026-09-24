@@ -24,8 +24,9 @@ import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line 
 class Agent:
     """A fake MCP client (like Claude Code or Codex) talking to `python agon.py <name>` over stdio."""
 
-    def __init__(self, name, client="fake-client", version="2025-06-18"):
-        self.p = subprocess.Popen([sys.executable, SERVER, name], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    def __init__(self, name, client="fake-client", version="2025-06-18", argv=None):
+        argv = argv or [sys.executable, SERVER, name]
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         info = {"name": client, "version": "1.0"}
         self.hello = self.rpc("initialize", {"protocolVersion": version, "clientInfo": info})["result"]
         assert self.hello["serverInfo"]["name"] == "agon"
@@ -619,6 +620,52 @@ code, out, err = run_hook("zoe", "--wait", "0", env={"AGON_LIMIT_PATTERNS": "[1]
 assert code == 1 and out == b"" and "AGON_LIMIT_PATTERNS must be" in err, (code, out, err)
 say.close()
 
+
+# Phase 2, 10-12. Plugins: Claude Code (.claude-plugin/, whose marketplace Codex reads too), Codex (.codex-plugin/)
+# and Antigravity (plugin.json, mcp_config.json and hooks.json at the root). Each app installs its own copy of the
+# repository, and the chat is shared through ~/.agon/agon.db
+def manifest(path):
+    return json.loads((HERE / path).read_text(encoding="utf-8"))
+
+
+claude_plugin, codex_plugin, market = (manifest(p) for p in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json",
+                                                              ".claude-plugin/marketplace.json"))
+assert market["name"] == "agon" and [(p["name"], p["source"]) for p in market["plugins"]] == [("agon", "./")]
+assert claude_plugin["name"] == codex_plugin["name"] == "agon" and claude_plugin["version"] == codex_plugin["version"]
+python = "${user_config.python}"  # Claude Code has no per-OS fields: on Windows the user picks py
+option = claude_plugin["userConfig"]["python"]
+assert option["default"] == "python3" and "On Windows use py" in option["description"], option
+assert claude_plugin["mcpServers"] == {"agon": {"command": python, "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "claude"]}}
+for event in ("Stop", "StopFailure"):  # a turn that ends in an API error (a usage limit) runs StopFailure, not Stop
+    assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": 60,
+                                                         "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
+assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gpt"], "cwd": ".",
+                                                "env_vars": ["AGON_DB"]}}  # Codex passes only listed variables
+[codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
+assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
+antigravity = manifest("plugin.json")
+assert set(antigravity) == {"$schema", "name", "description"} and antigravity["name"] == "agon"  # all its schema allows
+assert manifest("mcp_config.json") == {"mcpServers": {"agon": {"command": "./agon", "args": ["gemini"]}}}
+assert manifest("hooks.json")["agon"]["enabled"] is True
+[antigravity_stop] = manifest("hooks.json")["agon"]["Stop"]
+# The commands start Python through the launchers: ./agon (python3) or, on Windows, agon.cmd (py -3, else python),
+# because python3 there is usually a Microsoft Store stub. Run them here the way each app runs them on this system
+windows = os.name == "nt"
+assert windows or os.access(HERE / "agon", os.X_OK)
+lena = Agent("lena", argv=[str(HERE / ("agon.cmd" if windows else "agon")), "lena"])  # an MCP server via the launcher
+assert lena.hello["serverInfo"]["name"] == "agon" and "hi team" in lena("inbox", wait=0)
+lena.close()
+say = sqlite3.connect(HOOKS["AGON_DB"], isolation_level=None)
+for name, command, shell in (
+    ("gpt", codex_stop["commandWindows" if windows else "command"].replace("${PLUGIN_ROOT}", str(HERE)),
+     ["powershell", "-NoProfile", "-Command"] if windows else ["sh", "-c"]),  # Codex: the user's shell, PowerShell
+    ("gemini", antigravity_stop["command"], ["cmd", "/c"] if windows else ["sh", "-c"]),  # Antigravity, in its folder
+):
+    say.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', ?, ?)", (name, f"plugin hook for {name}"))
+    p = subprocess.run([*shell, command], cwd=HERE, input=b"{}", env=HOOKS, capture_output=True, timeout=60)
+    assert p.returncode == 0 and f"plugin hook for {name}" in json.loads(p.stdout)["reason"], (name, p)
+say.close()
+
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
 # (Claude Code drops channel events silently when the channel isn't loaded), and nobody else gets one
@@ -631,7 +678,7 @@ def until_reply(agent, rid):  # the notifications a client gets before the reply
 
 cleo, dora, vic = Agent("cleo", client="claude-code"), Agent("dora", client="claude-code"), Agent("vic")
 assert cleo.hello["capabilities"]["experimental"] == {"claude/channel": {}}
-assert vic.hello["capabilities"]["experimental"] == {"claude/channel": {}}  # declared to all: Claude Code alone reads it
+assert vic.hello["capabilities"]["experimental"] == {"claude/channel": {}}  # declared to all; only Claude Code reads it
 for a in (cleo, vic):
     while a("inbox", wait=0) != "No new messages.":  # caught up; the first tool call
         pass
