@@ -619,6 +619,46 @@ code, out, err = run_hook("zoe", "--wait", "0", env={"AGON_LIMIT_PATTERNS": "[1]
 assert code == 1 and out == b"" and "AGON_LIMIT_PATTERNS must be" in err, (code, out, err)
 say.close()
 
+# Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
+# has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
+# (Claude Code drops channel events silently when the channel isn't loaded), and nobody else gets one
+def until_reply(agent, rid):  # the notifications a client gets before the reply to request `rid`
+    got = []
+    while (msg := agent.read()).get("id") != rid:
+        got.append(msg)
+    return got
+
+
+cleo, dora, vic = Agent("cleo", client="claude-code"), Agent("dora", client="claude-code"), Agent("vic")
+assert cleo.hello["capabilities"]["experimental"] == {"claude/channel": {}}
+assert vic.hello["capabilities"]["experimental"] == {"claude/channel": {}}  # declared to all: Claude Code alone reads it
+for a in (cleo, vic):
+    while a("inbox", wait=0) != "No new messages.":  # caught up; the first tool call
+        pass
+caught_up("dora")  # dora has called no tool: her client may not be listening yet
+for name in ("cleo", "dora", "vic"):
+    agon.post("gpt", name, f"pr ready for {name}")
+time.sleep(agon.RING_DELAY + 1.5)
+for i, a in enumerate((cleo, dora, vic)):
+    a.write({"jsonrpc": "2.0", "id": 70 + i, "method": "ping"})
+    bells = until_reply(a, 70 + i)
+    if a is cleo:
+        assert [b["method"] for b in bells] == ["notifications/claude/channel"], bells
+        newest = con.execute("SELECT MAX(id) FROM msgs WHERE rcpt = 'cleo'").fetchone()[0]
+        assert bells[0]["params"]["meta"] == {"sender": "gpt", "msg_id": str(newest)}, bells
+        assert bells[0]["params"]["content"].startswith("1 new Agon message, the latest from gpt"), bells
+    else:
+        assert bells == [], (a, bells)
+assert agent_row("cleo", "cursor") < newest and "pr ready for cleo" in cleo("inbox", wait=0)  # inbox delivers it
+agon.post("human", "all", "STOP")  # no doorbells while the team is paused
+agon.post("gpt", "cleo", "while paused")
+time.sleep(agon.RING_DELAY + 1.5)
+cleo.write({"jsonrpc": "2.0", "id": 80, "method": "ping"})
+assert until_reply(cleo, 80) == []
+agon.post("human", "all", "go on")
+for a in (cleo, dora, vic):
+    a.close()
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
