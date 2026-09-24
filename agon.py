@@ -44,7 +44,9 @@ TOOLS = [
 
 
 def db():
-    con = sqlite3.connect(DB, timeout=10)
+    con = sqlite3.connect(DB, timeout=5)  # timeout=5 is busy_timeout=5000
+    con.execute("PRAGMA journal_mode=WAL")  # readers and the writer don't block each other
+    con.execute("PRAGMA synchronous=NORMAL")  # safe with WAL and much cheaper than FULL
     con.execute(
         "CREATE TABLE IF NOT EXISTS msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT,"
         " ts TEXT DEFAULT (datetime('now', 'localtime')))"
