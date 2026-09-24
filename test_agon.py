@@ -345,6 +345,25 @@ text = sam("inbox", wait=0)
 assert text.startswith("#") and "legacy" in text and len(text) > 12000  # still delivered, alone
 assert sam("inbox", wait=0) == "No new messages."
 
+# 11. A human message that is exactly STOP pauses the team; any later human message resumes it
+agon.post("human", "all", "STOP")
+assert agon.paused()
+t0 = time.monotonic()
+text = sam("inbox", wait=20)  # no waiting while paused
+assert time.monotonic() - t0 < 5 and text.startswith(agon.PAUSED) and "human -> all: STOP" in text, text
+assert sam("inbox", wait=20) == f"{agon.PAUSED}\n\nNo new messages."  # says so on every call
+agon.post("claude", "all", "STOP")  # only the human can pause or resume
+agon.post("human", "sam", "  STOP\n")  # to anyone, and spaces around it don't matter
+assert agon.paused()
+agon.post("human", "all", "STOP please")  # not exactly STOP: a normal message, so it resumes
+assert not agon.paused()
+agon.post("human", "all", "STOP")
+agon.post("human", "gpt", "gpt, carry on")  # any later human message resumes
+assert not agon.paused()
+text = sam("inbox", wait=0)
+assert "Team paused" not in text and "STOP please" in text, text
+assert "paused" in agon.INSTRUCTIONS
+
 for a in (claude, gemini, gpt):
     a.close()
 agon.close_db()
