@@ -152,6 +152,10 @@ class RpcError(Exception):
         self.code = code
 
 
+class ToolError(Exception):
+    """A tool call the agent can fix: answered as a result with isError, so the model sees why."""
+
+
 def error(rid, code, message):
     return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
@@ -165,12 +169,21 @@ class Session:
 
 
 def tool_send(session, args):
-    post(session.me, args.get("to", "all"), args["text"])
+    text, to = args.get("text"), args.get("to", "all")
+    if not isinstance(text, str) or not text.strip():
+        raise ToolError("Nothing sent: `text` must be a non-empty string.")
+    if not isinstance(to, str) or not to.strip():
+        raise ToolError("Nothing sent: `to` must be all, human or an agent name such as claude, gemini or gpt.")
+    post(session.me, to.strip(), text)
     return "Sent."
 
 
 def tool_inbox(session, args):
-    rows = inbox(session.me, session.last, int(args.get("wait", 30)))
+    try:
+        wait = float(args.get("wait", 30))
+    except (TypeError, ValueError):
+        raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
+    rows = inbox(session.me, session.last, wait if wait > 0 else 0)  # negative or NaN: no wait
     if rows:
         session.last = rows[-1][0]
     return "\n".join(f"#{i} {s} -> {r}: {t}" for i, s, r, t in rows) or "No new messages."
@@ -226,7 +239,13 @@ def call_tool(session, params):
     args = {} if args is None else args
     if not isinstance(args, dict):
         raise RpcError(-32602, "Invalid params: `arguments` must be an object")
-    return {"content": [{"type": "text", "text": tool(session, args)}]}
+    try:
+        return {"content": [{"type": "text", "text": tool(session, args)}]}
+    except ToolError as e:
+        text = str(e)
+    except Exception as e:  # e.g. agon.db stayed locked for 5 s: tell the agent, keep serving
+        text = f"Agon failed: {e}. Try again in a moment."
+    return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
 def serve_mcp(me, inp=None, out=None):

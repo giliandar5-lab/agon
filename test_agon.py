@@ -156,4 +156,24 @@ errol.write({"jsonrpc": "2.0", "method": "notifications/initialized"})  # notifi
 errol.write({"jsonrpc": "2.0", "id": 99, "result": {}})  # neither do responses
 assert errol.rpc("ping", id=8) == {"jsonrpc": "2.0", "id": 8, "result": {}}
 errol.close()
+
+# 14. Tool failures come back as results with isError = true and say what to fix
+tess = Agent("tess")
+for args in ({}, {"text": "  "}, {"text": 5}, {"text": "hi", "to": ["gpt"]}):
+    res = tess.call("send", **args)
+    assert res["isError"] is True and res["content"][0]["text"].startswith("Nothing sent: `"), res
+res = tess.call("inbox", wait="soon")
+assert res["isError"] is True and "`wait` must be a number" in res["content"][0]["text"], res
+assert "isError" not in tess.call("inbox", wait="0")  # numbers as strings still work, as in v0.1
+tess.close()
+
+
+def locked(*args):
+    raise sqlite3.OperationalError("database is locked")
+
+
+agon.post, real_post = locked, agon.post  # a failure inside the tool itself
+res = agon.call_tool(agon.Session("tess"), {"name": "send", "arguments": {"text": "hi"}})
+agon.post = real_post
+assert res["isError"] is True and "database is locked" in res["content"][0]["text"], res
 print("ok")
