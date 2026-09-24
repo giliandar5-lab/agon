@@ -142,6 +142,70 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
 ## Working rules for every phase
 
 - Check the current official docs for every CLI flag, hook schema and plugin manifest before relying on it;
-  these tools change monthly. List what you verified in the pull request.
+  these tools change monthly. If the docs are unreachable from your environment, use the facts below and list
+  in the pull request what you could not re-verify.
 - `agon.py` stays one file with zero dependencies; existing tools stay backward compatible.
 - Every new behavior gets an assert-based check in `test_agon.py`; `python test_agon.py` must print `ok`.
+- The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
+  (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.
+
+## Verified platform facts (checked 2026-09-24)
+
+Sources are official docs unless marked *(secondary)*. Re-check when you can; these change often.
+
+**Claude Code — Stop hook** ([docs](https://code.claude.com/docs/en/hooks))
+- Configured in `~/.claude/settings.json`, `.claude/settings.json` or a plugin's `hooks/hooks.json`:
+  `{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`.
+- stdin JSON includes `session_id`, `transcript_path`, `cwd`, `hook_event_name`, `stop_hook_active`,
+  `last_assistant_message`.
+- Exit code 2 blocks the stop and shows stderr to Claude as the reason. Default timeout 600 s. Runs in the VS Code
+  extension too.
+
+**Claude Code — channels** ([docs](https://code.claude.com/docs/en/channels-reference))
+- Declare `capabilities.experimental["claude/channel"] = {}`; send `notifications/claude/channel` with
+  `params: {"content": "...", "meta": {"key": "value"}}`. Meta keys must be letters, digits and underscores
+  (others are dropped silently). The server `instructions` string is shown to Claude on connect.
+- Custom channels need `claude --dangerously-load-development-channels server:<name>` during the research
+  preview (CLI only). A channel does not register if protocol revision `2026-07-28` is negotiated.
+
+**Claude Code — headless and plugins**
+- `claude -p "<prompt>" --output-format json` (final text in `result`), `--resume <session_id>`,
+  `--permission-mode plan | acceptEdits`.
+- Plugins: manifest `.claude-plugin/plugin.json`; MCP servers in `.mcp.json`; hooks in `hooks/hooks.json` (same
+  schema as settings); a `.claude-plugin/marketplace.json` lets users run `/plugin marketplace add owner/repo` and
+  `/plugin install <plugin>@<marketplace>` ([docs](https://code.claude.com/docs/en/plugin-marketplaces)).
+
+**Codex — hooks** ([docs](https://developers.openai.com/codex/hooks)) *(details partly secondary)*
+- `~/.codex/hooks.json`, `<project>/.codex/hooks.json`, or a plugin's `hooks.json`. On by default since 0.150.1;
+  every non-managed hook must be trusted by the user in `/hooks`.
+- Stop stdin includes `turn_id`, `stop_hook_active`, `last_assistant_message`. To continue: stdout
+  `{"decision": "block", "reason": "<new prompt>"}` or exit code 2 with the prompt on stderr. `"continue": false`
+  ends the turn. The Stop output schema rejects unknown fields. Default timeout 600 s.
+
+**Codex — headless and plugins** *(secondary)*
+- `codex exec --json "<prompt>"` streams JSONL events (`thread.started` carries the session id, `item.*`,
+  `turn.completed`, `error`); continue with `codex exec resume <SESSION_ID> --json "<prompt>"`.
+  `--full-auto` was removed in 0.147.0 (use explicit `--sandbox read-only | workspace-write`);
+  `codex mcp-server` was removed in 0.154.0. `codex mcp add <name> -- <command> [args]` adds an MCP server.
+- Plugins: `.codex-plugin/plugin.json` is required; optional `.mcp.json`, `hooks.json`, `skills/` at the plugin
+  root. Install: `codex plugin marketplace add owner/repo`, then `codex plugin add <plugin>@<marketplace>` (0.146+).
+
+**Antigravity (IDE and `agy` CLI)** ([hooks](https://antigravity.google/docs/hooks/),
+[headless](https://antigravity.google/docs/cli/headless/))
+- Hooks: `~/.gemini/config/hooks.json` or `<workspace>/.agents/hooks.json`, shaped
+  `{"agon": {"enabled": true, "Stop": [{"type": "command", "command": "...", "timeout": 60}]}}`. Stop stdin
+  includes `executionNum`, `terminationReason`, `error`, `fullyIdle`, `conversationId`, `workspacePaths`,
+  `transcriptPath`, `modelName`. To continue: stdout `{"decision": "continue", "reason": "<prompt>"}`; any other
+  decision lets it stop. Default timeout 30 s. Applies to the IDE and the CLI.
+- MCP: `~/.gemini/config/mcp_config.json` or `<workspace>/.agents/mcp_config.json` (`{"mcpServers": {...}}`), or
+  `agy mcp add <name> <command> [args]` *(secondary)*.
+- Headless: `agy -p "<prompt>" --output-format text | json | stream-json`, `--continue`,
+  `--input-format stream-json` for multi-turn over stdin, `--mode default | accept-edits | plan`. Tools that need
+  approval are refused in headless mode unless `--dangerously-skip-permissions` is set. Gemini CLI was replaced
+  by `agy` on 2026-06-18.
+
+**MCP protocol**
+- Revision `2026-07-28` is stateless (no `initialize`; version and client info travel in `_meta`; `server/discover`
+  lists versions). Older revisions keep working when both sides agree, so keep answering `initialize` with a
+  supported older version and reply `-32601` to unknown methods
+  ([blog](https://blog.modelcontextprotocol.io/posts/2026-07-28/)).
