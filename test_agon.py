@@ -257,8 +257,11 @@ def cancel(id):  # what a client sends when the user interrupts a call (Esc)
 
 
 walt = Agent("walt")  # a cancelled inbox gets no reply, and what it found stays unread
+while walt("inbox", wait=0) != "No new messages.":  # walt is new: read the history first, so inbox waits
+    pass
 walt.write(call(5, "inbox", wait=30))
 walt.write(cancel(5))
+assert walt.rpc("ping", id=50)["id"] == 50  # the server reads in order: by now it knows about the cancel
 agon.post("test", "walt", "after the cancel")
 t0 = time.monotonic()
 reply = walt.rpc("tools/call", {"name": "inbox", "arguments": {"wait": 0}}, id=6)
