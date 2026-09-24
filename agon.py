@@ -541,6 +541,42 @@ def kill_tree(p):
     p.wait()
 
 
+JOB = None  # Windows: the job object the apps that ask starts belong to (see contain())
+
+
+def contain(p):
+    """Windows: put process p (and what it starts) in a job that ends with Agon's server. A host app may end the
+    server with TerminateProcess, which no cleanup survives, and an ask's app must not go on without it. Best effort:
+    the timeout still works through taskkill."""
+    global JOB
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        if JOB is None:
+            class Limits(ctypes.Structure):  # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+                _fields_ = [("times", ctypes.c_int64 * 2), ("flags", wintypes.DWORD), ("sizes", ctypes.c_size_t * 2),
+                            ("processes", wintypes.DWORD), ("affinity", ctypes.c_size_t),
+                            ("classes", wintypes.DWORD * 2), ("io", ctypes.c_uint64 * 6),
+                            ("memory", ctypes.c_size_t * 4)]
+            limits = Limits(flags=0x2000)  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            job = k32.CreateJobObjectW(None, None)  # 9: JobObjectExtendedLimitInformation
+            if not job or not k32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+                return
+            JOB = job  # never closed: Windows closes it, and so ends the apps, when this process ends
+        process = k32.OpenProcess(0x0101, False, p.pid)  # PROCESS_TERMINATE | PROCESS_SET_QUOTA
+        if process:
+            k32.AssignProcessToJobObject(JOB, process)
+            k32.CloseHandle(process)
+    except Exception:  # no ctypes, an old Windows...
+        pass
+
+
 def run_cli(argv, stdin, cwd, env, end, stopped):
     """Run a headless app until it exits: (its exit code, or None when time.monotonic() passed `end` or stopped()
     became true and Agon killed its process tree; its stdout; its stderr). The output goes to temporary files, so
@@ -550,6 +586,8 @@ def run_cli(argv, stdin, cwd, env, end, stopped):
                              stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                              start_new_session=True,  # a process group of its own, killed as one (POSIX)
                              creationflags=NO_WINDOW)
+        if os.name == "nt":
+            contain(p)
         if stdin is not None:
             threading.Thread(target=feed, args=(p.stdin, stdin.encode()), daemon=True).start()
         code = None
@@ -1388,6 +1426,9 @@ def main(argv):
     elif argv == ["setup"]:
         setup()
     elif argv:
+        # Host apps end their MCP servers with SIGINT (Claude Code) or SIGTERM (Codex, agy after closing stdin).
+        # Take SIGTERM like Ctrl+C: the server unwinds and waits while running asks stop their apps and log it
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
         url = f"http://127.0.0.1:{PORT}"
