@@ -5,9 +5,11 @@ python agon.py hook <name>   Stop hook that wakes the agent with its new message
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
+import datetime
 import json
 import os
 import queue
+import re
 import sqlite3
 import sys
 import threading
@@ -30,6 +32,13 @@ RECAP_CHARS = 150  # ...each cut to this many characters
 HOOK_WAIT = 25  # seconds a Stop hook waits for a message: Antigravity gives hooks 30 s by default
 FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
 CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
+LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON_LIMIT_PATTERNS replaces the list
+    r"you(?:['’]ve| have) hit your (?:\w+ ){0,2}limit",  # Claude Code ("You've hit your limit"), Codex
+    r"usage limit reached|limit reached\W{1,5}resets",  # Claude Code ("5-hour limit reached ∙ resets 3pm")
+    r"you(?:['’]re| are) out of (?:extra )?usage",  # Claude Code
+    r"(?:reached|exceeded|exhausted) (?:your|the) (?:\w+ ){0,2}quota|QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED",  # Gemini
+    r"^rate_limit$",  # Claude Code's StopFailure error type
+]
 
 INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
 (claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
@@ -483,6 +492,101 @@ def read_payload(inp):
     return payload if isinstance(payload, dict) else {}
 
 
+def turn_failed(payload):
+    """Whether the turn ended in an error or was cancelled rather than finished. Such a turn is never continued:
+    Claude Code ignores what a StopFailure hook says, and Antigravity would re-enter its error."""
+    error, reason = payload.get("error"), str(payload.get("terminationReason") or "").lower()
+    return (payload.get("hook_event_name") == "StopFailure" or isinstance(error, str) and bool(error.strip())
+            or any(word in reason for word in ("error", "cancel", "quota")))
+
+
+def limit_patterns():
+    """AGON_LIMIT_PATTERNS, a JSON list of regular expressions (or a single one), replaces LIMIT_PATTERNS."""
+    raw = os.environ.get("AGON_LIMIT_PATTERNS")
+    if not raw:
+        return LIMIT_PATTERNS
+    try:
+        patterns = json.loads(raw)
+    except ValueError:
+        patterns = raw  # one plain regular expression
+    patterns = [patterns] if isinstance(patterns, str) else patterns
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        raise ValueError("AGON_LIMIT_PATTERNS must be a JSON list of regular expressions, or one expression")
+    return patterns
+
+
+def usage_limit(payload):
+    """The error texts of a Stop hook payload if they show a usage limit, else None. The model's last message is
+    read only when the turn failed (then Claude Code puts the error there): an agent writing about limits has none."""
+    keys = ["error", "error_details", "terminationReason"] + ["last_assistant_message"] * turn_failed(payload)
+    texts = [value for key in keys if isinstance(value := payload.get(key), str)]
+    if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
+        return "\n".join(texts)
+
+
+UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+MONTHS = "jan feb mar apr may jun jul aug sep oct nov dec".split()
+DURATION = r"(\d+)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])"
+CLOCK = re.compile(  # "resets 3pm", "at 3:57 PM", "at Sep 25th, 2026 7:40 PM", "at 9/25/2026, 5:23 PM"
+    r"\b(?:at|resets?|until|on)\s+(?:(?P<mon>[a-z]{3})[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?:(?P<year>\d{4}),?\s+)?(?:at\s+)?|(?P<m>\d{1,2})/(?P<d>\d{1,2})/(?P<y>\d{4}),?\s+)?"
+    r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
+
+
+def reset_time(text, now):
+    """When a usage limit resets (Unix time), from the text an app printed: an older Claude Code timestamp, a
+    duration ("in 2 hours 5 minutes", "after 2h3m4s") or a local clock time with an optional date; else None."""
+    if m := re.search(r"\|(\d{10})\b", text):  # "Claude AI usage limit reached|1760000000"
+        return float(m[1])
+    if m := re.search(rf"\b(?:in|after)\s+((?:{DURATION}[\s,]*(?:and\s+)?)+)", text, re.I):
+        return now + sum(int(n) * UNITS[unit[0].lower()] for n, unit in re.findall(DURATION, m[1], re.I))
+    for m in CLOCK.finditer(text):
+        if not (m["min"] or m["ap"]):
+            continue  # a bare number isn't a time
+        hour, minute = int(m["h"]), int(m["min"] or 0)
+        if m["ap"]:
+            hour = hour % 12 + (12 if m["ap"][0] in "pP" else 0)
+        base = datetime.datetime.fromtimestamp(now)
+        try:
+            if m["mon"]:
+                if m["mon"][:3].lower() not in MONTHS:
+                    continue
+                day = base.replace(year=int(m["year"] or base.year), month=MONTHS.index(m["mon"][:3].lower()) + 1,
+                                   day=int(m["day"]))
+            elif m["m"]:
+                day = base.replace(year=int(m["y"]), month=int(m["m"]), day=int(m["d"]))
+            else:
+                day = base
+            when = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if when.timestamp() <= now and not m["y"] and not m["year"]:  # no year given: the next such time
+                when = when.replace(year=when.year + 1) if m["mon"] else when + datetime.timedelta(days=1)
+        except ValueError:  # no such day or hour
+            continue
+        return when.timestamp()
+
+
+def out_of_quota(me, text):
+    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
+    team, once per limit."""
+    now = time.time()
+    until = reset_time(text, now)
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (me,)).fetchone()
+        con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
+                    " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
+        if not (row and row[0] and row[0] > now):  # not already known
+            clock = "%H:%M" if until and until - now < 20 * 3600 else "%b %d %H:%M"
+            post("agon", "all", f"{me} hit its usage limit"
+                 + (f", resets ~{time.strftime(clock, time.localtime(until))}." if until else "; reset time unknown."))
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:
+            con.execute("ROLLBACK")
+        raise
+
+
 def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
     The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
@@ -490,6 +594,13 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     fmt = fmt or FORMATS.get(me, "claude")
     payload = read_payload(inp or sys.stdin.buffer)
     touch(me)  # the agent's row, so its cursor can move
+    if paused():  # 1. the human said STOP
+        return
+    if hit := usage_limit(payload):  # 2. out of quota: say so and let it stop
+        return out_of_quota(me, hit)
+    if turn_failed(payload):
+        return
+    # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
     rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
     if halted or not rows:
         return  # exit 0 without output: the agent may stop
@@ -629,7 +740,8 @@ def main(argv):
         cli.add_argument("--wait", type=float, default=HOOK_WAIT, metavar="SECONDS",
                          help=f"how long to wait for a message before letting the agent stop (default {HOOK_WAIT})")
         cli.add_argument("--format", choices=sorted(CONTINUE),
-                         help="the app running the hook (default: gpt -> codex, gemini -> antigravity, others -> claude)")
+                         help="the app that runs the hook (default: gpt -> codex, gemini -> antigravity,"
+                         " any other name -> claude)")
         args = cli.parse_args(argv[1:])
         try:
             hook(args.name, args.wait, args.format)
