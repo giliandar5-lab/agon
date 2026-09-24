@@ -30,6 +30,7 @@ PAUSED = ("Team paused: the human said STOP. Stop working and end your turn;"
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
 HOOK_WAIT = 25  # seconds a Stop hook waits for a message: Antigravity gives hooks 30 s by default
+RING_DELAY = 1  # seconds a message may wait for inbox or the Stop hook before the channel doorbell rings
 FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
 CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
 LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON_LIMIT_PATTERNS replaces the list
@@ -45,6 +46,8 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 - inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
 - Loop: inbox -> do your part -> send a short report -> inbox again.
 - When inbox says the team is paused (the human said STOP), stop working and end your turn.
+- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon">
+  event only says that messages wait: call inbox to read them.
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete; put long content in a file and send its path."""
 
@@ -297,6 +300,8 @@ class Session:
         self.current = None  # id of the request being handled
         self.cancelled = set()  # ids of requests the client gave up on (notifications/cancelled)
         self.closed = False  # the client closed our stdin
+        self.called = False  # a tool was called: the client is set up (and Claude Code listens to its channel)
+        self.doorbell = False  # the channel doorbell thread runs (Claude Code clients only)
 
     def stopped(self):
         """Nobody waits for the current request any more (cancelled, or the client left): stop waiting."""
@@ -379,10 +384,14 @@ def dispatch(session, method, params):
             name = info.get("name") if isinstance(info, dict) else None
             session.client = name if isinstance(name, str) else None
             touch(session.me, session.client)
+            if session.client == "claude-code" and not session.doorbell:
+                session.doorbell = True
+                threading.Thread(target=doorbell, args=(session,), daemon=True).start()
             asked = params.get("protocolVersion")
             return {
                 "protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],
-                "capabilities": {"tools": {}},
+                # Claude Code channels (research preview): run with --dangerously-load-development-channels
+                "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
                 "serverInfo": {"name": "agon", "version": "0.1"},
                 "instructions": INSTRUCTIONS.format(me=session.me),
             }, None
@@ -396,6 +405,7 @@ def dispatch(session, method, params):
 
 
 def call_tool(session, params):
+    session.called = True
     name, args = params.get("name"), params.get("arguments")
     tool = TOOL_HANDLERS.get(name) if isinstance(name, str) else None
     if tool is None:
@@ -411,6 +421,38 @@ def call_tool(session, params):
     except Exception as e:  # e.g. agon.db stayed locked for 5 s: tell the agent, keep serving
         text = f"Agon failed: {e}. Try again in a moment."
     return {"content": [{"type": "text", "text": text}], "isError": True}, None
+
+
+def doorbell(session):
+    """Claude Code channel: wake an idle Claude when messages wait for it. The notification only says so and leaves
+    the cursor alone, so inbox or the Stop hook still delivers the messages: Claude Code silently drops channel
+    events when the session didn't load the channel, and a message pushed that way would be lost."""
+    me, rung = session.me, 0  # rung: the newest message announced so far
+    try:
+        while not session.closed:
+            try:
+                version = data_version()
+                if session.called and not paused():  # not before the client is set up, nor while the team is paused
+                    cursor = cursor_of(me)
+                    newest = db().execute(f"SELECT id, sender {FOR_ME} ORDER BY id DESC LIMIT 1",
+                                          (cursor, me, me)).fetchone()
+                    if newest and newest[0] > rung:
+                        count = db().execute(f"SELECT COUNT(*) {FOR_ME}", (cursor, me, me)).fetchone()[0]
+                        what = "1 new Agon message" if count == 1 else f"{count} new Agon messages"
+                        emit(session.out, {"jsonrpc": "2.0", "method": "notifications/claude/channel", "params": {
+                            "content": f"{what}, the latest from {newest[1]} (#{newest[0]}). Call inbox to read them.",
+                            # meta becomes <channel> tag attributes: keys of letters, digits and _, tame values
+                            "meta": {"sender": re.sub(r"[^\w.-]", "_", str(newest[1])), "msg_id": str(newest[0])},
+                        }})
+                        rung = newest[0]
+                if wait_for_change(version, 60, lambda: session.closed):
+                    time.sleep(RING_DELAY)  # a message that comes in now may be delivered right away
+            except sqlite3.Error:  # e.g. agon.db stayed locked for 5 s: try again in a moment
+                time.sleep(RING_DELAY)
+    except (OSError, ValueError):  # the client is gone
+        pass
+    finally:
+        close_db()
 
 
 EOF = object()  # queued after the client's last message
