@@ -21,8 +21,9 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [ ] Phase 3 — Cross-vendor second opinion (`ask`)
 - [ ] Phase 4 — Task board (no downtime)
-- [ ] Phase 5 — The arena
-- [ ] Phase 6 — Packaging
+- [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
+- [ ] Phase 6 — The arena
+- [ ] Phase 7 — Packaging
 
 ## How every session works
 
@@ -147,7 +148,27 @@ When asked to do "the next phase":
   to acknowledgments) goes into the server `instructions` and the README.
 - Tests: claim race between two processes, file conflict, dependencies, author ≠ reviewer, reassignment on quota.
 
-## Phase 5 — The arena
+## Phase 5 — Autopilot (Agon wakes the agents itself)
+
+The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **Design**, **Research first**,
+**Tests** and **Done means** sections as this phase's bullets. In short:
+
+- `python agon.py autopilot` keeps the team working with no app window open: when a message or task appears
+  for an agent, Agon wakes that agent through its vendor's official CLI on the user's own subscription
+  (`claude -p` stream-json, `codex exec resume`, `agy -p` stream-json). Idle costs nothing: no model calls,
+  ~0% CPU, ~20 MB RAM; no worker process stays alive while idle.
+- Wake-up ladder, cheapest first: a live Claude Code session's inbox socket (registered by the hook; no new
+  process) → a warm worker kept for `AGON_WARM_SECONDS` → a cold start that resumes the agent's saved session.
+- Rule-based triage with zero tokens: wake only on addressed messages, assigned or unblocked tasks and review
+  requests; broadcasts wake only the lead; acknowledgments wake nobody; events are debounced into one prompt.
+- Hard brakes: wakes per hour, daily USD/token caps, `--max-turns`, turn timeout, STOP, the auto-turn budget
+  and out-of-quota parking with task reassignment.
+- Session hygiene: reuse sessions while the cache is warm, rotate on token/turn/age thresholds with Agon's recap.
+- Every wake is recorded (trigger, tokens, cost, duration, status); `python agon.py stats` reports cost per task.
+- Research first, before coding: the inbox-socket wire format on Windows and Linux, exact limit errors of each
+  CLI, memory and latency measurements, and cache lifetimes; record the results in this file.
+
+## Phase 6 — The arena
 
 - Server-Sent Events (`/events`, resumes from `Last-Event-ID`, heartbeat every 15 s) and `/board` JSON.
 - UI: chat, team roster with each agent's **fuel** (working / idle / out of quota + reset time), task board,
@@ -160,7 +181,7 @@ When asked to do "the next phase":
 - Terminal: `python agon.py watch` (live colored feed) and `python agon.py say [--to NAME] TEXT`.
 - Tests: SSE resume, `/board` JSON, a duel with fake CLIs, scoreboard update, exported HTML has no external URLs.
 
-## Phase 6 — Packaging
+## Phase 7 — Packaging
 
 - PyPI package `agon-arena` with an `agon` command (`uvx agon-arena`), listings in plugin marketplaces and MCP
   directories, a demo video, and measured numbers (idle CPU and RAM, `tools/list` size, tokens per turn).
