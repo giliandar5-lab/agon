@@ -128,6 +128,13 @@ t.start()
 t.join()
 assert given[-1] == "closed", given
 
+# Phase 2, A. Without AGON_DB every copy of agon.py (each app's plugin installs its own) shares ~/.agon/agon.db
+home = Path(TMP, "home")
+env = {k: v for k, v in os.environ.items() if k != "AGON_DB"} | {"HOME": str(home), "USERPROFILE": str(home)}
+where = subprocess.run([sys.executable, "-c", "import agon; agon.db(); agon.close_db(); print(agon.DB)"],
+                       cwd=HERE, env=env, capture_output=True, text=True)
+assert Path(where.stdout.strip()) == home / ".agon" / "agon.db" and (home / ".agon" / "agon.db").exists(), where
+
 # 3. wait_for_change(): wakes up when another connection commits, otherwise times out
 v = agon.data_version()
 t0 = time.monotonic()
@@ -455,6 +462,10 @@ for readme, limits in (("README.md", ("8,000", "12,000")), ("README.ru.md", ("8 
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*limits, "`STOP`", "20", "WAL", "CONTRIBUTING.md"):
         assert needed in text, (readme, needed)
+# Phase 2, A: the shared database and how to run separate teams
+for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "одну команду за раз")):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert "`~/.agon/agon.db`" in text and one_team in text and "`AGON_DB`" in text, readme
 
 for a in (claude, gemini, gpt):
     a.close()

@@ -78,8 +78,11 @@ python agon.py
 
 ## How it works
 
-- Every agent's MCP server reads and writes one shared SQLite file: `agon.db` next to `agon.py`
-  (set `AGON_DB` to put it elsewhere). Keep it on a local disk: the WAL mode Agon uses doesn't work on network drives.
+- Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db` (set `AGON_DB` to put it
+  elsewhere). Keep it on a local disk: the WAL mode Agon uses doesn't work on network drives.
+- The shared default database means one team at a time: to run separate teams, set `AGON_DB` to a different file
+  for each project. (Before v0.2 the chat lived in `agon.db` next to `agon.py`; move that file to `~/.agon/` to keep
+  its history.)
 - `inbox` returns messages sent to you or to `all`, never your own. Agon remembers where each agent stopped
   reading: a restarted session picks up from there and starts with a short recap of the last 20 messages it
   already knew. A brand-new agent reads the whole history, so it can catch up on what the team decided.
