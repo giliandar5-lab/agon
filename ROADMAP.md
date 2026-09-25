@@ -11,7 +11,7 @@ team working on your project, and shows it live in an arena. Two pillars:
    automatically and comes back after the reset.
 
 Who it is for: people who already use two or more AI coding tools, including people who work in GUI apps
-(VS Code, Codex app, Antigravity IDE) and on Windows, not only in tmux on macOS/Linux.
+(VS Code, Codex in the ChatGPT desktop app, Antigravity IDE) and on Windows, not only in tmux on macOS/Linux.
 
 ## Progress
 
@@ -21,7 +21,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [x] Phase 3 — Cross-vendor second opinion (`ask`)
 - [x] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
-- [ ] Phase 4 — Task board (no downtime)
+- [x] Phase 4 — Task board (no downtime)
 - [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [ ] Phase 6 — The arena
 - [ ] Phase 7 — Packaging
@@ -67,12 +67,14 @@ When asked to do "the next phase":
 
 - **Storage:** SQLite in WAL mode (`busy_timeout=5000`, `synchronous=NORMAL`), one connection per thread, in
   `~/.agon/agon.db` (`AGON_DB`) so that every app's copy of `agon.py` shares it.
-  Tables: `msgs`, `agents(name, client, cursor, last_seen, autoruns, out_of_quota_until)`, `tasks` (Phase 4).
+  Tables: `msgs`, `agents(name, client, cursor, last_seen, autoruns, out_of_quota_until)`, `tasks` and `releases`
+  (Phase 4).
 - **Delivery:** per-agent cursor stored in the database; advance it only after the output is written
   (at-least-once). Waiting uses `PRAGMA data_version` every 0.2 s (near-zero CPU, ≤ 0.2 s latency).
-- **Agent tools (max 4):** `send`, `inbox`, `ask` (Phase 3), `tasks` (Phase 4).
+- **Agent tools (max 4):** `send`, `inbox`, `ask` (Phase 3), `board` (Phase 4).
 - **Wake-up layers:** Claude Code channels (a doorbell: the push only says that messages wait) → Stop hooks in all
-  three apps (a JSON decision on stdout) → `inbox(wait)` → the human.
+  three apps (a JSON decision on stdout) → `inbox(wait)` → the human. `UserPromptSubmit` hooks (Claude Code, Codex)
+  tell an agent that comes back which of its tasks went to others.
 - **Security:** arena on 127.0.0.1 with Host and JSON checks; every message shows its author (`[HUMAN]` stands
   out); messages from agents are requests, never permissions; Agon never edits user config files; reviews are
   read-only by default.
@@ -194,17 +196,37 @@ Fix, so that every verdict rests on evidence Agon itself produced:
 
 ## Phase 4 — Task board (no downtime)
 
-- `tasks(action, ...)`: `list | add(title, spec, files, after) | claim(id) | done(id, note) | review(id, verdict, evidence)`.
-- Atomic claim (`BEGIN IMMEDIATE` + `UPDATE ... WHERE owner IS NULL`); overlapping files with another task in
-  progress → rejected with the owner's name; a task with unfinished `after` dependencies can't be claimed.
-- `done` → `review`: the reviewer must be a different agent (vendor); if nobody is online, the review runs
-  automatically through `ask`. `changes` sends the task back to its owner.
-- When an agent runs out of quota, its in-progress tasks go back to `todo` with a note ("reassigned: claude hit
-  its usage limit, resets ~14:00"); after the reset the agent returns to rotation and gets a recap.
-- Every state change posts a short system message so the hooks wake the right agent.
-- The team playbook (lead, one writer per file, split by context boundaries, evidence-based reviews, don't reply
-  to acknowledgments) goes into the server `instructions` and the README.
-- Tests: claim race between two processes, file conflict, dependencies, author ≠ reviewer, reassignment on quota.
+- `board(action, ...)`: `list [id] | add(title, spec, files, after) | claim(id) | done(id, note, cwd) |
+  review(id, verdict, evidence)`. The fourth tool is `board`, not `tasks`: the apps have task tools of their own
+  (Antigravity's `manage_task`, Claude Code's Task tools, Codex's `update_plan`). It is marked local, and the four tools
+  stay within the 2,500 characters of `tools/list`.
+- Atomic claim (`BEGIN IMMEDIATE` + `UPDATE ... WHERE owner IS NULL`), with every check inside that transaction. A claim
+  is refused while another agent's task in progress or in review has one of its files, naming the owner, and while a
+  task in `after` isn't done (approved). A task's files are paths in the project: a file, a folder (`src/`) or `.`,
+  compared as text whatever the letter case or slashes; no patterns, absolute paths or line breaks.
+- `done` (the owner only): Agon runs `AGON_TEST_CMD` in the project folder, unasked, and its outcome labels the review;
+  red tests never stop `done`. The task goes to an online agent (seen in the last 15 minutes) of another company, the
+  one that asked for changes first. The reviewer must be a different agent and vendor (by the app it connected with,
+  else by its name). `changes` sends the task back to its owner, or to the board when the owner is away; `approve`
+  closes it and tells everyone which tasks it frees. `done` and `review` from an agent that no longer has the task say
+  who has it now and why.
+- Nobody from another company online: the human is told. With `AGON_AUTO_REVIEW=1` (off by default: it sends the code
+  to another company's app and spends that plan, unasked), Agon runs one's app headless for the review through `ask`.
+- When an agent runs out of quota, its in-progress tasks go back to `todo` with a note ("reassigned: claude hit its
+  usage limit, resets ~14:00"), and its reviews go to another agent. A claim also lasts `AGON_LEASE` seconds (7200)
+  after its owner's last sign of life, any Agon request or hook run, and goes back at the next board call: a crashed
+  app, and Codex, whose hooks never see a limit. After the reset the agent returns to rotation, and before it works
+  again it hears once which of its tasks went to others, who has them and not to edit their files: through
+  `UserPromptSubmit` in Claude Code (which resumes the interrupted task by itself) and Codex, else at the start of
+  `inbox` or of the Stop hook's prompt.
+- Every state change posts a short message to the agent that must act (a review request to the reviewer, a verdict to
+  the owner); a task anyone can take goes to everyone but its author, and a claim only to the arena.
+- The team playbook (lead, one writer per file, split by context boundaries, evidence-based reviews, don't reply to
+  acknowledgments) is in the server `instructions` (the board's rules in the first 512 characters, all of it within
+  2,048) and in the README, which also says what runs without asking.
+- Tests: a claim race between two processes (the same 30 tasks, each claimed by both at once), file conflicts,
+  dependencies, author ≠ reviewer and vendor, reassignment on quota, leases, the returning agent's note, the automatic
+  review with fake CLIs.
 
 ## Phase 5 — Autopilot (Agon wakes the agents itself)
 
@@ -259,7 +281,7 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
 - The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
   (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.
 
-## Verified platform facts (checked 2026-09-24)
+## Verified platform facts (checked 2026-09-24; Phase 4 additions 2026-09-25)
 
 Sources are official docs unless marked *(secondary)*. Re-check when you can; these change often.
 
@@ -276,6 +298,20 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
 - A turn that ends in an API error (rate or usage limit, server error, ...) runs `StopFailure` instead of `Stop`:
   stdin has `error` (`rate_limit`, ...), optional `error_details`, and the rendered error in
   `last_assistant_message`. Its output and exit code are ignored.
+- Stop stdin also has `background_tasks` and `session_crons`. StopFailure's `error` is one of `rate_limit`, `overloaded`,
+  `authentication_failed`, `oauth_org_not_allowed`, `account_on_hold`, `billing_error`, `invalid_request`,
+  `model_not_found`, `server_error`, `max_output_tokens`, `cloud_credential_error`, `unknown`: a plan's usage limit has no
+  value of its own, and "API Error: Server is temporarily limiting requests (not your usage limit)", a throttle retried
+  since v2.1.199, may end a turn too.
+- `UserPromptSubmit` runs before a prompt reaches Claude (stdin adds `prompt`); stdout
+  `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "..."}}` or plain text adds context.
+  Its default timeout is 30 s. After a usage limit resets, an interactive claude.ai session (v2.1.234+, on by default)
+  continues the interrupted task with a fixed prompt that goes through this hook (blocking it ends the wait); not in
+  `-p`, for agent-team teammates, or when the reset is over 24 hours away. Notification types
+  `quota_auto_resume_fired`, `_stale` and `_disabled` report it.
+- The plan limits read "You've hit your session limit · resets 3:45pm" (also `weekly`, `Opus`, `Sonnet`; the weekly one
+  says "resets Mon 12:00am"). The session and weekly limits are shared across models
+  ([errors](https://code.claude.com/docs/en/errors)).
 - Plugin hooks and MCP servers substitute `${CLAUDE_PLUGIN_ROOT}` and `${user_config.KEY}`. A userConfig `default`
   reaches MCP servers but not hooks: a hook using an option that was never set fails ("Plugin option ... isn't set")
   until the user sets it (`/plugin configure`, or `claude plugin install <plugin> --config KEY=VALUE`).
@@ -312,6 +348,12 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   `"env": {"NAME": "${user_config.KEY}"}` in the server's config passes one; an option that was never set arrives as
   its `default` (`claude plugin install` then says "1 userConfig option not yet set"). Plugin options are read only
   from user, `--settings` and managed settings, never from a project's `.claude/settings*.json` (docs).
+- Claude Code cuts each MCP tool description and each server's `instructions` at 2,048 characters
+  (`CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, v2.1.280+). MCP tool search is on by default: at the start Claude sees only
+  the tool names and the servers' instructions (`alwaysLoad` in a server's config, or `_meta["anthropic/alwaysLoad"]` on
+  a tool, loads them up front). A root-level `oneOf`/`anyOf` is flattened (v2.1.195+); `_meta["anthropic/
+  requiresUserInteraction"]: true` asks on every call (v2.1.199+). The built-in Task tools are on by default only on
+  older models (`CLAUDE_CODE_ENABLE_TODO_TOOLS=1` elsewhere) ([mcp](https://code.claude.com/docs/en/mcp)).
 - Plan mode lets the auto-mode classifier approve shell commands; without auto mode only the read-only set runs
   ([docs](https://code.claude.com/docs/en/permission-modes)). MCP tool calls: a wall-clock limit of
   `MCP_TOOL_TIMEOUT` (about 28 h by default) or a server's `timeout`, an idle limit of 30 min for stdio servers, and a
@@ -330,6 +372,11 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   (any key beyond `continue`, `stopReason`, `suppressOutput`, `systemMessage`, `decision`, `reason` fails the hook)
   or exit 2 with the prompt on stderr. Exit 0 without output ends the turn. No cap on continuations (224 in 20 s).
   Default timeout 600 s.
+- Twelve hook events (PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, UserPromptSubmit,
+  SubagentStart, SubagentStop, Stop, Interrupt, SessionStart, SessionEnd), none for a failed turn (source 0.157.0: a
+  usage limit ends the turn with an error event and runs no hook; the legacy `notify` fires only on a finished turn).
+  `UserPromptSubmit` stdin adds `turn_id` and `prompt`; plain stdout or `hookSpecificOutput.additionalContext` becomes
+  developer context, and exit 0 with no output adds nothing. Model-visible hook output is cut at about 2,500 tokens.
 - Stop doesn't run when a turn fails, a usage limit included, and no hook event reports errors. The limit reads
   "You’ve hit your usage limit. ... try again at 3:57 PM." (curly apostrophe; on another day "Try again at Sep 25th,
   2026 7:40 PM.").
@@ -358,6 +405,22 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   `item.completed` (the answer is an `agent_message` item's `text`; items of type `error` are only warnings),
   `turn.completed`. A usage limit is not retried: `error` and `turn.failed` say "You’ve hit your usage limit. ... try
   again at 7:48 PM." (or "try again later."), exit 1. Stop hooks get Codex's environment.
+- MCP docs (2026-09-25): keep the first 512 characters of a server's `instructions` self-contained; per server
+  `default_tools_approval_mode` is auto, prompt, writes (asks for tools not marked read-only) or approve, and
+  `tools.<tool>.approval_mode` sets one tool. `clientInfo.name` is `codex-mcp-client` (source).
+- Plugins ([docs](https://developers.openai.com/plugins/build/plugins), source c98e263, 2026-09-25): OpenAI's portable
+  format has a root `plugin.json` with `"$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"`. Codex
+  takes a root `plugin.json` as the manifest only when its `$schema` starts with `https://agent-plugins.org/schemas/`;
+  otherwise it reads `.codex-plugin/plugin.json`, then `.claude-plugin/plugin.json`, then `.cursor-plugin/plugin.json`
+  (a root `plugin.json` that is a link or not a file stops the search). A portable package's MCP servers come only from
+  a root `mcp.json`, and `.codex-plugin`'s `mcpServers` are ignored. Agon's root `plugin.json` has Antigravity's
+  `$schema`, so Codex never takes it for its own.
+- On 2026-07-09 the Codex desktop app became a mode of the ChatGPT desktop app (Chat, Work and Codex; macOS and
+  Windows) *(the date: secondary)*. The codex CLI, the ChatGPT app and the IDE extension share `~/.codex/config.toml`,
+  MCP servers, hooks and plugins, and the app loads plugins from the same cache.
+- The usage limit (source 0.157.0): "You’ve hit your usage limit." then " Try again at {time}." or, with an upsell,
+  " or try again at {time}." (or "later"); the time is local, `3:05 PM` or `Sep 26th, 2026 3:05 PM`. A plan limit is not
+  retried. ChatGPT plans have a ~5-hour and a weekly window (not the 5-hour one on Pro for now) *(secondary)*.
 - MCP (0.156.1): `tool_timeout_sec` (default 60) fails a longer call and sends no cancel; a plugin's `mcpServers`
   accept `tool_timeout_sec` and `env_vars` (`codex mcp list --json` shows them) and start in the plugin's cache
   folder. The model sees a server's tools as a `namespace` named `mcp__<server>`, described by the server's
@@ -374,6 +437,10 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   stdin includes `executionNum`, `terminationReason`, `error`, `fullyIdle`, `conversationId`, `workspacePaths`,
   `transcriptPath`, `modelName`. To continue: stdout `{"decision": "continue", "reason": "<prompt>"}` and exit 0;
   any other decision, a non-zero exit, empty output or unknown keys let it stop. Default timeout 30 s.
+- Stop stdin (docs, 2026-09-25) also has `fullyIdle` and the common fields `artifactDirectoryPath` and `modelName`; hooks
+  run in Antigravity 2.0, the CLI and the IDE. Built-in tools include `manage_task` (background tasks: `list`, `kill`,
+  `status`, `send_input`) and `send_message`. An MCP tool that no rule allows runs in Ask mode, asking every time;
+  `mcp(server/tool)` and `mcp(server/*)` rules allow it ([mcp](https://antigravity.google/docs/mcp)).
 - `terminationReason`: the docs say `model_stop`, `max_steps_exceeded`, `error`; 1.2.x sends `NO_TOOL_CALL`,
   `ERROR`, `USER_CANCELED`, `QUOTA_EXHAUSTED`, ... Continuing after an error re-enters the loop. A configurable cap
   ends long runs of continuations. Quota: "You have exhausted your quota on this model." (the server's error reads
@@ -437,10 +504,26 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   ([tools](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)). Tool annotations:
   `readOnlyHint`, `destructiveHint` (default true; false means additive only), `idempotentHint`, `openWorldHint`
   (default true).
+- Tasks (2025-11-25, experimental: `tasks/*` methods, `execution.taskSupport` per tool, capability
+  `tasks.requests.tools.call`) became the extension `io.modelcontextprotocol/tasks` in 2026-07-28: no clash with a tool
+  named `board` or `tasks`. Tool names are 1–128 of `A-Za-z0-9_.-`; the spec sets no length on descriptions, and "there
+  SHOULD always be a human in the loop with the ability to deny tool invocations". 2026-07-28 moves `instructions` to
+  `server/discover`, which clients may skip.
 - Tried against agon (Phase 1): the official Python SDK 2.2.0 `Client` (default `mode="auto"`) probes
   `server/discover` at `2026-07-28`, gets `-32601` and falls back to `initialize` at `2025-11-25`; the TypeScript SDK
   1.30.1 (the one Claude Code builds on) initializes at `2025-11-25` directly. Aborting a call makes both send
   `notifications/cancelled`.
+
+**SQLite and Python** (checked 2026-09-25)
+- `BEGIN IMMEDIATE` takes SQLite's one write lock at BEGIN and waits the busy timeout for it; a deferred transaction
+  that reads and then writes fails at once with `SQLITE_BUSY` (or `SQLITE_BUSY_SNAPSHOT`), without waiting. So a claim's
+  checks and its write go in one IMMEDIATE transaction ([docs](https://sqlite.org/lang_transaction.html)).
+- Python's `sqlite3`: `isolation_level=None` (3.10, 3.11) and `autocommit=True` (3.12+) leave SQLite in its autocommit
+  mode, where an explicit `BEGIN IMMEDIATE` works. The default `autocommit=LEGACY_TRANSACTION_CONTROL` will change to
+  `False`, which keeps a transaction open, and then `BEGIN` fails ([docs](https://docs.python.org/3/library/sqlite3.html)).
+- Two processes that claim the same 30 tasks at once (Python 3.10–3.13, SQLite 3.45.1): every task got one owner.
+- Windows paths: `os.path.normcase` lowercases only on Windows, and `realpath` resolves 8.3 names and junctions only for
+  paths that exist. Agon compares a task's files as text (relative, `/`, NFC, case-folded) and resolves no links.
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,

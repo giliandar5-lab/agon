@@ -2197,7 +2197,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.3)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.4)"):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -2227,6 +2227,31 @@ for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers
     for claim in gone:
         assert claim not in text, (readme, claim)
 assert "- [x] Phase 3.1 — Review evidence" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+# Phase 4: both READMEs explain the board (its actions, claims, reviews by another company, leases, usage limits, the
+# note for a returning agent, the automatic review), say plainly what runs without asking, give the UserPromptSubmit
+# hooks for a hand-made setup, and call Codex's app what it is now: a mode of the ChatGPT desktop app
+for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-board", "Codex in the ChatGPT desktop app",
+                                     "Four tools for agents", "done` runs your test command (`AGON_TEST_CMD`) with no"
+                                     " prompt, as you, outside the apps' sandboxes", "sends your code to another"
+                                     " company's app and spends your plan there", "Announce a file", "Codex app")),
+                      ("README.ru.md", ("## Доска задач (`board`)", "#доска-задач-board", "Codex в десктопном приложении"
+                                        " ChatGPT", "Четыре инструмента для агентов", "запускает твою команду тестов"
+                                        " (`AGON_TEST_CMD`) без подтверждения, от твоего\n  имени и вне песочниц",
+                                        "отправляет твой код в программу\n  другой компании и тратит там твой тариф",
+                                        "Перед правкой файла сообщи", "Codex app"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
+                   "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
+                   "`mcp(agon/*)`", "(v0.4)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
+                   '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
+                   ' gpt", "timeout": 10 }] }]'):
+        assert needed in text, (readme, needed)
+    for gone in words[6:]:
+        assert gone not in text, (readme, gone)
+roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+assert "- [x] Phase 4 — Task board (no downtime)" in roadmap and "Codex app" not in roadmap
+assert "`board(action, ...)`" in roadmap and "`AGON_LEASE` seconds (7200)" in roadmap
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
