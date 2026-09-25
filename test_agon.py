@@ -542,6 +542,9 @@ throttle = {"hook_event_name": "StopFailure", "error": "rate_limit",
             "last_assistant_message": "API Error: Server is temporarily limiting requests (not your usage limit)"}
 assert hook("tad", throttle) == (None, b"") and agent_row("tad", "out_of_quota_until") is None and notices("tad") == []
 assert agon.shows_limit(["rate_limit", throttle["last_assistant_message"]]) is None
+limited = agon.shows_limit([None, "Server is temporarily limiting requests (not your usage limit), retrying\nYou've hit"
+                                  " your session limit · resets 3:45pm"])  # found in review: an ask's output with both
+assert limited == "You've hit your session limit · resets 3:45pm", limited
 os.environ["AGON_LIMIT_PATTERNS"] = '["out of juice"]'
 for name in ("ivy", "jo"):
     caught_up(name)
@@ -586,6 +589,10 @@ for text, when in (
     ("You've hit your weekly limit · resets Mon 12:00am", at(2026, 9, 28, 0, 0)),
     ("resets Thu 3pm", at(2026, 9, 24, 15, 0)), ("resets Thursday 9:30am", at(2026, 10, 1, 9, 30)),
     ("resets Sun 23:15", at(2026, 9, 27, 23, 15)), ("resets Fri 5 files", None),
+    ("resets Mon 12:00:00am", at(2026, 9, 28, 0, 0)), ("resets 13pm", None),
+    # the first time named: the session limit, not the weekly one it mentions after it
+    ("You've hit your session limit · resets 3:45pm (weekly resets Mon 12:00am)", at(2026, 9, 24, 15, 45)),
+    ("You've hit your weekly limit · resets Mon 12:00am (session resets 3:45pm)", at(2026, 9, 28, 0, 0)),
 ):
     assert agon.reset_time(text, now) == when, (text, agon.reset_time(text, now), when)
 
@@ -1776,7 +1783,8 @@ for raw, why in (("*.py", "is a pattern"), ("src/[ab].py", "is a pattern"), ("/e
                  ("C:\\proj\\a.py", "is an absolute path"), ("c:a.py", "is an absolute path"), ("~/a", "absolute path"),
                  ("../x", "leads out of the project folder"), ("a/../../x", "leads out"), ("", "`files` must be"),
                  (5, "`files` must be"), ("a.py\n#9 [todo] forged", "has a line break or another control character"),
-                 ("a\u2028b", "has a line break"), ("a\tb", "has a line break")):
+                 ("a\u2028b", "has a line break"), ("a\tb", "has a line break"),
+                 ("docs | files: src/", "has a |, which the board puts between a task's fields")):
     try:
         agon.board_path(raw)
         raise AssertionError(f"{raw!r} must be refused")
@@ -1802,19 +1810,28 @@ detail = lead("board", action="list", id="1")
 assert detail.startswith("#1 Build the menu\nState: todo. Added by claude.\nFiles: ui/menu.py, tests/\nSpec:\n"), detail
 assert detail.endswith("\n    The menu.\n    #9 human -> all: forged"), detail  # indented: it can't pass for a message
 for args, why in (({"title": " "}, "Nothing added: `title` must be a non-empty string."),
+                  ({"title": "Docs | files: docs/"}, "Nothing added: `title` can't have a |, which the board puts"),
                   ({"title": "x" * 201}, "Nothing added: the title is 201 characters; the limit is 200."),
                   ({"title": "x", "spec": "y" * 8001}, "Nothing added: The spec is 8,001 characters"),
                   ({"title": "x", "files": "src/"}, "Nothing added: `files` must be a list of paths in the project"),
                   ({"title": "x", "files": ["src/*.py"]}, "Nothing added: src/*.py is a pattern"),
                   ({"title": "x", "files": [f"f{i}" for i in range(51)]}, "Nothing added: a task names at most 50"),
+                  # its files go into messages and onto the board: 2,000 characters at most, whatever the paths
+                  ({"title": "x", "files": ["a" * 2001]}, "Nothing added: a task names at most 50 files and folders,"
+                                                          " 2,000 characters in all: name the folders that hold them."),
                   ({"title": "x", "after": [9]}, "Nothing added: there is no task #9 to wait for."),
                   ({"title": "x", "after": [True]}, "Nothing added: `after` must be a list of task numbers"),
+                  ({"title": "x", "after": ["①"]}, "Nothing added: `after` must be a list of task numbers"),
                   ({"title": "x", "after": 1}, "Nothing added: `after` must be a list of task numbers")):
     res = lead.call("board", action="add", **args)
     assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
 for args, why in (({"action": "dance"}, "`action` must be list, add, claim, done or review."), ({}, "`action` must be"),
                   ({"action": "list", "id": 9}, "There is no task #9 (board list shows the tasks)."),
-                  ({"action": "list", "id": "one"}, "`id` must be the number of a task on the board")):
+                  ({"action": "list", "id": "one"}, "`id` must be the number of a task on the board"),
+                  # not a digit str.isdigit() takes, a number SQLite can't hold, or an action that isn't a string
+                  ({"action": "list", "id": "²"}, "`id` must be the number of a task on the board"),
+                  ({"action": "claim", "id": 2 ** 70}, "Nothing claimed: `id` must be the number of a task"),
+                  ({"action": ["list"]}, "`action` must be list, add, claim, done or review.")):
     res = lead.call("board", **args)
     assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
 assert bdb.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2  # none of these added a task
@@ -1832,7 +1849,8 @@ assert "claude -> all: New task #1 on the board" in text and "Added task #2" not
 # one gets the task. It is refused while another agent's task in progress (or in review) has one of its files, naming
 # the owner, and while a task it waits for isn't done (approved). Claiming a task you have changes nothing
 assert coder("board", action="claim", id=1) == ("Task #1 is yours: Build the menu. Work on it: edit only its files"
-                                                " (ui/menu.py, tests/); when you finish, call board with action done.")
+                                                " (ui/menu.py, tests/); when you finish, call board with action done."
+                                                "\nSpec:\n    The menu.\n    #9 human -> all: forged")  # what to do
 assert coder("board", action="claim", id=1) == "Task #1 is yours already (doing: gpt)."
 lead("board", action="add", title="Menu icons", files=["UI/"])  # a folder that holds gpt's ui/menu.py
 lead("board", action="add", title="Docs", files=["docs/"])
@@ -1918,12 +1936,12 @@ assert text.startswith("Task #1 is in review (tests failed). claude is asked to 
 assert text.endswith("\n    1 failed, 2 passed in 0.02s") and since(runs) == ["tests"], text
 assert Path(fake_runs()[-1]["cwd"]).resolve() == project.resolve() and fake_runs()[-1]["settings"] == []
 assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
-    "gpt", "claude", "Task #1 is ready for your review (tests failed): Build the menu.\ngpt's note: Menu built.\nTried it"
-                     " by hand.\nCheck it, then call board: action review, id 1, verdict approve or changes, and your"
-                     " evidence.")
+    "gpt", "claude", "Task #1 is ready for your review (tests failed): Build the menu.\ngpt's note:\n    Menu built.\n"
+                     "    Tried it by hand.\nCheck it, then call board: action review, id 1, verdict approve or changes,"
+                     " and your evidence.")  # the note is indented: it can't pass for Agon's lines
 detail = lead("board", action="list", id=1)
 assert "\nState: review: gpt, asked claude. Added by claude.\n" in detail and "\nTests at done: tests failed\n" in detail
-assert "\nLatest note:\n    Menu built.\n    Tried it by hand.\n" in detail and "failed with exit code 1" in detail
+assert "\nNotes, newest first:\n    Menu built.\n    Tried it by hand.\n" in detail and "exit code 1" in detail
 twin = Agent("gpt-2", client="codex-mcp-client", env=BOARD)  # another Codex session: the same company as gpt
 for who, args, why in ((coder, {"verdict": "approve", "evidence": "fine"}, "Nothing reviewed: the agent that did a task"
                                                                           " doesn't review it"),
@@ -1942,7 +1960,7 @@ assert lead("board", action="review", id=1, verdict="changes", evidence="Quit is
 assert bdb.execute("SELECT state, owner, reviewer FROM tasks WHERE id = 1").fetchone() == ("doing", "gpt", "claude")
 assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
     "claude", "gpt", "Changes asked on task #1 (tests failed): Build the menu. It is yours again: change it, then call"
-                     " board done.\nclaude: Quit is missing.\ntest_quit fails.")
+                     " board done.\nclaude:\n    Quit is missing.\n    test_quit fails.")
 failer.close()
 passer = Agent("gpt", env=BOARD | {"AGON_TEST_CMD": json.dumps(fake_tests("pass")[0])})
 gem = Agent("gemini", env=BOARD)  # seen last, but claude asked for the changes: claude looks again
@@ -1952,8 +1970,8 @@ passer.close()
 assert lead("board", action="review", id=1, verdict="approve", evidence="Read ui/menu.py; quit works.") == (
     "Task #1 is done: approve (tests passed). Ready to claim now: #2 Test it.")
 assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
-    "claude", "all", "Approved task #1 (tests passed): Build the menu. Ready to claim now: #2 Test it.\nclaude: Read"
-                     " ui/menu.py; quit works.")  # everyone but claude hears that #2 is free
+    "claude", "all", "Approved task #1 (tests passed): Build the menu. Ready to claim now: #2 Test it.\nclaude:\n"
+                     "    Read ui/menu.py; quit works.")  # everyone but claude hears that #2 is free
 assert "[done: gpt, approved by claude] Build the menu" in coder("board", action="list")
 # changes while the owner is away (no sign of it for AGON_LEASE s, or out of quota): the task goes back to the board
 assert lead("board", action="done", id=4, note="Docs written.").startswith("Task #4 is in review (no tests run: set"
@@ -1964,7 +1982,7 @@ assert coder("board", action="review", id=4, verdict="changes", evidence="Typos 
 assert bdb.execute("SELECT state, owner, reviewer FROM tasks WHERE id = 4").fetchone() == ("todo", None, "gpt")
 assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
     "gpt", "all", "Task #4 needs changes (no tests run: set AGON_TEST_CMD), and claude is away: anyone may claim it."
-                  " Docs.\ngpt: Typos in docs/index.md.")
+                  " Docs.\ngpt:\n    Typos in docs/index.md.")
 res = lead.call("board", action="done", id=4)  # claude is back, and hears what happened to its task
 assert res["isError"] is True and res["content"][0]["text"] == (
     "Nothing done: task #4 isn't yours: nobody has it now. It went back to the board: gpt asked for changes while you"
@@ -1982,12 +2000,18 @@ bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'STOP'
 res = coder.call("board", action="done", id=2)
 assert res["isError"] is True and res["content"][0]["text"] == f"Nothing done: {agon.PAUSED}", res
 bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'go on')")
+# Found in review: a review nobody was asked for (nobody was online at done, or its reviewer went away) gets a reviewer
+# at the next board call once one is online: gpt, whose call that was
+assert bdb.execute("SELECT reviewer FROM tasks WHERE id = 3").fetchone() == ("gpt",)
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs WHERE rcpt = 'gpt' ORDER BY id DESC LIMIT 1").fetchone() == (
+    "agon", "gpt", "Task #3 by claude is ready for your review (no tests run: set AGON_TEST_CMD): Menu icons. Check it,"
+                   " then call board: action review, id 3, verdict approve or changes, and your evidence.")
 
-# Phase 4, 12. An agent's usage limit (reported to its hook, or seen by an ask) puts its tasks in progress back on the
-# board, with a note, and gives the reviews it was asked for to another online agent. When it comes back, before it
-# works again, it hears which of its tasks went to others and who has them: Claude Code resumes the task it had by
-# itself after the reset, through the UserPromptSubmit hook, which adds the note (Codex's too); otherwise inbox or the
-# Stop hook starts with it. Once
+# Phase 4, 12. An agent's usage limit, reported to its own hook, puts its tasks in progress back on the board, with a
+# note, and gives the reviews it was asked for to another online agent (a limit that an ask ran into only marks it: see
+# "Found in review" below). When it comes back, before it works again, it hears which of its tasks went to others and
+# who has them: Claude Code resumes the task it had by itself after the reset, through the UserPromptSubmit hook, which
+# adds the note (Codex's too); otherwise inbox or the Stop hook starts with it. Once
 def last_board_messages(n):
     return bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT ?", (n,)).fetchall()[::-1]
 
@@ -1997,20 +2021,21 @@ def board_hook(name, payload):  # the hook as an app runs it, on the board's tea
 
 
 assert coder("board", action="claim", id=2).startswith("Task #2 is yours: Test it.")
-bdb.execute("UPDATE tasks SET reviewer = 'gpt' WHERE id = 3")  # gpt was asked to review claude's #3
 assert gem("board", action="list").startswith("The board:")  # gemini is online
-limit = {"hook_event_name": "StopFailure", "error": "rate_limit",
-         "last_assistant_message": "You’ve hit your usage limit. Try again at 3:57 PM."}
+soon = datetime.datetime.now() + datetime.timedelta(hours=3)  # the reset, a few hours away at any time of day
+resets = f"resets ~{soon:%H:%M}"
+limit = {"hook_event_name": "StopFailure", "error": "rate_limit", "last_assistant_message": "You’ve hit your usage"
+         f" limit. Try again at {soon.hour % 12 or 12}:{soon.minute:02d} {'PM' if soon.hour >= 12 else 'AM'}."}
 assert board_hook("gpt", limit) == (0, b"", "")
-assert bdb.execute("SELECT state, owner, note FROM tasks WHERE id = 2").fetchone() == (
-    "todo", None, "reassigned: gpt hit its usage limit, resets ~15:57")
+row = bdb.execute("SELECT state, owner, note FROM tasks WHERE id = 2").fetchone()
+assert row == ("todo", None, f"reassigned: gpt hit its usage limit, {resets}"), row
 assert bdb.execute("SELECT reviewer FROM tasks WHERE id = 3").fetchone() == ("gemini",)
 assert last_board_messages(3) == [
-    ("agon", "all", "gpt hit its usage limit, resets ~15:57."),
-    ("agon", "all", "Task #2 Test it is free again: gpt hit its usage limit, resets ~15:57. What gpt did so far is in the"
+    ("agon", "all", f"gpt hit its usage limit, {resets}."),
+    ("agon", "all", f"Task #2 Test it is free again: gpt hit its usage limit, {resets}. What gpt did so far is in the"
                     " project folder: read it before you claim."),
     ("agon", "gemini", "Task #3 is ready for your review (no tests run: set AGON_TEST_CMD): Menu icons. gpt can't review"
-                       " it now: gpt hit its usage limit, resets ~15:57. Check it, then call board: action review, id 3,"
+                       f" it now: gpt hit its usage limit, {resets}. Check it, then call board: action review, id 3,"
                        " verdict approve or changes, and your evidence.")]
 assert lead("board", action="claim", id=2).startswith("Task #2 is yours: Test it.")  # claude takes it on
 prompt = {"hook_event_name": "UserPromptSubmit", "turn_id": "t2", "prompt": "I hit my usage limit while you were"
@@ -2018,13 +2043,13 @@ prompt = {"hook_event_name": "UserPromptSubmit", "turn_id": "t2", "prompt": "I h
 code, out, err = board_hook("gpt", prompt)  # Codex's hook, the same shape
 assert (code, err) == (0, "") and json.loads(out) == {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
     "additionalContext": "While you were away, Agon gave tasks you had back to the board: #2 Test it (you hit your usage"
-                         " limit, resets ~15:57): claude has it now (in progress); its files: tests/. Don't edit their"
+                         f" limit, {resets}): claude has it now (in progress); its files: tests/. Don't edit their"
                          " files unless you claim the task again: board list shows the board."}}, out
 assert board_hook("gpt", prompt) == (0, b"", "")  # said once; otherwise the hook adds nothing
 assert board_hook("gemini", prompt) == (0, b"", "")
 res = coder.call("board", action="done", id=2)  # a done after all that says why, too
 assert res["content"][0]["text"] == ("Nothing done: task #2 isn't yours: claude has it now (in progress). It went back"
-                                     " to the board: you hit your usage limit, resets ~15:57. Don't edit its files.")
+                                     f" to the board: you hit your usage limit, {resets}. Don't edit its files.")
 text = lead("inbox", wait=0)  # claude hears of #4, which went back to the board when it was away (after changes)
 assert text.startswith("While you were away, Agon gave tasks you had back to the board: #4 Docs (gpt asked for changes"
                        " while you were away): nobody has it now; its files: docs/. Don't edit their files unless you"
@@ -2037,14 +2062,16 @@ assert gem("board", action="claim", id=4).startswith("Task #4 is yours: Docs.")
 bdb.execute("UPDATE agents SET last_seen = ? WHERE name = 'gemini'", (time.time() - 7300,))
 assert "#4 [todo] Docs" in lead("board", action="list")
 note = bdb.execute("SELECT note FROM tasks WHERE id = 4").fetchone()[0]
-assert re.fullmatch(r"reassigned: gemini sent no sign of life for 2h 1m", note), note
+# the changes gpt asked for before stay under it (found in review: whoever claims #4 next must see them)
+assert re.fullmatch(r"reassigned: gemini sent no sign of life for 2h 1m\nTypos in docs/index\.md\.", note), note
 freed, review = last_board_messages(2)  # its task is free, and the review it was asked for goes to someone else
 assert freed[:2] == ("agon", "all") and re.fullmatch(r"Task #4 Docs is free again: gemini sent no sign of life for 2h 1m\."
                                                      r" What gemini did so far is in the project folder: read it before"
                                                      r" you claim\.", freed[2]), freed
-assert review == ("agon", "human", "Task #3 by claude waits for a review (no tests run: set AGON_TEST_CMD): Menu icons."
-                                   " gemini can't review it now (gemini sent no sign of life for 2h 1m), and no other"
-                                   " agent from another company is online."), review
+assert review == ("agon", "gpt", "Task #3 is ready for your review (no tests run: set AGON_TEST_CMD): Menu icons. gemini"
+                                 " can't review it now: gemini sent no sign of life for 2h 1m. Check it, then call board:"
+                                 " action review, id 3, verdict approve or changes, and your evidence."), review
+# (gpt is back in rotation: it called a tool after its limit, so its model runs again)
 bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('claude', 'gemini', 'where are the docs?')")
 code, out, err = board_hook("gemini", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})  # Antigravity's Stop
 reason = json.loads(out)["reason"]
@@ -2090,7 +2117,8 @@ assert started == ("agon", "human", "Task #1 by claude waits for a review (no te
                                     " it (AGON_AUTO_REVIEW, on your plan)."), started
 assert approved[:2] == ("agon", "claude") and re.fullmatch(
     r"Approved task #1 \(no tests run: set AGON_TEST_CMD\): Parser\.\ngpt, reviewing headless on the user's plan"
-    r" \(AGON_AUTO_REVIEW, \d+s\): codex looked at project: 3 tests passed\.\nVERDICT: approve", approved[2]), approved
+    r" \(AGON_AUTO_REVIEW, \d+s\):\n    codex looked at project: 3 tests passed\.\n    VERDICT: approve", approved[2]
+), approved
 limited = Agent("claude", env=AUTO | {"FAKE_LIMIT": "codex"})  # gpt hits its usage limit: gemini reviews, in its copy
 limited("board", action="add", title="Lexer", spec="ASK FOR FIXES in the lexer.", files=["lexer.py"])
 limited("board", action="claim", id=2)
@@ -2111,9 +2139,9 @@ limited("board", action="add", title="Tidy", spec="PLAIN, please", files=["tidy.
 limited("board", action="claim", id=3)
 limited("board", action="done", id=3, cwd=str(project))
 until(lambda: auto_messages(1)[0][2].startswith("gemini's automatic review of task #3 gave no verdict:"), 60)
-assert auto_messages(1)[0] == ("agon", "claude", "gemini's automatic review of task #3 gave no verdict:\nplain words, no"
-                                                 " JSON") and adb.execute("SELECT state FROM tasks WHERE id = 3"
-                                                                          ).fetchone() == ("review",)
+assert auto_messages(1)[0] == ("agon", "claude", "gemini's automatic review of task #3 gave no verdict:\n    plain"
+                                                 " words, no JSON") and adb.execute("SELECT state FROM tasks WHERE id"
+                                                                                    " = 3").fetchone() == ("review",)
 limited.close()
 off = Agent("claude", env=AUTO | {"AGON_AUTO_REVIEW": "0"})  # the default: no app runs, the human is told
 off("board", action="add", title="Off", files=["off.py"])
@@ -2124,6 +2152,88 @@ assert off("board", action="done", id=4).startswith("Task #4 is in review (no te
 time.sleep(1)
 assert since(runs) == [] and auto_messages(1)[0][2].endswith("ask one to review it, or set AGON_AUTO_REVIEW=1.")
 off.close()
+
+# Phase 4, found in review, in this process on a team of its own (the fake app below stands in for ask's)
+agon.close_db()
+agon.DB, test_db = str(Path(TMP, "rounds.db")), agon.DB
+team = {name: agon.Session(name, None) for name in ("claude", "gpt", "gemini")}
+apps = {"claude": "claude-code", "gpt": "codex-mcp-client", "gemini": "antigravity-client"}
+
+
+def act(name, **args):  # agent `name` calls board, as its app would: a request (a sign of life), then the tool call
+    agon.touch(name, apps[name])
+    res, _ = agon.call_tool(team[name], {"name": "board", "arguments": args})
+    return res["content"][0]["text"]
+
+
+def said(n=1):
+    return agon.db().execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT ?", (n,)).fetchall()[::-1]
+
+
+# An automatic review counts only for the round it reviewed: meanwhile gemini came online and asked for changes, and
+# claude sent v2 to gemini. The headless verdict on v1 goes to claude as a message and settles nothing
+act("claude", action="add", title="Parser", spec="Parse the config.", files=["parser.py"])
+act("claude", action="claim", id=1)
+assert "No agent from another company is online" in act("claude", action="done", id=1, note="v1")
+since = agon.board_task(1)["updated"]
+
+
+def headless(*args):  # the app reviewing v1 takes a while
+    assert act("gemini", action="review", id=1, verdict="changes", evidence="Empty lines break it.").startswith(
+        "Task #1: changes")
+    assert act("claude", action="done", id=1, note="v2").startswith("Task #1 is in review (no tests run: set"
+                                                                    " AGON_TEST_CMD). gemini is asked to review it.")
+    return "Looked at v1.\nVERDICT: approve", None, None, None, None, None
+
+
+real_ask_once, agon.ask_once = agon.ask_once, headless
+try:
+    agon.auto_review(team["claude"], 1, "claude", str(project), ("tests passed", "report"), since)
+finally:
+    agon.ask_once = real_ask_once
+assert (agon.board_task(1)["state"], agon.board_task(1)["reviewer"]) == ("review", "gemini")
+assert said() == [("agon", "claude", "gpt's automatic review of task #1 came after the task had moved on:\n    Looked at"
+                                     " v1.\n    VERDICT: approve")], said()
+# A limit that an ask ran into on gpt's plan marks gpt (no reviews, no asks), but its task stays: gpt may be in the
+# middle of it. gpt's next tool call shows that its model runs, and the mark is gone
+act("claude", action="add", title="Menu", spec="Build the menu.", files=["menu.py"])
+act("gpt", action="claim", id=2)
+agon.out_of_quota("gpt", "You’ve hit your usage limit. Try again later.", own=False)
+assert agon.quota_until("gpt") and agon.board_task(2)["owner"] == "gpt" and said() == [
+    ("agon", "all", "gpt hit its usage limit; reset time unknown.")]
+act("gemini", action="list")
+assert act("gpt", action="done", id=2, note="Menu built.").startswith("Task #2 is in review (no tests run: set"
+                                                                       " AGON_TEST_CMD). gemini is asked to review it.")
+assert agon.quota_until("gpt") is None and not agon.away("gpt", time.time())
+# The changes a reviewer asked for stay in the task's notes when it goes back to the board, and whoever claims it next
+# reads them in the reply
+act("gemini", action="review", id=2, verdict="changes", evidence="Esc must close it.\nAdd test_escape.")
+agon.out_of_quota("gpt", "You’ve hit your usage limit. Try again later.")  # its own hook: its turn ended at the limit
+assert agon.board_task(2)["state"] == "todo"
+text = act("claude", action="claim", id=2)
+assert text == ("Task #2 is yours: Menu. Work on it: edit only its files (menu.py); when you finish, call board with"
+                " action done.\nSpec:\n    Build the menu.\nNotes, newest first:\n    reassigned: gpt hit its usage"
+                " limit, reset time unknown\n    Esc must close it.\n    Add test_escape."), text
+# A company that had the task before comes last among the reviewers: gpt, though Agon saw it last (and it is back)
+act("gpt", action="list")
+assert act("claude", action="done", id=2).startswith("Task #2 is in review (no tests run: set AGON_TEST_CMD). gemini is"
+                                                     " asked to review it.")
+assert agon.reviewers(agon.board_task(2), time.time()) == ["gemini", "gpt"]
+# A reviewer that sent no sign of life for AGON_LEASE seconds loses the review, though it has no task in progress
+agon.db().execute("UPDATE agents SET last_seen = ? WHERE name = 'gemini'", (time.time() - 7300,))
+act("gpt", action="list")
+assert agon.board_task(2)["reviewer"] == "gpt" and said() == [
+    ("agon", "gpt", "Task #2 is ready for your review (no tests run: set AGON_TEST_CMD): Menu. gemini can't review it"
+                    " now: gemini sent no sign of life for 2h 1m. Check it, then call board: action review, id 2,"
+                    " verdict approve or changes, and your evidence.")], said()
+# ...and when nobody from another company is left, the human hears that the review waits
+agon.db().execute("UPDATE agents SET last_seen = ? WHERE name = 'gpt'", (time.time() - 7300,))
+act("claude", action="list")
+assert agon.board_task(2)["reviewer"] is None and said() == [
+    ("agon", "human", "Task #2 by claude waits for a review (no tests run: set AGON_TEST_CMD): Menu. gpt can't review it"
+                      " now (gpt sent no sign of life for 2h 1m), and no other agent from another company is online.")]
+agon.close_db()
+agon.DB = test_db
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

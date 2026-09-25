@@ -68,7 +68,8 @@ NO_TESTS = "no tests run: set AGON_TEST_CMD"  # what came of the tests: this, or
 LEASE = 7200
 ONLINE = 900  # an agent seen by Agon this many seconds ago counts as online: it can be asked for a review
 MAX_TITLE = 200  # characters in a task's title
-MAX_FILES = 50  # files and folders one task may name
+MAX_FILES = 50  # files and folders one task may name...
+MAX_FILES_TEXT = 2000  # ...in this many characters: they go into messages and onto the board
 CLIENTS = {"claude-code": "claude", "codex-mcp-client": "gpt", "antigravity-client": "gemini"}  # vendor by app
 # The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
 ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
@@ -1179,7 +1180,7 @@ def tool_ask(session, args):
                 continue
             answer, problem, limit, branch, stat = None, str(e), None, None, None
         if limit:
-            out_of_quota(name, limit)  # marked until it resets, and the team is told
+            out_of_quota(name, limit, own=False)  # marked until it resets, and the team is told
             skipped.append(f"{name} hit its usage limit" + (f" (what it did is on branch {branch})" if branch else ""))
             continue
         break
@@ -1210,7 +1211,8 @@ def tool_ask(session, args):
 
 # The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
 # an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
-BOARD_SQL = "SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report FROM tasks"
+BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, updated FROM"
+             " tasks")
 FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
 STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
 
@@ -1226,6 +1228,8 @@ def board_path(raw):
         raise ToolError(f"{raw!r} has a line break or another control character.")
     if set(path) & set("*?[]"):
         raise ToolError(f"{raw} is a pattern: name a folder instead (tests/ covers everything in it).")
+    if "|" in path:  # Windows allows none in a name either
+        raise ToolError(f"{raw} has a |, which the board puts between a task's fields.")
     if path.startswith(("/", "~")) or re.match(r"[A-Za-z]:", path):
         raise ToolError(f"{raw} is an absolute path: name files relative to the project folder, such as src/app.py.")
     folder = path.endswith("/")
@@ -1245,8 +1249,9 @@ def board_files(value):
     for raw in value:
         path = board_path(raw)
         paths.setdefault(path.casefold().rstrip("/"), path)
-    if len(paths) > MAX_FILES:
-        raise ToolError(f"a task names at most {MAX_FILES} files and folders: name the folders that hold them.")
+    if len(paths) > MAX_FILES or len(", ".join(paths.values())) > MAX_FILES_TEXT:
+        raise ToolError(f"a task names at most {MAX_FILES} files and folders, {MAX_FILES_TEXT:,} characters in all:"
+                        " name the folders that hold them.")
     return list(paths.values())
 
 
@@ -1257,22 +1262,29 @@ def overlap(a, b):
     return "." in (a, b) or a == b or b.startswith(a + "/") or a.startswith(b + "/")
 
 
+def number(value):
+    """A task number from a tool argument: a whole number, or one written in the digits 0-9; else None."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,15}", value.strip()):  # not ² or ①, which isdigit() takes
+        return int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10 ** 15:  # SQLite takes 64 bits
+        return value
+
+
 def task_ids(value, what):
     """A list of task ids from a tool argument (numbers, or numbers as strings), each once."""
     if value is None:
         return []
-    items = value if isinstance(value, list) else None
-    if items is None or any(isinstance(i, bool) or not (isinstance(i, int) or isinstance(i, str) and i.strip().isdigit())
-                            for i in items):
+    ids = [number(i) for i in value] if isinstance(value, list) else [None]
+    if None in ids:
         raise ToolError(f"`{what}` must be a list of task numbers, such as [1, 3].")
-    return list(dict.fromkeys(int(i) for i in items))
+    return list(dict.fromkeys(ids))
 
 
 def task_id(value):
     """The task number in a tool argument `id`."""
-    if isinstance(value, bool) or not (isinstance(value, int) or isinstance(value, str) and value.strip().isdigit()):
+    if (tid := number(value)) is None:
         raise ToolError("`id` must be the number of a task on the board (board list shows them).")
-    return int(value)
+    return tid
 
 
 def board_tasks(where="", params=()):
@@ -1314,6 +1326,12 @@ def status(t):
     return "todo"
 
 
+def details(t):
+    """Task t's spec and notes (newest first: a change request, why it went back to the board...), indented."""
+    return [line for label, text in (("Spec", t["spec"]), ("Notes, newest first", t["note"])) if text.strip()
+            for line in (f"{label}:", indented(text))]
+
+
 def task_line(t, states):
     """One task on one line: `#3 [doing: gpt] Build the menu | files: menu.py, ui | after: #1 done`."""
     parts = [f"#{t['id']} [{status(t)}] {t['title']}"]
@@ -1335,9 +1353,7 @@ def board_list(session, args):
             lines.append("Files: " + ", ".join(t["files"]))
         if t["after"]:
             lines.append("After: " + ", ".join(f"#{i} {states.get(i, 'gone')}" for i in t["after"]))
-        for label, text in (("Spec", t["spec"]), ("Latest note", t["note"])):
-            if text.strip():
-                lines += [f"{label}:", indented(text)]
+        lines += details(t)
         if t["tests"]:
             lines += [f"Tests at done: {t['tests']}", t["report"] or ""]
         return clip("\n".join(lines)), None
@@ -1364,6 +1380,8 @@ def board_add(session, args):
     if not isinstance(title, str) or not title.strip():
         raise ToolError("`title` must be a non-empty string.")
     title = " ".join(title.split())  # one line: the board shows a task per line
+    if "|" in title:
+        raise ToolError("`title` can't have a |, which the board puts between a task's fields.")
     if len(title) > MAX_TITLE:
         raise ToolError(f"the title is {len(title)} characters; the limit is {MAX_TITLE}. Put the details in spec.")
     if not isinstance(spec, str):
@@ -1418,7 +1436,8 @@ def board_claim(session, args):
             raise ToolError(f"task #{tid} was just claimed by someone else.")  # the checks above make this rare
         post(me, "human", f"Claimed task #{tid}: {t['title']}.")  # the arena only: nobody needs to act on it
     files = f": edit only its files ({', '.join(t['files'])})" if t["files"] else ""
-    return f"Task #{tid} is yours: {t['title']}. Work on it{files}; when you finish, call board with action done.", None
+    return clip("\n".join([f"Task #{tid} is yours: {t['title']}. Work on it{files}; when you finish, call board with"
+                           " action done.", *details(t)])), None
 
 
 def lease():
@@ -1440,12 +1459,19 @@ def away(name, now):
     return bool(until and until > now) or (last_seen or 0) < now - lease()
 
 
-def reviewers(owner, now):
-    """Who can review `owner`'s task now: another company's agents that are online (seen by Agon within ONLINE s) and
-    not out of quota, the most recently seen first."""
+def had_it(tid):
+    """The companies whose agents had task `tid` before it went back to the board (see release())."""
+    return {vendor(agent) for (agent,) in db().execute("SELECT DISTINCT agent FROM releases WHERE task = ?", (tid,))}
+
+
+def reviewers(t, now):
+    """Who can review task t now: another company's agents that are online (seen by Agon within ONLINE s) and not out
+    of quota, the most recently seen first. Those whose company had the task before it went back to the board come
+    last: they would review some of their own work (a team of two companies may have nobody else)."""
     rows = db().execute("SELECT name FROM agents WHERE name != ? AND last_seen > ? AND (out_of_quota_until IS NULL OR"
-                        " out_of_quota_until <= ?) ORDER BY last_seen DESC", (owner, now - ONLINE, now)).fetchall()
-    return [name for (name,) in rows if vendor(name) != vendor(owner)]
+                        " out_of_quota_until <= ?) ORDER BY last_seen DESC", (t["owner"], now - ONLINE, now)).fetchall()
+    before, owner = had_it(t["id"]), vendor(t["owner"])
+    return sorted((name for (name,) in rows if vendor(name) != owner), key=lambda name: vendor(name) in before)
 
 
 def owned(t, me):
@@ -1475,9 +1501,10 @@ def release(con, agent, note, why, now):
     usage limit, resets ~14:00), and ask another agent for the reviews `agent` was asked for. The team hears which tasks
     are free; `agent` hears it too, with `why`, before it works again (see taken_note())."""
     taken = board_tasks("WHERE state = 'doing' AND owner = ?", (agent,))
-    for t in taken:
+    for t in taken:  # the earlier notes stay, newest first: the next owner must see what a reviewer asked for
+        notes = f"reassigned: {note}" + (f"\n{t['note']}" if t["note"].strip() else "")
         con.execute("UPDATE tasks SET state = 'todo', owner = NULL, note = ?, updated = ? WHERE id = ?",
-                    (f"reassigned: {note}", now, t["id"]))
+                    (clip(notes, MAX_TEXT), now, t["id"]))
         con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)", (t["id"], agent, why))
     if taken:
         tasks = "; ".join(f"#{t['id']} {t['title']}" for t in taken)
@@ -1485,7 +1512,7 @@ def release(con, agent, note, why, now):
                             f" again: {note}. What {agent} did so far is in the project folder: read it before you"
                             " claim.")
     for t in board_tasks("WHERE state = 'review' AND reviewer = ?", (agent,)):  # its reviews go to someone else
-        reviewer = next((name for name in reviewers(t["owner"], now) if name != agent), None)
+        reviewer = next((name for name in reviewers(t, now) if name != agent), None)
         con.execute("UPDATE tasks SET reviewer = ? WHERE id = ?", (reviewer, t["id"]))
         tests = t["tests"] or NO_TESTS
         if reviewer:
@@ -1499,18 +1526,27 @@ def release(con, agent, note, why, now):
 
 
 def reap():
-    """Put back on the board the tasks whose owners sent no sign of life for AGON_LEASE seconds: an app that crashed
-    or closed, or a usage limit Codex tells no hook about. Every Agon request and hook run of the owner renews its
-    claim; this runs at the start of every board call, like beads' reclaim, and costs one query when nothing expired."""
+    """Put back on the board the tasks whose owners sent no sign of life for AGON_LEASE seconds, and give the reviews
+    their reviewers were asked for to someone else: an app that crashed or closed, or a usage limit Codex tells no hook
+    about. Every Agon request and hook run of an agent renews its claims; this runs at the start of every board call,
+    like beads' reclaim, and costs one query when nothing expired."""
     now, limit = time.time(), lease()
-    stale = ("SELECT DISTINCT tasks.owner, COALESCE(agents.last_seen, 0) FROM tasks LEFT JOIN agents ON agents.name ="
-             " tasks.owner WHERE tasks.state = 'doing' AND COALESCE(agents.last_seen, 0) < ?")
-    if not db().execute(stale, (now - limit,)).fetchone():
+    stale = ("SELECT DISTINCT agent, COALESCE(agents.last_seen, 0) FROM (SELECT owner AS agent FROM tasks WHERE state ="
+             " 'doing' UNION SELECT reviewer FROM tasks WHERE state = 'review' AND reviewer IS NOT NULL) LEFT JOIN"
+             " agents ON agents.name = agent WHERE COALESCE(agents.last_seen, 0) < ?")
+    unasked = "WHERE state = 'review' AND reviewer IS NULL"  # nobody was online at done, or its reviewer went away
+    if not db().execute(stale, (now - limit,)).fetchone() and not any(reviewers(t, now) for t in board_tasks(unasked)):
         return
-    with transaction() as con:
-        for owner, seen in con.execute(stale, (now - limit,)).fetchall():  # again, now that nobody else writes
+    with transaction() as con:  # again, now that nobody else writes
+        for agent, seen in con.execute(stale, (now - limit,)).fetchall():
             gone = ago(now - seen) if seen else "a long time"
-            release(con, owner, f"{owner} sent no sign of life for {gone}", f"Agon saw no sign of you for {gone}", now)
+            release(con, agent, f"{agent} sent no sign of life for {gone}", f"Agon saw no sign of you for {gone}", now)
+        for t in board_tasks(unasked):
+            if reviewer := next(iter(reviewers(t, now)), None):
+                con.execute("UPDATE tasks SET reviewer = ? WHERE id = ?", (reviewer, t["id"]))
+                post("agon", reviewer, f"Task #{t['id']} by {t['owner']} is ready for your review"
+                                       f" ({t['tests'] or NO_TESTS}): {t['title']}. Check it, then call board: action"
+                                       f" review, id {t['id']}, verdict approve or changes, and your evidence.")
 
 
 def taken_note(me):
@@ -1530,7 +1566,7 @@ def taken_note(me):
         items.append(f"#{t['id']} {t['title']} ({why[t['id']]}): {now}{files}")
     note = ("While you were away, Agon gave tasks you had back to the board: " + "; ".join(items) + ". Don't edit"
             " their files unless you claim the task again: board list shows the board.") if items else ""
-    return note, (rows[-1][0] if rows else 0)
+    return clip(note, 4000), (rows[-1][0] if rows else 0)  # Codex shows a model ~2,500 tokens of a hook's context
 
 
 def told(me, upto):
@@ -1569,11 +1605,11 @@ def board_done(session, args):
     with transaction() as con:
         t = board_task(tid)
         owned(t, me)  # it may have gone back to the board while the tests ran
-        online = reviewers(me, now)  # after changes, the one who asked for them looks again
+        online = reviewers(t, now)  # after changes, the one who asked for them looks again
         reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
         con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?"
                     " WHERE id = ?", (reviewer, note, outcome, report, now, tid))
-        said = f"\n{me}'s note: {clip(note, 1000)}" if note.strip() else ""
+        said = f"\n{me}'s note:\n{indented(clip(note.strip(), 1000))}" if note.strip() else ""
         if reviewer:
             post(me, reviewer, f"Task #{tid} is ready for your review ({outcome}): {t['title']}.{said}\nCheck it, then"
                                f" call board: action review, id {tid}, verdict approve or changes, and your evidence.")
@@ -1589,7 +1625,7 @@ def board_done(session, args):
                                   " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
             then = "No agent from another company is online to review it: the human is told."
     if not reviewer and auto:  # after the commit: the review reads the task as done left it
-        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report))).start()
+        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report), now)).start()
     return f"Task #{tid} is in review ({outcome}). {then}\n\n{report}", None
 
 
@@ -1620,7 +1656,7 @@ def settle(t, reviewer, verdict, evidence, sender, by):
     tasks it frees (else only its owner hears); changes send it back to its owner, or to the board when the owner is
     away. `sender` posts the message, which quotes the `evidence` as `by`'s. Returns what the reviewer is told."""
     con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
-    said = f"\n{by}: {clip(evidence.strip(), 1500)}"
+    said = f"\n{by}:\n{indented(clip(evidence.strip(), 1500))}"
     if verdict == "approve":
         con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ? WHERE id = ?",
                     (reviewer, evidence, now, tid))
@@ -1648,11 +1684,13 @@ def settle(t, reviewer, verdict, evidence, sender, by):
     return f"Task #{tid}: changes ({tests}). It goes back to {owner}."
 
 
-def auto_review(session, tid, owner, cwd, tested):
+def auto_review(session, tid, owner, cwd, tested, since):
     """With AGON_AUTO_REVIEW=1 and no agent from another company online, Agon asks one for the review itself: it runs
-    that company's app headless through ask (AGON_FALLBACK's order, the next one when one is out of quota), on the
-    user's plan, with the tests Agon ran at done. It runs in a thread of its own, after done has answered, and stops,
-    with the app, on STOP or when the app that called done goes; the verdict goes to the owner as a message."""
+    that company's app headless through ask (AGON_FALLBACK's order, the next one when one is out of quota; a company
+    that had the task before comes last), on the user's plan, with the tests Agon ran at done. It runs in a thread of
+    its own, after done has answered, and stops, with the app, on STOP or when the app that called done goes; the
+    verdict goes to the owner as a message. It counts only while the task is as done left it at `since`: after
+    another agent's verdict and a new done, it would judge work it never saw."""
     def halt():  # why the app must stop now, if it must
         if session.closed:
             return "the app that called done is gone"
@@ -1665,7 +1703,8 @@ def auto_review(session, tid, owner, cwd, tested):
         prompt = (f"Review task #{tid} of the team's board: {t['title']}\nFiles: {', '.join(t['files']) or 'any'}\n"
                   f"What was asked:\n{indented(clip(t['spec'], 3000)) or '    (no spec)'}\n{owner}'s note:\n"
                   f"{indented(clip(t['note'], 3000)) or '    (none)'}\nThe work is in the project folder as it is now.")
-        for name in fallbacks(vendor(owner), owner):  # the apps of the other companies
+        before = had_it(tid)
+        for name in sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before):  # the other companies
             if until := quota_until(name):
                 skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
                 continue
@@ -1676,7 +1715,7 @@ def auto_review(session, tid, owner, cwd, tested):
                 skipped.append(str(e).rstrip("."))
                 continue
             if limit:
-                out_of_quota(name, limit)  # marked until it resets, and the team is told
+                out_of_quota(name, limit, own=False)  # marked until it resets, and the team is told
                 skipped.append(f"{name} hit its usage limit")
                 continue
             break
@@ -1689,10 +1728,10 @@ def auto_review(session, tid, owner, cwd, tested):
         by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
         with transaction():
             t = board_task(tid)
-            if t["state"] != "review" or t["owner"] != owner or not found:
+            if (t["state"], t["owner"], t["updated"]) != ("review", owner, since) or not found:
                 why = "gave no verdict" if not found else "came after the task had moved on"
                 return post("agon", owner, f"{name}'s automatic review of task #{tid} {why}:\n"
-                                           f"{clip(answer.strip(), 3000)}")
+                                           f"{indented(clip(answer.strip(), 3000))}")
             settle(t, name, found, answer, "agon", by)
     except Exception as e:  # a bad setting, agon.db locked...: the human hears of it, the task still waits
         post("agon", "human", f"Agon's automatic review of task #{tid} failed: {e}")
@@ -1703,7 +1742,7 @@ def auto_review(session, tid, owner, cwd, tested):
 def tool_board(session, args):
     action = args.get("action")
     handlers = {"list": board_list, "add": board_add, "claim": board_claim, "done": board_done, "review": board_review}
-    if action not in handlers:
+    if not isinstance(action, str) or action not in handlers:
         raise ToolError("`action` must be list, add, claim, done or review.")
     try:
         reap()  # claims whose owners sent no sign of life for AGON_LEASE seconds go back to the board first
@@ -1782,6 +1821,11 @@ def call_tool(session, params):
     args = {} if args is None else args
     if not isinstance(args, dict):
         raise RpcError(-32602, "Invalid params: `arguments` must be an object")
+    try:  # its model called a tool, so it isn't out of quota (any more): it may review, and it is asked again
+        db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = ? AND out_of_quota_until IS NOT NULL",
+                     (session.me,))
+    except sqlite3.Error:
+        pass  # best effort, as for presence
     try:
         text, after = tool(session, args)
         return {"content": [{"type": "text", "text": text}]}, after
@@ -1958,10 +2002,12 @@ def limit_patterns():
 
 def shows_limit(texts):
     """`texts` joined if one of them shows a usage limit (limit_patterns()), else None. Claude Code's "Server is
-    temporarily limiting requests (not your usage limit)" is a short throttle: its StopFailure error is rate_limit too."""
+    temporarily limiting requests (not your usage limit)" is a short throttle: its StopFailure error is rate_limit too,
+    so with such a line, the lines that say so and a bare rate_limit don't count; a real limit elsewhere still does."""
     texts = [text for text in texts if isinstance(text, str) and text]
     if any("not your usage limit" in text.lower() for text in texts):
-        return None
+        texts = [kept for text in texts if text.strip() != "rate_limit"
+                 if (kept := re.sub(r"(?im)^.*not your usage limit.*$\n?", "", text)).strip()]
     if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
         return "\n".join(texts)
 
@@ -1982,8 +2028,9 @@ CLOCK = re.compile(  # "resets 3pm", "at 3:57 PM", "at Sep 25th, 2026 7:40 PM", 
     r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
 
 
-WEEKDAY = re.compile(r"\b(?:at|resets?|until|on)\s+(?P<wd>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+(?:at\s+)?"
-                     r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)  # "resets Mon 12:00am"
+WEEKDAY = re.compile(  # "resets Mon 12:00am"
+    r"\b(?:at|resets?|until|on)\s+(?P<wd>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+(?:at\s+)?"
+    r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
 DAYS = "mon tue wed thu fri sat sun".split()
 
 
@@ -1995,22 +2042,19 @@ def reset_time(text, now):
         return float(m[1])
     if m := re.search(rf"\b(?:in|after)\s+((?:{DURATION}[\s,]*(?:and\s+)?)+)", text, re.I):
         return now + sum(int(n) * UNITS[unit[0].lower()] for n, unit in re.findall(DURATION, m[1], re.I))
-    for m in WEEKDAY.finditer(text):  # the next such day and time: Claude Code's weekly limit
-        if not (m["min"] or m["ap"]) or int(m["h"]) > (12 if m["ap"] else 23) or int(m["min"] or 0) > 59:
-            continue
-        hour = int(m["h"]) % 12 + (12 if m["ap"] and m["ap"][0] in "pP" else 0) if m["ap"] else int(m["h"])
-        base = datetime.datetime.fromtimestamp(now)
-        day = base + datetime.timedelta(days=(DAYS.index(m["wd"][:3].lower()) - base.weekday()) % 7)
-        when = day.replace(hour=hour, minute=int(m["min"] or 0), second=0, microsecond=0)
-        return (when if when.timestamp() > now else when + datetime.timedelta(days=7)).timestamp()
-    for m in CLOCK.finditer(text):
-        if not (m["min"] or m["ap"]):
-            continue  # a bare number isn't a time
+    # the first time the text names: "resets 3:45pm (weekly resets Mon 12:00am)" is at 3:45pm
+    for m in sorted([*WEEKDAY.finditer(text), *CLOCK.finditer(text)], key=lambda m: m.start()):
+        if not (m["min"] or m["ap"]) or int(m["h"]) > (12 if m["ap"] else 23):
+            continue  # a bare number isn't a time, nor is 13pm
         hour, minute = int(m["h"]), int(m["min"] or 0)
         if m["ap"]:
             hour = hour % 12 + (12 if m["ap"][0] in "pP" else 0)
         base = datetime.datetime.fromtimestamp(now)
         try:
+            if m.re is WEEKDAY:  # the next such day and time: Claude Code's weekly limit
+                day = base + datetime.timedelta(days=(DAYS.index(m["wd"][:3].lower()) - base.weekday()) % 7)
+                when = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                return (when if when.timestamp() > now else when + datetime.timedelta(days=7)).timestamp()
             if m["mon"]:
                 if m["mon"][:3].lower() not in MONTHS:
                     continue
@@ -2039,9 +2083,12 @@ def quota_until(name):
     return row[0] if row and row[0] and row[0] > time.time() else None
 
 
-def out_of_quota(me, text):
-    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say), tell the team once
-    per limit, and put the agent's tasks in progress back on the board: the others go on with them (no downtime)."""
+def out_of_quota(me, text, own=True):
+    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say), or until it calls
+    a tool, and tell the team once per limit. When the limit ended the agent's `own` turn (its hook said so), put its
+    tasks in progress back on the board: the others go on with them (no downtime). A limit that an ask ran into on its
+    plan leaves them: the agent may be in the middle of one, on another model's limit; if it is stuck, its lease runs
+    out (see reap())."""
     now = time.time()
     until = reset_time(text, now)
     resets = f"resets ~{reset_clock(until, now)}" if until else "reset time unknown"
@@ -2051,7 +2098,8 @@ def out_of_quota(me, text):
                     " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
         if not (row and row[0] and row[0] > now):  # not already known
             post("agon", "all", f"{me} hit its usage limit" + (f", {resets}." if until else "; reset time unknown."))
-        release(con, me, f"{me} hit its usage limit, {resets}", f"you hit your usage limit, {resets}", now)
+        if own:
+            release(con, me, f"{me} hit its usage limit, {resets}", f"you hit your usage limit, {resets}", now)
 
 
 def max_autoruns():
