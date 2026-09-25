@@ -9,7 +9,7 @@
     {
       "name": "agon",
       "source": "./",
-      "description": "Shared team chat (MCP server), second opinions from another company's agent, and a Stop hook that wakes the agent with new messages."
+      "description": "Shared team chat and task board (MCP server), second opinions from another company's agent, and hooks that wake the agent with new messages."
     }
   ]
 }

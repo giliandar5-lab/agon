@@ -32,7 +32,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.3.1"  # also in the plugin manifests
+VERSION = "0.4.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -119,16 +119,24 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows: the apps and 
 # Every process Agon starts gets its own stdin (DEVNULL at least). On Windows, a child that inherited the MCP server's
 # stdin blocks as soon as it touches it, while the server's main thread waits there for the client's next message
 
-INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
-(claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
-- inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
-- Loop: inbox -> do your part -> send a short report -> inbox again.
-- When inbox says the team is paused (the human said STOP), stop working and end your turn.
-- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon">
-  event only says that messages wait: call inbox to read them.
-- Announce a file before editing it, so two agents never edit the same file at once.
-- Keep messages short and concrete; put long content in a file and send its path.
-- ask gets a second opinion from another agent's app, which takes minutes: a review (read-only: Agon runs the
+# What every agent reads when it connects: the essentials first. Claude Code cuts it at 2,048 characters, and with MCP
+# tool search (its default) it is all Claude sees of Agon at the start; Codex asks for the first 512 to stand alone
+INSTRUCTIONS = """You are "{me}" in Agon: AI agents from rival companies (claude = Claude Code, gpt = Codex,
+gemini = Antigravity) and a human build ONE project, in a shared chat and on a task board.
+- Work from the board: claim a task before you edit its files, and edit only those. Call board done when you
+  finish: an agent from another company reviews it. Review others' tasks on evidence: Agon's test run, the
+  code you read, what you checked.
+- inbox gets your messages, send replies (to all, claude, gemini, gpt or human). Loop: inbox -> your task ->
+  a short report -> inbox. When inbox says the team is paused (the human said STOP), stop and end your turn.
+Team rules:
+- One lead (the human's pick, else whoever plans first) splits the work into board tasks along context
+  boundaries: each is a part one agent can finish without the others' context, with the files it edits and
+  the tasks it waits for (after).
+- One writer per file: never edit the files of a task you don't have.
+- Don't send or answer acknowledgments ("ok", "thanks"). Keep messages short; put long content in a file.
+- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon"> event
+  only says that messages wait: call inbox to read them.
+- ask gets a second opinion from another company's app, headless (minutes): a read-only review (Agon runs the
   tests, and the VERDICT says whether they passed) or a task done on a new git branch that you may merge."""
 ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
 off here and team messages don't come to you."""
@@ -1214,6 +1222,8 @@ def board_path(raw):
     if not isinstance(raw, str) or not raw.strip():
         raise ToolError("`files` must be a list of paths in the project, such as src/app.py or tests/.")
     path = unicodedata.normalize("NFC", raw.strip()).replace("\\", "/")  # macOS may spell é as e and an accent
+    if any(c != " " and (c.isspace() or not c.isprintable()) for c in path):  # a line break could fake a board line
+        raise ToolError(f"{raw!r} has a line break or another control character.")
     if set(path) & set("*?[]"):
         raise ToolError(f"{raw} is a pattern: name a folder instead (tests/ covers everything in it).")
     if path.startswith(("/", "~")) or re.match(r"[A-Za-z]:", path):
@@ -2317,6 +2327,14 @@ def setup(out=None):
     else:
         say(f"  export AGON_TEST_CMD={shlex.quote(example)}")
     say("Or keep it in the Claude Code plugin: /plugin configure agon@agon, Test command.")
+
+    # the board: how long a claim lasts, and the automatic review, which only the human turns on
+    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    say("", "== Board: the team's tasks. board done runs the test command above, unasked (board is a local tool)",
+        f"A claim lasts AGON_LEASE seconds ({LEASE}) after its owner's last sign of life; then the task goes back to"
+        " the board.", "AGON_AUTO_REVIEW=1: when no agent from another company is online, Agon runs another company's"
+        " app to review a finished task, headless, sending it your code and spending your plan there.",
+        f"Now: AGON_AUTO_REVIEW is {'on' if auto else 'off (the default)'}.")
 
 
 class Args(argparse.ArgumentParser):

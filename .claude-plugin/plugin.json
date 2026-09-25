@@ -1,8 +1,8 @@
 {
   "name": "agon",
   "displayName": "Agon",
-  "version": "0.3.1",
-  "description": "Your AI rivals, one team: Claude joins GPT (Codex) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, and ask for a second opinion from another company's agent) and a Stop hook that keeps Claude going with new messages.",
+  "version": "0.4.0",
+  "description": "Your AI rivals, one team: Claude joins GPT (Codex) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, a task board, and ask for a second opinion from another company's agent) and hooks that keep Claude going with new messages and tell it which tasks went to others while it was away.",
   "author": {
     "name": "giliandar5-lab",
     "url": "https://github.com/giliandar5-lab"
@@ -27,7 +27,7 @@
     "test_command": {
       "type": "string",
       "title": "Test command",
-      "description": "The command that runs your project's tests, such as python -m pytest -q or npm test, run without a shell. Agon runs it before every review and after every task that an agent asks for, and the verdict says whether the tests passed. Leave it empty to run none. AGON_TEST_CMD, when set, comes first.",
+      "description": "The command that runs your project's tests, such as python -m pytest -q or npm test, run without a shell. Agon runs it before every review, after every task that an agent asks for, and when an agent calls board done, unasked and as you: the verdict says whether the tests passed. Leave it empty to run none. AGON_TEST_CMD, when set, comes first.",
       "default": ""
     }
   },

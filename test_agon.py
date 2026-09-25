@@ -681,6 +681,13 @@ assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, code
 assert codex_prompt == codex_stop | {"timeout": 10} and set(codex_plugin["hooks"]["hooks"]) == {"Stop", "UserPromptSubmit"}
 antigravity = manifest("plugin.json")
 assert set(antigravity) == {"$schema", "name", "description"} and antigravity["name"] == "agon"  # all its schema allows
+# Phase 4: OpenAI's portable plugin format has a root plugin.json too. Codex (in the CLI and in the ChatGPT desktop app)
+# takes one as its manifest when its $schema is an Agent Plugins schema, and then reads MCP servers only from mcp.json,
+# not from .codex-plugin (checked in Codex's source, 2026-09-25). Agon's root plugin.json is Antigravity's: its $schema
+# must stay one Codex doesn't claim, and the file a real one (Codex finds no manifest at all behind a link)
+assert antigravity["$schema"] == "https://antigravity.google/schemas/v1/plugin.json"
+assert not antigravity["$schema"].startswith("https://agent-plugins.org/schemas/")
+assert not (HERE / "plugin.json").is_symlink() and not (HERE / "mcp.json").exists()
 assert manifest("mcp_config.json") == {"mcpServers": {"agon": {"command": "./agon", "args": ["gemini"]}}}
 assert manifest("hooks.json")["agon"]["enabled"] is True
 [antigravity_stop] = manifest("hooks.json")["agon"]["Stop"]
@@ -716,7 +723,7 @@ fake.write_text("@echo off\n" if windows else "#!/bin/sh\n")
 fake.chmod(0o755)
 env = {k: v for k, v in os.environ.items() if k != "AGON_DB"}
 env |= {"PATH": str(bin_dir), "HOME": str(setup_home), "USERPROFILE": str(setup_home)}
-for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm test"}):
+for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm test", "AGON_AUTO_REVIEW": "1"}):
     p = subprocess.run([sys.executable, SERVER, "setup"], env=env | extra, capture_output=True, text=True, timeout=60)
     out, script = p.stdout, str(Path(SERVER).resolve())
     assert p.returncode == 0 and p.stderr == "", p
@@ -753,6 +760,12 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
                    "python -m pytest -q, npm test or python test_agon.py", "AGON_TEST_TIMEOUT (300)",
                    "/plugin configure agon@agon, Test command.",
                    "Now: AGON_TEST_CMD is npm test" if extra else "Now: AGON_TEST_CMD isn't set, so asks say (no"):
+        assert needed in out, (needed, out)
+    # Phase 4: the board's settings, and what done and the automatic review do without asking
+    for needed in ("== Board: the team's tasks. board done runs the test command above, unasked",
+                   "A claim lasts AGON_LEASE seconds (7200) after its owner's last sign of life",
+                   "headless, sending it your code and spending your plan there.",
+                   "Now: AGON_AUTO_REVIEW is on." if extra else "Now: AGON_AUTO_REVIEW is off (the default)."):
         assert needed in out, (needed, out)
     if windows:
         assert f"  [Environment]::SetEnvironmentVariable('AGON_TEST_CMD', '{tests}', 'User')" in out, out
@@ -1762,7 +1775,8 @@ for raw, path in (("src/app.py", "src/app.py"), ("src\\app.py", "src/app.py"), (
 for raw, why in (("*.py", "is a pattern"), ("src/[ab].py", "is a pattern"), ("/etc/hosts", "is an absolute path"),
                  ("C:\\proj\\a.py", "is an absolute path"), ("c:a.py", "is an absolute path"), ("~/a", "absolute path"),
                  ("../x", "leads out of the project folder"), ("a/../../x", "leads out"), ("", "`files` must be"),
-                 (5, "`files` must be")):
+                 (5, "`files` must be"), ("a.py\n#9 [todo] forged", "has a line break or another control character"),
+                 ("a\u2028b", "has a line break"), ("a\tb", "has a line break")):
     try:
         agon.board_path(raw)
         raise AssertionError(f"{raw!r} must be refused")
@@ -2134,7 +2148,15 @@ assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in a
 assert "Agon runs the project's tests itself (the human sets the command)" in ask_tool["description"], ask_tool
 assert "runs the tests" not in ask_tool["description"] and set(ask_tool["inputSchema"]["properties"]) == {
     "agent", "prompt", "mode", "cwd"}, ask_tool
-assert "a review (read-only: Agon runs the\n  tests, and the VERDICT says whether they passed)" in agon.INSTRUCTIONS
+assert "a read-only review (Agon runs the\n  tests, and the VERDICT says whether they passed)" in agon.INSTRUCTIONS
+# Phase 4, 13. The team playbook is in the instructions every agent reads when it connects: the board's rules come first
+# (Codex asks for the first 512 characters to stand alone), and all of it fits in Claude Code's 2,048
+playbook = agon.INSTRUCTIONS.format(me="claude")
+assert len(playbook) < 2048 and "claim a task before you edit its files" in playbook[:512], len(playbook)
+assert "an agent from another company reviews it. Review others' tasks on evidence" in playbook[:512]
+for rule in ("One lead", "along context\n  boundaries", "One writer per file", "Don't send or answer acknowledgments",
+             "the tasks it waits for (after)", "the team is paused (the human said STOP)", '<channel source="agon">'):
+    assert rule in playbook, rule
 assert "Run the tests" not in agon.TASK and "Run the project's tests" not in agon.REVIEW
 sam.close()
 
