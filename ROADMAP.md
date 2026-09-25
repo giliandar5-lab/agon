@@ -37,8 +37,8 @@ When asked to do "the next phase":
 3. Research before you plan. Find the phase's open questions: how comparable tools solve the same problem, the
    current docs of every CLI, hook and manifest it relies on, and what can go wrong on Windows. Research them with
    `/deep-research` (if you can't start it yourself, give the user the exact `/deep-research …` line to send as a
-   message of its own, and wait for its report), and give the strongest argument against each key decision. Where the findings contradict this roadmap, say so and
-   let the user decide.
+   message of its own, and wait for its report), and give the strongest argument against each key decision.
+   Where the findings contradict this roadmap, say so and let the user decide.
 4. Turn every bullet of the phase into a numbered checklist. Show the research's findings, the checklist and a short
    plan to the user and wait for approval.
 5. Work item by item: implement, add assert-based checks to test_agon.py, run `python test_agon.py`, commit.
