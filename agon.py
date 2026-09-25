@@ -1,14 +1,17 @@
 """Agon: a shared chat where AI agents from different apps build one project together.
 
 python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
-python agon.py hook <name>   Stop hook that wakes the agent with its new messages (--help for options)
+python agon.py hook <name>   the agent's hook: Stop wakes it with new messages, UserPromptSubmit tells a returning
+                             agent which of its tasks went to others (--help for options)
 python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
+import contextlib
 import datetime
 import json
 import os
+import posixpath
 import queue
 import re
 import shlex
@@ -21,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -58,9 +62,18 @@ TEST_TIMEOUT = 300  # seconds the tests may run (AGON_TEST_TIMEOUT), within the 
 TEST_TAIL = 3000  # characters of their output that the reviewer and the asker get: the end, where failures are
 TEST_READ = 1 << 16  # bytes of that output Agon reads, from its end: plenty for the tail in any encoding
 NO_TESTS = "no tests run: set AGON_TEST_CMD"  # what came of the tests: this, or tests passed, failed, timed out...
+# The task board (Phase 4). A claim lasts while its owner shows signs of life: every Agon request and hook run renews it.
+# A turn that never calls Agon can run past an hour, and taking a task away mid-work causes the overwrites the board
+# exists to prevent, so a claim lasts AGON_LEASE seconds (2 hours) after the owner's last sign
+LEASE = 7200
+ONLINE = 900  # an agent seen by Agon this many seconds ago counts as online: it can be asked for a review
+MAX_TITLE = 200  # characters in a task's title
+MAX_FILES = 50  # files and folders one task may name
+CLIENTS = {"claude-code": "claude", "codex-mcp-client": "gpt", "antigravity-client": "gemini"}  # vendor by app
 # The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
 ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
-            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS", "AGON_TEST_CMD", "AGON_TEST_TIMEOUT"]
+            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS", "AGON_TEST_CMD", "AGON_TEST_TIMEOUT", "AGON_LEASE",
+            "AGON_AUTO_REVIEW"]
 # How ask runs each agent's app headless, on the user's own plan. AGON_CMD_CLAUDE, AGON_CMD_GPT and AGON_CMD_GEMINI
 # replace a command (a JSON list or a command line): {prompt} marks where the prompt goes (otherwise it goes on stdin)
 # and {cwd} the folder the run works in. Checked with claude 2.1.281, codex 0.156.1 and agy 1.2.10
@@ -120,7 +133,8 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
 ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
 off here and team messages don't come to you."""
 
-# Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
+# send and inbox only add to the local chat (inbox moves a cursor forward), and board only changes the board in agon.db:
+# Codex runs such tools without asking. So board's done runs the human's test command unasked (see board_done())
 LOCAL = {"destructiveHint": False, "openWorldHint": False}
 TOOLS = [
     {
@@ -139,23 +153,44 @@ TOOLS = [
     },
     {
         "name": "inbox",
-        "description": "Get your new Agon messages. Waits up to `wait` seconds (max 55) for one to arrive."
-        " A new session starts with a recap of earlier messages; a long backlog comes in parts;"
-        " says when the human has paused the team.",
-        "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
+        "description": "Your new Agon messages; waits up to `wait` s (max 55) for one. A new session starts with a"
+        " recap; a long backlog comes in parts; says if the human paused the team.",
+        "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer"}}},
+        "annotations": LOCAL,
+    },
+    {
+        "name": "board",
+        "description": "Task board: list; add (after: ids it waits for); claim a task before editing its files; done:"
+        " Agon runs the human's tests as the user, outside your sandbox, unasked; another company's agent reviews"
+        " (AGON_AUTO_REVIEW: headless, on the user's plan); review: approve or changes, with evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "add", "claim", "done", "review"]},
+                "id": {"type": "integer"},
+                "title": {"type": "string"},
+                "spec": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "after": {"type": "array", "items": {"type": "integer"}},
+                "note": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["approve", "changes"]},
+                "evidence": {"type": "string"},
+                "cwd": {"type": "string"},
+            },
+            "required": ["action"],
+        },
         "annotations": LOCAL,
     },
     {
         "name": "ask",
-        "description": "Get a second opinion from another agent's app (claude, gpt or gemini), run headless on the"
-        " user's plan; it takes minutes. Agon runs the project's tests itself (the human sets the command) and says"
-        " whether they passed. review: read-only, ends with VERDICT: approve or changes. task: works on a new git"
-        " branch from your last commit and returns its summary, diff stat and branch; merging it is your call.",
+        "description": "A second opinion from another company's agent, run headless on the user's plan; takes minutes."
+        " Agon runs the project's tests itself (the human sets the command). review: read-only, ends with VERDICT:"
+        " approve or changes. task: on a new git branch you may merge.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "claude, gpt or gemini (not yourself)"},
-                "prompt": {"type": "string", "description": "what to review or do (at most 8,000 characters)"},
+                "prompt": {"type": "string", "description": "what to review or do"},
                 "mode": {"type": "string", "enum": ["review", "task"], "default": "review"},
                 "cwd": {"type": "string", "description": "your project folder (absolute path)"},
             },
@@ -176,6 +211,15 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     # any message from the human gives every agent its automatic turns back (see out_of_turns())
     "CREATE TRIGGER human_resets_autoruns AFTER INSERT ON msgs WHEN NEW.sender = 'human'"
     " BEGIN UPDATE agents SET autoruns = 0; END",
+    # Phase 4, the task board: files and after are JSON lists (the board's paths, task ids); times are Unix seconds.
+    # tests is what came of the tests Agon ran at done, and report is their report
+    "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, spec TEXT NOT NULL DEFAULT '',"
+    " files TEXT NOT NULL DEFAULT '[]', after TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'todo',"
+    " author TEXT NOT NULL, owner TEXT, reviewer TEXT, note TEXT NOT NULL DEFAULT '', tests TEXT, report TEXT,"
+    " created REAL NOT NULL, updated REAL NOT NULL)",
+    # the tasks Agon took from an agent (a usage limit, or no sign of it for AGON_LEASE s): the agent hears which, once
+    "CREATE TABLE releases(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, agent TEXT NOT NULL, why TEXT NOT NULL,"
+    " told INTEGER NOT NULL DEFAULT 0)",
 ]
 _local = threading.local()
 
@@ -185,8 +229,11 @@ def db():
     con = getattr(_local, "con", None)
     if con is None:
         Path(DB).parent.mkdir(parents=True, exist_ok=True)
-        # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
-        con = sqlite3.connect(DB, timeout=5, isolation_level=None)
+        # timeout=5 is busy_timeout=5000. SQLite's own autocommit mode: every statement commits on its own, and BEGIN
+        # IMMEDIATE starts a transaction. Python 3.12+ gets autocommit=True, since its default is to change to a
+        # transaction that is always open, and then BEGIN IMMEDIATE would fail
+        mode = {"autocommit": True} if sys.version_info >= (3, 12) else {"isolation_level": None}
+        con = sqlite3.connect(DB, timeout=5, **mode)
         try:
             for tries in range(50):  # WAL: readers and the writer don't block each other
                 try:
@@ -216,6 +263,22 @@ def migrate(con):
             con.execute(step)
         if done < len(SCHEMA):  # a newer agon may have gone further: never lower the version
             con.execute(f"PRAGMA user_version = {len(SCHEMA)}")
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:  # SQLite may have rolled back already
+            con.execute("ROLLBACK")
+        raise
+
+
+@contextlib.contextmanager
+def transaction():
+    """A write transaction on this thread's connection: BEGIN IMMEDIATE takes SQLite's one write lock at once (waiting
+    up to the busy timeout for another writer), so what it reads can't change before it writes. Commits at the end,
+    rolls back on any exception."""
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
         con.execute("COMMIT")
     except BaseException:
         if con.in_transaction:  # SQLite may have rolled back already
@@ -1123,7 +1186,197 @@ def tool_ask(session, args):
     return f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n{summary}", None
 
 
-TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
+# The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
+# an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
+BOARD_SQL = "SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report FROM tasks"
+FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
+
+
+def board_path(raw):
+    """One file or folder of a task, as the board keeps it: relative to the project folder, with / between names (and
+    after a folder named with one), "." for the whole project. A pattern, an absolute path or a path out of the project
+    is a ToolError."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("`files` must be a list of paths in the project, such as src/app.py or tests/.")
+    path = unicodedata.normalize("NFC", raw.strip()).replace("\\", "/")  # macOS may spell é as e and an accent
+    if set(path) & set("*?[]"):
+        raise ToolError(f"{raw} is a pattern: name a folder instead (tests/ covers everything in it).")
+    if path.startswith(("/", "~")) or re.match(r"[A-Za-z]:", path):
+        raise ToolError(f"{raw} is an absolute path: name files relative to the project folder, such as src/app.py.")
+    folder = path.endswith("/")
+    path = posixpath.normpath(path)
+    if path == ".." or path.startswith("../"):
+        raise ToolError(f"{raw} leads out of the project folder.")
+    return path + "/" if folder and path != "." else path
+
+
+def board_files(value):
+    """The `files` of a new task, checked and made the board's paths (see board_path()), each once."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ToolError("`files` must be a list of paths in the project, such as [\"src/app.py\", \"tests/\"].")
+    paths = {}
+    for raw in value:
+        path = board_path(raw)
+        paths.setdefault(path.casefold().rstrip("/"), path)
+    if len(paths) > MAX_FILES:
+        raise ToolError(f"a task names at most {MAX_FILES} files and folders: name the folders that hold them.")
+    return list(paths.values())
+
+
+def overlap(a, b):
+    """Whether board paths a and b cover a common file: the same path, a folder and what's in it, or "." (the whole
+    project). Letter case never counts, as on Windows and macOS: a project with both App.py and app.py is rare."""
+    a, b = a.casefold().rstrip("/"), b.casefold().rstrip("/")
+    return "." in (a, b) or a == b or b.startswith(a + "/") or a.startswith(b + "/")
+
+
+def task_ids(value, what):
+    """A list of task ids from a tool argument (numbers, or numbers as strings), each once."""
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else None
+    if items is None or any(isinstance(i, bool) or not (isinstance(i, int) or isinstance(i, str) and i.strip().isdigit())
+                            for i in items):
+        raise ToolError(f"`{what}` must be a list of task numbers, such as [1, 3].")
+    return list(dict.fromkeys(int(i) for i in items))
+
+
+def task_id(value):
+    """The task number in a tool argument `id`."""
+    if isinstance(value, bool) or not (isinstance(value, int) or isinstance(value, str) and value.strip().isdigit()):
+        raise ToolError("`id` must be the number of a task on the board (board list shows them).")
+    return int(value)
+
+
+def board_tasks(where="", params=()):
+    """The tasks on the board (`where` narrows them down), oldest first, as dicts with files and after as lists."""
+    cur = db().execute(f"{BOARD_SQL} {where} ORDER BY id", params)
+    names = [column[0] for column in cur.description]
+    found = [dict(zip(names, row)) for row in cur]
+    for t in found:
+        t["files"], t["after"] = json.loads(t["files"]), json.loads(t["after"])
+    return found
+
+
+def board_task(tid):
+    """Task `tid` from board_tasks(), or a ToolError when there is none."""
+    found = board_tasks("WHERE id = ?", (tid,))
+    if not found:
+        raise ToolError(f"there is no task #{tid} (board list shows the tasks).")
+    return found[0]
+
+
+def hashes(ids):
+    return ", ".join(f"#{i}" for i in ids)
+
+
+def indented(text):
+    """An agent's text, such as a spec or a note, with every line indented: data that can't pass for Agon's words."""
+    return "\n".join("    " + row for row in str(text).splitlines())
+
+
+def status(t):
+    """A task's state as the board shows it: todo, doing: gpt, review: gpt, asked claude, done: gpt, approved by..."""
+    state, owner, reviewer = t["state"], t["owner"], t["reviewer"]
+    if state == "doing":
+        return f"doing: {owner}"
+    if state == "review":
+        return f"review: {owner}" + (f", asked {reviewer}" if reviewer else "")
+    if state == "done":
+        return f"done: {owner}" + (f", approved by {reviewer}" if reviewer else "")
+    return "todo"
+
+
+def task_line(t, states):
+    """One task on one line: `#3 [doing: gpt] Build the menu | files: menu.py, ui | after: #1 done`."""
+    parts = [f"#{t['id']} [{status(t)}] {t['title']}"]
+    if t["files"]:
+        parts.append("files: " + ", ".join(t["files"]))
+    if t["after"]:
+        parts.append("after: " + ", ".join(f"#{i} {states.get(i, 'gone')}" for i in t["after"]))
+    return " | ".join(parts)
+
+
+def board_list(session, args):
+    """The board: its open tasks and the latest done ones, or with `id`, one task in full."""
+    everything = board_tasks()
+    states = {t["id"]: t["state"] for t in everything}
+    if args.get("id") is not None:
+        t = board_task(task_id(args.get("id")))
+        lines = [f"#{t['id']} {t['title']}", f"State: {status(t)}. Added by {t['author']}."]
+        if t["files"]:
+            lines.append("Files: " + ", ".join(t["files"]))
+        if t["after"]:
+            lines.append("After: " + ", ".join(f"#{i} {states.get(i, 'gone')}" for i in t["after"]))
+        for label, text in (("Spec", t["spec"]), ("Latest note", t["note"])):
+            if text.strip():
+                lines += [f"{label}:", indented(text)]
+        if t["tests"]:
+            lines += [f"Tests at done: {t['tests']}", t["report"] or ""]
+        return clip("\n".join(lines)), None
+    if not everything:
+        return ("The board is empty. Add tasks with board: action add, a title, a spec, the files each task edits and"
+                " the tasks it waits for (after)."), None
+    shown = [t for t in everything if t["state"] != "done"]
+    done = [t for t in everything if t["state"] == "done"]
+    counts = [(sum(t["state"] == state for t in everything), word) for state, word in
+              (("todo", "to do"), ("doing", "in progress"), ("review", "in review"), ("done", "done"))]
+    lines = [f"The board: {', '.join(f'{n} {word}' for n, word in counts if n)}."]
+    lines += [task_line(t, states) for t in shown + done[-5:]]
+    if len(done) > 5:
+        lines.append(f"({len(done) - 5} earlier tasks are done.)")
+    text = "\n".join(lines)
+    while len(text) > MAX_INBOX - 500 and len(lines) > 2:  # a huge board: the tasks it has room for
+        lines.pop(-2 if lines[-1].startswith("(") else -1)
+        text = "\n".join(lines) + "\n… more tasks: board list with an id shows any task."
+    return text, None
+
+
+def board_add(session, args):
+    """A new task on the board, by the session's agent; everyone hears of it once it can be claimed."""
+    me, title, spec = session.me, args.get("title"), args.get("spec") or ""
+    if not isinstance(title, str) or not title.strip():
+        raise ToolError("`title` must be a non-empty string.")
+    title = " ".join(title.split())  # one line: the board shows a task per line
+    if len(title) > MAX_TITLE:
+        raise ToolError(f"the title is {len(title)} characters; the limit is {MAX_TITLE}. Put the details in spec.")
+    if not isinstance(spec, str):
+        raise ToolError("`spec` must be a string.")
+    if problem := too_long(spec, "spec"):
+        raise ToolError(problem)
+    files, after = board_files(args.get("files")), task_ids(args.get("after"), "after")
+    with transaction() as con:
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        if missing := [i for i in after if i not in states]:
+            raise ToolError(f"there is no task {hashes(missing)} to wait for.")
+        now = time.time()
+        tid = con.execute("INSERT INTO tasks(title, spec, files, after, author, created, updated) VALUES"
+                          " (?, ?, ?, ?, ?, ?, ?)", (title, spec, json.dumps(files), json.dumps(after), me, now,
+                                                     now)).lastrowid
+        where = f" (files: {', '.join(files)})" if files else ""
+        if waiting := [i for i in after if states[i] != "done"]:  # nobody can take it yet: only the arena hears of it
+            post(me, "human", f"Added task #{tid}: {title}{where}; it waits for {hashes(waiting)}.")
+            return (f"Added task #{tid}. It can be claimed once {hashes(waiting)} {'is' if len(waiting) == 1 else 'are'}"
+                    " done (approved)."), None
+        post(me, "all", f"New task #{tid} on the board: {title}{where}. Claim it before you start on it.")
+    return f"Added task #{tid}. Anyone can claim it now.", None
+
+
+def tool_board(session, args):
+    action = args.get("action")
+    handlers = {"list": board_list, "add": board_add}
+    if action not in handlers:
+        raise ToolError("`action` must be list, add, claim, done or review.")
+    try:
+        return handlers[action](session, args)
+    except ToolError as e:  # what went wrong, after what didn't happen
+        text = str(e)
+        raise ToolError(f"{FAILED[action]}: {text}" if action in FAILED else text[:1].upper() + text[1:]) from None
+
+
+TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "board": tool_board, "ask": tool_ask}  # (text, what then)
 
 
 def handle(session, msg):

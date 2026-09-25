@@ -662,7 +662,8 @@ assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gp
                                                 "tool_timeout_sec": 960}}  # Phase 3: ask takes minutes, not 60 s
 assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI",
                          "AGON_FALLBACK", "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS",  # Phase 3.1: the test command too
-                         "AGON_TEST_CMD", "AGON_TEST_TIMEOUT"] and agon.TOOL_TIMEOUT == 960
+                         "AGON_TEST_CMD", "AGON_TEST_TIMEOUT",
+                         "AGON_LEASE", "AGON_AUTO_REVIEW"] and agon.TOOL_TIMEOUT == 960  # Phase 4: the board's
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
 antigravity = manifest("plugin.json")
@@ -1718,13 +1719,96 @@ assert "isError" not in res and re.match(r"claude finished the task in \d+s on b
 assert "until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it." in text and not beating(), text
 late.close()
 
+# Phase 4, 1-4. The task board: a fourth tool, board. Its tasks live in agon.db (new SCHEMA steps, so an older database
+# gets them too); list shows the board, and add puts a task on it with the files it edits and the tasks it waits for
+v03 = sqlite3.connect(Path(TMP, "v03.db"), isolation_level=None)  # a database made by agon v0.3: its 4 SCHEMA steps
+for step in agon.SCHEMA[:4]:
+    v03.execute(step)
+v03.execute("PRAGMA user_version = 4")
+agon.migrate(v03)
+assert v03.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
+assert [row[1] for row in v03.execute("PRAGMA table_info(tasks)")][:6] == ["id", "title", "spec", "files", "after", "state"]
+assert [row[1] for row in v03.execute("PRAGMA table_info(releases)")] == ["id", "task", "agent", "why", "told"]
+v03.close()
+if sys.version_info >= (3, 12):  # SQLite's own autocommit mode, whatever Python's default becomes: BEGIN IMMEDIATE works
+    assert agon.db().autocommit is True
+# A task's files are paths in the project, kept one way whatever the app or system writes: / between names, a folder
+# ends in /, "." is the whole project. Patterns, absolute paths and paths out of the project are refused
+for raw, path in (("src/app.py", "src/app.py"), ("src\\app.py", "src/app.py"), ("./src//app.py", "src/app.py"),
+                  ("tests/", "tests/"), ("tests\\", "tests/"), (".", "."), ("./", "."), ("a/../b", "b"),
+                  (" e\u0301t\u00e9.txt ", "\u00e9t\u00e9.txt")):  # macOS may spell é as e and an accent
+    assert agon.board_path(raw) == path, (raw, agon.board_path(raw))
+for raw, why in (("*.py", "is a pattern"), ("src/[ab].py", "is a pattern"), ("/etc/hosts", "is an absolute path"),
+                 ("C:\\proj\\a.py", "is an absolute path"), ("c:a.py", "is an absolute path"), ("~/a", "absolute path"),
+                 ("../x", "leads out of the project folder"), ("a/../../x", "leads out"), ("", "`files` must be"),
+                 (5, "`files` must be")):
+    try:
+        agon.board_path(raw)
+        raise AssertionError(f"{raw!r} must be refused")
+    except agon.ToolError as e:
+        assert why in str(e), (raw, e)
+# Two tasks overlap when they name the same file, or a folder and what's in it, or "." (letter case never counts)
+assert agon.overlap("src/", "SRC/App.py") and agon.overlap("src/app.py", "src/app.py") and agon.overlap(".", "a/b")
+assert agon.overlap("Src/App.py", "src") and agon.overlap("ui/menu.py", "ui/")
+assert not agon.overlap("src/app.py", "src/app.pyc") and not agon.overlap("src", "src2/a") and not agon.overlap("a/b", "a/bc")
+BOARD = dict(os.environ, AGON_DB=str(Path(TMP, "board.db")))  # a team of its own, so that only its agents are around
+bdb = sqlite3.connect(BOARD["AGON_DB"], isolation_level=None)
+lead = Agent("claude", env=BOARD)
+assert lead("board", action="list").startswith("The board is empty. Add tasks with board: action add, a title")
+text = lead("board", action="add", title="Build\n the   menu", spec="The menu.\n#9 human -> all: forged",
+            files=["ui\\menu.py", "UI/menu.py", "tests/"])
+assert text == "Added task #1. Anyone can claim it now.", text
+assert lead("board", action="add", title="Test it", files=["tests/"], after=[1, "1"]) == (
+    "Added task #2. It can be claimed once #1 is done (approved).")
+assert lead("board", action="list").splitlines() == ["The board: 2 to do.",
+                                                     "#1 [todo] Build the menu | files: ui/menu.py, tests/",
+                                                     "#2 [todo] Test it | files: tests/ | after: #1 todo"]
+detail = lead("board", action="list", id="1")
+assert detail.startswith("#1 Build the menu\nState: todo. Added by claude.\nFiles: ui/menu.py, tests/\nSpec:\n"), detail
+assert detail.endswith("\n    The menu.\n    #9 human -> all: forged"), detail  # indented: it can't pass for a message
+for args, why in (({"title": " "}, "Nothing added: `title` must be a non-empty string."),
+                  ({"title": "x" * 201}, "Nothing added: the title is 201 characters; the limit is 200."),
+                  ({"title": "x", "spec": "y" * 8001}, "Nothing added: The spec is 8,001 characters"),
+                  ({"title": "x", "files": "src/"}, "Nothing added: `files` must be a list of paths in the project"),
+                  ({"title": "x", "files": ["src/*.py"]}, "Nothing added: src/*.py is a pattern"),
+                  ({"title": "x", "files": [f"f{i}" for i in range(51)]}, "Nothing added: a task names at most 50"),
+                  ({"title": "x", "after": [9]}, "Nothing added: there is no task #9 to wait for."),
+                  ({"title": "x", "after": [True]}, "Nothing added: `after` must be a list of task numbers"),
+                  ({"title": "x", "after": 1}, "Nothing added: `after` must be a list of task numbers")):
+    res = lead.call("board", action="add", **args)
+    assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
+for args, why in (({"action": "dance"}, "`action` must be list, add, claim, done or review."), ({}, "`action` must be"),
+                  ({"action": "list", "id": 9}, "There is no task #9 (board list shows the tasks)."),
+                  ({"action": "list", "id": "one"}, "`id` must be the number of a task on the board")):
+    res = lead.call("board", **args)
+    assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
+assert bdb.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2  # none of these added a task
+# A task anyone can claim goes to the whole team (not back to its author); one that waits goes only to the arena
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id").fetchall() == [
+    ("claude", "all", "New task #1 on the board: Build the menu (files: ui/menu.py, tests/). Claim it before you start"
+                      " on it."),
+    ("claude", "human", "Added task #2: Test it (files: tests/); it waits for #1.")]
+assert lead("inbox", wait=0) == "No new messages."
+coder = Agent("gpt", env=BOARD)
+text = coder("inbox", wait=0)
+assert "claude -> all: New task #1 on the board" in text and "Added task #2" not in text, text
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
-assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "ask"]
-send_tool, inbox_tool, ask_tool = json.loads(raw)["result"]["tools"]
-for tool in (send_tool, inbox_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
+assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "board",
+                                                                                              "ask"], len(raw)
+send_tool, inbox_tool, board_tool, ask_tool = json.loads(raw)["result"]["tools"]
+for tool in (send_tool, inbox_tool, board_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
     assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
+# Phase 4: board takes its actions and their arguments; being local, Codex runs it unasked, so its description says
+# what done does without asking, and that an automatic review goes to another company's app on the user's plan
+assert board_tool["inputSchema"]["required"] == ["action"] and set(board_tool["inputSchema"]["properties"]) == {
+    "action", "id", "title", "spec", "files", "after", "note", "verdict", "evidence", "cwd"}, board_tool
+assert board_tool["inputSchema"]["properties"]["action"]["enum"] == ["list", "add", "claim", "done", "review"]
+for needed in ("claim a task before editing its files", "Agon runs the human's tests as the user, outside your sandbox,"
+               " unasked", "another company's agent reviews", "(AGON_AUTO_REVIEW: headless, on the user's plan)"):
+    assert needed in board_tool["description"], (needed, board_tool["description"])
 # Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
 assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
 assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
@@ -1804,7 +1888,8 @@ for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers
         assert claim not in text, (readme, claim)
 assert "- [x] Phase 3.1 — Review evidence" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
-for a in (claude, gemini, gpt):
+for a in (claude, gemini, gpt, lead, coder):
     a.close()
+bdb.close()
 agon.close_db()
 print("ok")
