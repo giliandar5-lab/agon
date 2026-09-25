@@ -17,7 +17,9 @@
         "AGON_CMD_GEMINI",
         "AGON_FALLBACK",
         "AGON_ASK_TIMEOUT",
-        "AGON_LIMIT_PATTERNS"
+        "AGON_LIMIT_PATTERNS",
+        "AGON_TEST_CMD",
+        "AGON_TEST_TIMEOUT"
       ],
       "tool_timeout_sec": 960
     }
