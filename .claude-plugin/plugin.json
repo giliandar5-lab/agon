@@ -1,7 +1,7 @@
 {
   "name": "agon",
   "displayName": "Agon",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Your AI rivals, one team: Claude joins GPT (Codex) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, and ask for a second opinion from another company's agent) and a Stop hook that keeps Claude going with new messages.",
   "author": {
     "name": "giliandar5-lab",
@@ -23,6 +23,12 @@
       "title": "Python command",
       "description": "The command that starts Python 3.10 or newer. On Windows use py: python3 there is usually a Microsoft Store stub.",
       "default": "python3"
+    },
+    "test_command": {
+      "type": "string",
+      "title": "Test command",
+      "description": "The command that runs your project's tests, such as python -m pytest -q or npm test, run without a shell. Agon runs it before every review and after every task that an agent asks for, and the verdict says whether the tests passed. Leave it empty to run none. AGON_TEST_CMD, when set, comes first.",
+      "default": ""
     }
   },
   "mcpServers": {
@@ -31,7 +37,10 @@
       "args": [
         "${CLAUDE_PLUGIN_ROOT}/agon.py",
         "claude"
-      ]
+      ],
+      "env": {
+        "CLAUDE_PLUGIN_OPTION_TEST_COMMAND": "${user_config.test_command}"
+      }
     }
   },
   "hooks": {
