@@ -537,6 +537,11 @@ for failed in ({"hook_event_name": "StopFailure", "error": "server_error"}, {"te
                {"terminationReason": "error", "error": "boom"}):  # found in review: never continue a failed turn
     assert hook("hank", failed) == (None, b""), failed
 assert "after the error" in hook("hank")[0]["reason"]
+caught_up("tad")  # Phase 4: Claude Code's short server throttle ends a turn with rate_limit too, but it is no usage limit
+throttle = {"hook_event_name": "StopFailure", "error": "rate_limit",
+            "last_assistant_message": "API Error: Server is temporarily limiting requests (not your usage limit)"}
+assert hook("tad", throttle) == (None, b"") and agent_row("tad", "out_of_quota_until") is None and notices("tad") == []
+assert agon.shows_limit(["rate_limit", throttle["last_assistant_message"]]) is None
 os.environ["AGON_LIMIT_PATTERNS"] = '["out of juice"]'
 for name in ("ivy", "jo"):
     caught_up(name)
@@ -577,6 +582,10 @@ for text, when in (
     ("You've hit your usage limit. Try again later.", None),
     ("resets in 5 files", None),
     ("look at 3 files", None),
+    # Phase 4: Claude Code's weekly limit names a weekday (2026-09-24 is a Thursday)
+    ("You've hit your weekly limit · resets Mon 12:00am", at(2026, 9, 28, 0, 0)),
+    ("resets Thu 3pm", at(2026, 9, 24, 15, 0)), ("resets Thursday 9:30am", at(2026, 10, 1, 9, 30)),
+    ("resets Sun 23:15", at(2026, 9, 27, 23, 15)), ("resets Fri 5 files", None),
 ):
     assert agon.reset_time(text, now) == when, (text, agon.reset_time(text, now), when)
 
@@ -654,9 +663,11 @@ option = claude_plugin["userConfig"]["test_command"]
 assert option["type"] == "string" and option["title"] == "Test command" and option["default"] == "", option
 assert "python -m pytest -q" in option["description"], option
 assert "AGON_TEST_CMD, when set, comes first" in option["description"], option
-for event in ("Stop", "StopFailure"):  # a turn that ends in an API error (a usage limit) runs StopFailure, not Stop
-    assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": 60,
+for event, timeout in (("Stop", 60), ("StopFailure", 60),  # a turn that ends in an API error runs StopFailure
+                       ("UserPromptSubmit", 10)):  # Phase 4: before a turn, tasks that went to others while away
+    assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": timeout,
                                                          "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
+assert set(claude_plugin["hooks"]) == {"Stop", "StopFailure", "UserPromptSubmit"}
 assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gpt"], "cwd": ".",
                                                 "env_vars": agon.ENV_VARS,  # Codex passes only listed variables
                                                 "tool_timeout_sec": 960}}  # Phase 3: ask takes minutes, not 60 s
@@ -666,6 +677,8 @@ assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CM
                          "AGON_LEASE", "AGON_AUTO_REVIEW"] and agon.TOOL_TIMEOUT == 960  # Phase 4: the board's
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
+[codex_prompt] = codex_plugin["hooks"]["hooks"]["UserPromptSubmit"][0]["hooks"]  # Phase 4: the same command, sooner
+assert codex_prompt == codex_stop | {"timeout": 10} and set(codex_plugin["hooks"]["hooks"]) == {"Stop", "UserPromptSubmit"}
 antigravity = manifest("plugin.json")
 assert set(antigravity) == {"$schema", "name", "description"} and antigravity["name"] == "agon"  # all its schema allows
 assert manifest("mcp_config.json") == {"mcpServers": {"agon": {"command": "./agon", "args": ["gemini"]}}}
@@ -687,6 +700,10 @@ for name, command, shell in (
     say.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', ?, ?)", (name, f"plugin hook for {name}"))
     p = subprocess.run([*shell, command], cwd=HERE, input=b"{}", env=HOOKS, capture_output=True, timeout=60)
     assert p.returncode == 0 and f"plugin hook for {name}" in json.loads(p.stdout)["reason"], (name, p)
+    if name == "gpt":  # Phase 4: Codex's UserPromptSubmit hook: nothing to add, so it prints nothing
+        p = subprocess.run([*shell, command], cwd=HERE, input=b'{"hook_event_name": "UserPromptSubmit", "prompt": "hi"}',
+                           env=HOOKS, capture_output=True, timeout=60)
+        assert (p.returncode, p.stdout) == (0, b""), p
 say.close()
 
 # Phase 2, 13. `agon.py setup` finds claude, codex and agy on PATH and prints the commands and the hook snippets, with
@@ -710,6 +727,9 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
     [claude_hook] = snippets[0]["hooks"]["StopFailure"][0]["hooks"]
     assert claude_hook == {"type": "command", "command": sys.executable, "args": [script, "hook", "claude"],
                            "timeout": 60}  # exec form: no shell, so no quoting to get wrong
+    assert snippets[0]["hooks"]["UserPromptSubmit"] == [{"hooks": [claude_hook | {"timeout": 10}]}]  # Phase 4
+    assert snippets[1]["hooks"]["UserPromptSubmit"] == [{"hooks": [snippets[1]["hooks"]["Stop"][0]["hooks"][0]
+                                                                   | {"timeout": 10}]}]
     for snippet, name in ((snippets[1]["hooks"]["Stop"][0]["hooks"][0], "gpt"),
                           (snippets[2]["agon"]["Stop"][0], "gemini")):
         assert script in snippet["command"] and snippet["command"].endswith(f"hook {name}"), snippet
@@ -1839,6 +1859,7 @@ for i in range(1, 31):  # both claim task i at the same moment: each waits here 
     while not os.path.exists(os.path.join(folder, f"{other}-{i}")):
         time.sleep(0.001)
     try:
+        agon.touch(me)  # what the MCP server does on every request: a sign of life, which renews the claims
         agon.tool_board(agon.Session(me, None), {"action": "claim", "id": i})
         got[i] = "won"
     except agon.ToolError as e:
@@ -1946,6 +1967,82 @@ bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'STOP'
 res = coder.call("board", action="done", id=2)
 assert res["isError"] is True and res["content"][0]["text"] == f"Nothing done: {agon.PAUSED}", res
 bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'go on')")
+
+# Phase 4, 12. An agent's usage limit (reported to its hook, or seen by an ask) puts its tasks in progress back on the
+# board, with a note, and gives the reviews it was asked for to another online agent. When it comes back, before it
+# works again, it hears which of its tasks went to others and who has them: Claude Code resumes the task it had by
+# itself after the reset, through the UserPromptSubmit hook, which adds the note (Codex's too); otherwise inbox or the
+# Stop hook starts with it. Once
+def last_board_messages(n):
+    return bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT ?", (n,)).fetchall()[::-1]
+
+
+def board_hook(name, payload):  # the hook as an app runs it, on the board's team
+    return run_hook(name, stdin=json.dumps(payload).encode(), env={"AGON_DB": BOARD["AGON_DB"]})
+
+
+assert coder("board", action="claim", id=2).startswith("Task #2 is yours: Test it.")
+bdb.execute("UPDATE tasks SET reviewer = 'gpt' WHERE id = 3")  # gpt was asked to review claude's #3
+assert gem("board", action="list").startswith("The board:")  # gemini is online
+limit = {"hook_event_name": "StopFailure", "error": "rate_limit",
+         "last_assistant_message": "You’ve hit your usage limit. Try again at 3:57 PM."}
+assert board_hook("gpt", limit) == (0, b"", "")
+assert bdb.execute("SELECT state, owner, note FROM tasks WHERE id = 2").fetchone() == (
+    "todo", None, "reassigned: gpt hit its usage limit, resets ~15:57")
+assert bdb.execute("SELECT reviewer FROM tasks WHERE id = 3").fetchone() == ("gemini",)
+assert last_board_messages(3) == [
+    ("agon", "all", "gpt hit its usage limit, resets ~15:57."),
+    ("agon", "all", "Task #2 Test it is free again: gpt hit its usage limit, resets ~15:57. What gpt did so far is in the"
+                    " project folder: read it before you claim."),
+    ("agon", "gemini", "Task #3 is ready for your review (no tests run: set AGON_TEST_CMD): Menu icons. gpt can't review"
+                       " it now: gpt hit its usage limit, resets ~15:57. Check it, then call board: action review, id 3,"
+                       " verdict approve or changes, and your evidence.")]
+assert lead("board", action="claim", id=2).startswith("Task #2 is yours: Test it.")  # claude takes it on
+prompt = {"hook_event_name": "UserPromptSubmit", "turn_id": "t2", "prompt": "I hit my usage limit while you were"
+          " working, but it has reset now. Please continue from where you left off."}  # what Claude Code sends then
+code, out, err = board_hook("gpt", prompt)  # Codex's hook, the same shape
+assert (code, err) == (0, "") and json.loads(out) == {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+    "additionalContext": "While you were away, Agon gave tasks you had back to the board: #2 Test it (you hit your usage"
+                         " limit, resets ~15:57): claude has it now (in progress); its files: tests/. Don't edit their"
+                         " files unless you claim the task again: board list shows the board."}}, out
+assert board_hook("gpt", prompt) == (0, b"", "")  # said once; otherwise the hook adds nothing
+assert board_hook("gemini", prompt) == (0, b"", "")
+res = coder.call("board", action="done", id=2)  # a done after all that says why, too
+assert res["content"][0]["text"] == ("Nothing done: task #2 isn't yours: claude has it now (in progress). It went back"
+                                     " to the board: you hit your usage limit, resets ~15:57. Don't edit its files.")
+text = lead("inbox", wait=0)  # claude hears of #4, which went back to the board when it was away (after changes)
+assert text.startswith("While you were away, Agon gave tasks you had back to the board: #4 Docs (gpt asked for changes"
+                       " while you were away): nobody has it now; its files: docs/. Don't edit their files unless you"
+                       " claim the task again: board list shows the board.\n\n"), text
+assert not lead("inbox", wait=0).startswith("While you were away")
+# A claim lasts AGON_LEASE seconds (7200) after the owner's last sign of life (any Agon request or hook run): after
+# that, the next board call puts the task back, as for a usage limit. The owner hears of it before its next turn
+assert agon.LEASE == 7200 and agon.lease() == 7200
+assert gem("board", action="claim", id=4).startswith("Task #4 is yours: Docs.")
+bdb.execute("UPDATE agents SET last_seen = ? WHERE name = 'gemini'", (time.time() - 7300,))
+assert "#4 [todo] Docs" in lead("board", action="list")
+note = bdb.execute("SELECT note FROM tasks WHERE id = 4").fetchone()[0]
+assert re.fullmatch(r"reassigned: gemini sent no sign of life for 2h 1m", note), note
+freed, review = last_board_messages(2)  # its task is free, and the review it was asked for goes to someone else
+assert freed[:2] == ("agon", "all") and re.fullmatch(r"Task #4 Docs is free again: gemini sent no sign of life for 2h 1m\."
+                                                     r" What gemini did so far is in the project folder: read it before"
+                                                     r" you claim\.", freed[2]), freed
+assert review == ("agon", "human", "Task #3 by claude waits for a review (no tests run: set AGON_TEST_CMD): Menu icons."
+                                   " gemini can't review it now (gemini sent no sign of life for 2h 1m), and no other"
+                                   " agent from another company is online."), review
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('claude', 'gemini', 'where are the docs?')")
+code, out, err = board_hook("gemini", {"terminationReason": "NO_TOOL_CALL", "fullyIdle": True})  # Antigravity's Stop
+reason = json.loads(out)["reason"]
+assert re.match(r"While you were away, Agon gave tasks you had back to the board: #4 Docs \(Agon saw no sign of you for"
+                r" 2h 1m\): nobody has it now; its files: docs/\. Don't edit their files unless you claim the task"
+                r" again: board list shows the board\.\n\nNew messages from your Agon team:\n", reason), reason
+assert "claude -> gemini: where are the docs?" in reason and json.loads(out)["decision"] == "continue"
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('claude', 'gemini', 'ping')")
+assert "While you were away" not in json.loads(board_hook("gemini", {"fullyIdle": True})[1])["reason"]
+res = Agent("leasy", env=BOARD | {"AGON_LEASE": "soon"})
+text = res("board", action="list")
+assert text == "AGON_LEASE must be a number of seconds, such as 7200.", text
+res.close()
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

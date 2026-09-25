@@ -75,6 +75,22 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${user_config.python}",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/agon.py",
+              "hook",
+              "claude"
+            ],
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "channels": [

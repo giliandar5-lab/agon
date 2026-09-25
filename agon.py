@@ -496,8 +496,10 @@ def tool_inbox(session, args):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
-    wait = 0 if head or not wait > 0 else min(wait, MAX_WAIT)  # a recap comes back at once; NaN means no wait
-    rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
+    note, upto = taken_note(session.me)  # tasks it had that went back to the board while it was away
+    wait = 0 if head or note or not wait > 0 else min(wait, MAX_WAIT)  # these come back at once; NaN means no wait
+    rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - len(note) - 300,  # 300: headers
+                               session.stopped)
     text = "\n".join(line(row) for row in rows) or "No new messages."
     if more:
         text += f"\n{more} more — call inbox again."
@@ -505,6 +507,8 @@ def tool_inbox(session, args):
         text = f"{head}\n\nNew messages:\n{text}"
     elif head:
         text = f"{head}\n\n{text}"
+    if note:
+        text = f"{note}\n\n{text}"
     if halted:
         text = f"{PAUSED}\n\n{text}"
 
@@ -512,6 +516,7 @@ def tool_inbox(session, args):
         session.recap = False
         if rows:
             advance(session.me, rows[-1][0])
+        told(session.me, upto)
 
     return text, delivered
 
@@ -1449,6 +1454,81 @@ def owned(t, me):
     raise ToolError(f"task #{t['id']} isn't yours: {now}.{taken}{again}")
 
 
+def ago(seconds):
+    """A long span of time as people read it: 2h 5m, or 45m 10s."""
+    seconds = round(seconds)
+    return f"{seconds // 3600}h {seconds % 3600 // 60}m" if seconds >= 3600 else took(seconds)
+
+
+def release(con, agent, note, why, now):
+    """Inside a transaction: put `agent`'s tasks in progress back on the board, with `note` (reassigned: claude hit its
+    usage limit, resets ~14:00), and ask another agent for the reviews `agent` was asked for. The team hears which tasks
+    are free; `agent` hears it too, with `why`, before it works again (see taken_note())."""
+    taken = board_tasks("WHERE state = 'doing' AND owner = ?", (agent,))
+    for t in taken:
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, note = ?, updated = ? WHERE id = ?",
+                    (f"reassigned: {note}", now, t["id"]))
+        con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)", (t["id"], agent, why))
+    if taken:
+        tasks = "; ".join(f"#{t['id']} {t['title']}" for t in taken)
+        post("agon", "all", f"{'Tasks' if len(taken) > 1 else 'Task'} {tasks} {'are' if len(taken) > 1 else 'is'} free"
+                            f" again: {note}. What {agent} did so far is in the project folder: read it before you"
+                            " claim.")
+    for t in board_tasks("WHERE state = 'review' AND reviewer = ?", (agent,)):  # its reviews go to someone else
+        reviewer = next((name for name in reviewers(t["owner"], now) if name != agent), None)
+        con.execute("UPDATE tasks SET reviewer = ? WHERE id = ?", (reviewer, t["id"]))
+        tests = t["tests"] or NO_TESTS
+        if reviewer:
+            post("agon", reviewer, f"Task #{t['id']} is ready for your review ({tests}): {t['title']}. {agent} can't"
+                                   f" review it now: {note}. Check it, then call board: action review, id {t['id']},"
+                                   " verdict approve or changes, and your evidence.")
+        else:
+            post("agon", "human", f"Task #{t['id']} by {t['owner']} waits for a review ({tests}): {t['title']}. {agent}"
+                                  f" can't review it now ({note}), and no other agent from another company is online.")
+    return taken
+
+
+def reap():
+    """Put back on the board the tasks whose owners sent no sign of life for AGON_LEASE seconds: an app that crashed
+    or closed, or a usage limit Codex tells no hook about. Every Agon request and hook run of the owner renews its
+    claim; this runs at the start of every board call, like beads' reclaim, and costs one query when nothing expired."""
+    now, limit = time.time(), lease()
+    stale = ("SELECT DISTINCT tasks.owner, COALESCE(agents.last_seen, 0) FROM tasks LEFT JOIN agents ON agents.name ="
+             " tasks.owner WHERE tasks.state = 'doing' AND COALESCE(agents.last_seen, 0) < ?")
+    if not db().execute(stale, (now - limit,)).fetchone():
+        return
+    with transaction() as con:
+        for owner, seen in con.execute(stale, (now - limit,)).fetchall():  # again, now that nobody else writes
+            gone = ago(now - seen) if seen else "a long time"
+            release(con, owner, f"{owner} sent no sign of life for {gone}", f"Agon saw no sign of you for {gone}", now)
+
+
+def taken_note(me):
+    """What agent `me` must hear before it works again, when Agon gave tasks it had back to the board (a usage limit,
+    no sign of life): which tasks, who has each now, and not to edit their files. (The note, or "" when there is
+    nothing to say; the last release it covers, for told().) Claude Code resumes a task by itself after a usage limit
+    resets, and that prompt goes through the UserPromptSubmit hook: the hook adds this note to it."""
+    rows = db().execute("SELECT id, task, why FROM releases WHERE agent = ? AND told = 0 ORDER BY id", (me,)).fetchall()
+    why = {task: reason for _, task, reason in rows}  # each task once, with the latest reason
+    items = []
+    for t in board_tasks(f"WHERE id IN ({','.join('?' * len(why))})", tuple(why)) if why else []:
+        if t["owner"] == me and t["state"] in ("doing", "review"):
+            continue  # it took the task back
+        now = "it is done" if t["state"] == "done" else (f"{t['owner']} has it now ({STATES[t['state']]})" if t["owner"]
+                                                         else "nobody has it now")
+        files = f"; its files: {', '.join(t['files'])}" if t["files"] else ""
+        items.append(f"#{t['id']} {t['title']} ({why[t['id']]}): {now}{files}")
+    note = ("While you were away, Agon gave tasks you had back to the board: " + "; ".join(items) + ". Don't edit"
+            " their files unless you claim the task again: board list shows the board.") if items else ""
+    return note, (rows[-1][0] if rows else 0)
+
+
+def told(me, upto):
+    """Agent `me` has heard of its tasks given back up to release `upto` (see taken_note())."""
+    if upto:
+        db().execute("UPDATE releases SET told = 1 WHERE agent = ? AND id <= ?", (me, upto))
+
+
 def board_done(session, args):
     """The owner finishes a task: Agon runs the human's test command, and the task goes to review, by an online agent
     from another company. Like a Claude Code TaskCompleted hook the human set up, the tests run unasked, as the user,
@@ -1550,6 +1630,7 @@ def tool_board(session, args):
     if action not in handlers:
         raise ToolError("`action` must be list, add, claim, done or review.")
     try:
+        reap()  # claims whose owners sent no sign of life for AGON_LEASE seconds go back to the board first
         return handlers[action](session, args)
     except ToolError as e:  # what went wrong, after what didn't happen
         text = str(e)
@@ -1800,8 +1881,11 @@ def limit_patterns():
 
 
 def shows_limit(texts):
-    """`texts` joined if one of them shows a usage limit (limit_patterns()), else None."""
+    """`texts` joined if one of them shows a usage limit (limit_patterns()), else None. Claude Code's "Server is
+    temporarily limiting requests (not your usage limit)" is a short throttle: its StopFailure error is rate_limit too."""
     texts = [text for text in texts if isinstance(text, str) and text]
+    if any("not your usage limit" in text.lower() for text in texts):
+        return None
     if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
         return "\n".join(texts)
 
@@ -1822,13 +1906,27 @@ CLOCK = re.compile(  # "resets 3pm", "at 3:57 PM", "at Sep 25th, 2026 7:40 PM", 
     r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
 
 
+WEEKDAY = re.compile(r"\b(?:at|resets?|until|on)\s+(?P<wd>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+(?:at\s+)?"
+                     r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)  # "resets Mon 12:00am"
+DAYS = "mon tue wed thu fri sat sun".split()
+
+
 def reset_time(text, now):
     """When a usage limit resets (Unix time), from the text an app printed: an older Claude Code timestamp, a
-    duration ("in 2 hours 5 minutes", "after 2h3m4s") or a local clock time with an optional date; else None."""
+    duration ("in 2 hours 5 minutes", "after 2h3m4s"), a weekday and a time ("resets Mon 12:00am") or a local clock
+    time with an optional date; else None."""
     if m := re.search(r"\|(\d{10})\b", text):  # "Claude AI usage limit reached|1760000000"
         return float(m[1])
     if m := re.search(rf"\b(?:in|after)\s+((?:{DURATION}[\s,]*(?:and\s+)?)+)", text, re.I):
         return now + sum(int(n) * UNITS[unit[0].lower()] for n, unit in re.findall(DURATION, m[1], re.I))
+    for m in WEEKDAY.finditer(text):  # the next such day and time: Claude Code's weekly limit
+        if not (m["min"] or m["ap"]) or int(m["h"]) > (12 if m["ap"] else 23) or int(m["min"] or 0) > 59:
+            continue
+        hour = int(m["h"]) % 12 + (12 if m["ap"] and m["ap"][0] in "pP" else 0) if m["ap"] else int(m["h"])
+        base = datetime.datetime.fromtimestamp(now)
+        day = base + datetime.timedelta(days=(DAYS.index(m["wd"][:3].lower()) - base.weekday()) % 7)
+        when = day.replace(hour=hour, minute=int(m["min"] or 0), second=0, microsecond=0)
+        return (when if when.timestamp() > now else when + datetime.timedelta(days=7)).timestamp()
     for m in CLOCK.finditer(text):
         if not (m["min"] or m["ap"]):
             continue  # a bare number isn't a time
@@ -1866,24 +1964,18 @@ def quota_until(name):
 
 
 def out_of_quota(me, text):
-    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
-    team, once per limit."""
+    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say), tell the team once
+    per limit, and put the agent's tasks in progress back on the board: the others go on with them (no downtime)."""
     now = time.time()
     until = reset_time(text, now)
-    con = db()
-    con.execute("BEGIN IMMEDIATE")
-    try:
+    resets = f"resets ~{reset_clock(until, now)}" if until else "reset time unknown"
+    with transaction() as con:
         row = con.execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (me,)).fetchone()
         con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
                     " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
         if not (row and row[0] and row[0] > now):  # not already known
-            post("agon", "all", f"{me} hit its usage limit"
-                 + (f", resets ~{reset_clock(until, now)}." if until else "; reset time unknown."))
-        con.execute("COMMIT")
-    except BaseException:
-        if con.in_transaction:
-            con.execute("ROLLBACK")
-        raise
+            post("agon", "all", f"{me} hit its usage limit" + (f", {resets}." if until else "; reset time unknown."))
+        release(con, me, f"{me} hit its usage limit, {resets}", f"you hit your usage limit, {resets}", now)
 
 
 def max_autoruns():
@@ -1906,14 +1998,20 @@ def out_of_turns(me, limit):
 
 
 def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
-    """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
-    The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
-    an exit code 2 into 1, so the other way to keep an agent going can get lost."""
-    fmt = fmt or FORMATS.get(me, "claude")
+    """Hook of agent `me`. Stop (and Claude Code's StopFailure): let it stop, or keep it going with its new messages as
+    the next prompt. UserPromptSubmit (Claude Code, Codex): tell it which of its tasks went to others while it was away.
+    The answer goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns an exit code 2
+    into 1, so the other way to keep an agent going can get lost."""
+    fmt, out = fmt or FORMATS.get(me, "claude"), out or sys.stdout.buffer
     payload = read_payload(inp or sys.stdin.buffer)
     if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
         return
-    touch(me)  # the agent's row, so its cursor can move
+    touch(me)  # the agent's row, so its cursor can move; a sign of life that renews its claims on the board
+    if payload.get("hook_event_name") == "UserPromptSubmit":  # Claude Code and Codex, before the agent starts a turn
+        note, upto = taken_note(me)  # after a usage limit, Claude Code resumes the task it had by itself
+        if note:  # added to the prompt as context; otherwise the hook adds nothing
+            write_json(out, {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": note}})
+        return told(me, upto)
     if paused():  # 1. the human said STOP
         return
     if hit := usage_limit(payload):  # 2. out of quota: say so and let it stop
@@ -1921,18 +2019,25 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     if turn_failed(payload) or out_of_turns(me, max_autoruns()):
         return
     # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
-    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
+    note, upto = taken_note(me)
+    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100 - len(note))  # 100: header
     if halted or not rows:
         return  # exit 0 without output: the agent may stop
     text = "\n".join(line(row) for row in rows)
     if more:
         text += f"\n{more} more — call inbox again."
-    decision = {"decision": CONTINUE[fmt], "reason": f"New messages from your Agon team:\n{text}"}
-    out = out or sys.stdout.buffer
-    out.write(json.dumps(decision).encode() + b"\n")  # ASCII only (\u escapes): no console code page mangles it
-    out.flush()
+    write_json(out, {"decision": CONTINUE[fmt], "reason": (f"{note}\n\n" if note else "")
+                     + f"New messages from your Agon team:\n{text}"})
     advance(me, rows[-1][0])  # only once the app has the messages (at-least-once)
+    told(me, upto)
     db().execute("UPDATE agents SET autoruns = autoruns + 1 WHERE name = ?", (me,))
+
+
+def write_json(out, decision):
+    """A hook's answer to its app: one line of JSON on stdout. ASCII only (\\u escapes): no console code page mangles
+    it."""
+    out.write(json.dumps(decision).encode() + b"\n")
+    out.flush()
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -2072,6 +2177,7 @@ def setup(out=None):
         say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
 
     claude_hook = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 60}]}]
+    claude_prompt = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 10}]}]
     app("Claude Code", "claude")
     say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
         "  claude plugin marketplace add giliandar5-lab/agon",
@@ -2079,7 +2185,7 @@ def setup(out=None):
         "By hand:",
         "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", py, script, "claude"]),
         f"  and the hooks, merged into {home / '.claude' / 'settings.json'}:",
-        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook}}),
+        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook, "UserPromptSubmit": claude_prompt}}),
         "Channels (research preview), to wake an idle Claude:",
         "  claude --dangerously-load-development-channels plugin:agon@agon   (by hand: server:agon)")
 
@@ -2093,8 +2199,8 @@ def setup(out=None):
         "  then start Codex and trust the hook when it asks (or in /hooks)",
         "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
-        "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
-                                                          "timeout": 60}]}]}}),
+        "  " + json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": codex_hook, "timeout": timeout}]}]
+                                     for event, timeout in (("Stop", 60), ("UserPromptSubmit", 10))}}),
         f"  and under [mcp_servers.agon] in {home / '.codex' / 'config.toml'} (ask takes minutes, and Codex passes"
         " Agon only the variables it names):", f"  tool_timeout_sec = {TOOL_TIMEOUT}",
         f"  env_vars = {json.dumps(ENV_VARS)}")

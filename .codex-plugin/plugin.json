@@ -39,6 +39,18 @@
             }
           ]
         }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "\"${PLUGIN_ROOT}/agon\" hook gpt",
+              "commandWindows": "cmd /c \"${PLUGIN_ROOT}\\agon.cmd\" hook gpt",
+              "timeout": 10
+            }
+          ]
+        }
       ]
     }
   }
