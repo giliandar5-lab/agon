@@ -1543,7 +1543,8 @@ def board_done(session, args):
         raise ToolError(PAUSED)
     owned(board_task(tid), me)
     tests = test_command()  # a bad setting stops done before anything runs
-    folder = project_folder(args.get("cwd")) if tests else None
+    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    folder = project_folder(args.get("cwd")) if tests or auto else None  # where the tests and a review run
 
     def halt():  # why the tests must stop now, if they must
         if session.stopped():
@@ -1567,10 +1568,18 @@ def board_done(session, args):
             post(me, reviewer, f"Task #{tid} is ready for your review ({outcome}): {t['title']}.{said}\nCheck it, then"
                                f" call board: action review, id {tid}, verdict approve or changes, and your evidence.")
             then = f"{reviewer} is asked to review it."
+        elif auto:  # the human allowed it: another company's app reviews it headless, on the user's plan
+            post("agon", "human", f"Task #{tid} by {me} waits for a review ({outcome}): {t['title']}. No agent from"
+                                  " another company is online, so Agon runs another company's app to review it"
+                                  " (AGON_AUTO_REVIEW, on your plan).")
+            then = ("No agent from another company is online, so Agon runs another company's app to review it, headless"
+                    " on the user's plan (AGON_AUTO_REVIEW). The verdict comes to you as a message.")
         else:
             post("agon", "human", f"Task #{tid} by {me} waits for a review ({outcome}): {t['title']}. No agent from"
                                   " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
             then = "No agent from another company is online to review it: the human is told."
+    if not reviewer and auto:  # after the commit: the review reads the task as done left it
+        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report))).start()
     return f"Task #{tid} is in review ({outcome}). {then}\n\n{report}", None
 
 
@@ -1584,44 +1593,101 @@ def board_review(session, args):
         raise ToolError("`evidence` must say what you checked and what you found: the tests you ran, the code you read.")
     if problem := too_long(evidence, "evidence"):
         raise ToolError(problem)
-    now = time.time()
-    with transaction() as con:
+    with transaction():
         t = board_task(tid)
-        owner, tests = t["owner"], t["tests"] or NO_TESTS
         if t["state"] != "review":
             raise ToolError(f"task #{tid} isn't waiting for a review: it is {STATES[t['state']]}.")
-        if owner == me:
+        if t["owner"] == me:
             raise ToolError("the agent that did a task doesn't review it: another company's agent does.")
-        if vendor(me) == vendor(owner):
-            raise ToolError(f"you and {owner} run in the same company's app: a review comes from another company's"
+        if vendor(me) == vendor(t["owner"]):
+            raise ToolError(f"you and {t['owner']} run in the same company's app: a review comes from another company's"
                             " agent.")
-        said = f"\n{me}: {clip(evidence, 1500)}"
-        if verdict == "approve":
-            con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ? WHERE id = ?",
-                        (me, evidence, now, tid))
-            states = dict(con.execute("SELECT id, state FROM tasks"))
-            ready = [f"#{w['id']} {w['title']}" for w in board_tasks("WHERE state = 'todo'")
-                     if tid in w["after"] and all(states.get(i) == "done" for i in w["after"])]
-            if ready:  # anyone may take them now
-                post(me, "all", f"Approved task #{tid} ({tests}): {t['title']}. Ready to claim now: {'; '.join(ready)}."
+        return settle(t, me, verdict, evidence, me, me), None
+
+
+def settle(t, reviewer, verdict, evidence, sender, by):
+    """Inside a transaction: `reviewer`'s verdict on task t, in review. approve closes it, and everyone hears which
+    tasks it frees (else only its owner hears); changes send it back to its owner, or to the board when the owner is
+    away. `sender` posts the message, which quotes the `evidence` as `by`'s. Returns what the reviewer is told."""
+    con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
+    said = f"\n{by}: {clip(evidence.strip(), 1500)}"
+    if verdict == "approve":
+        con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ? WHERE id = ?",
+                    (reviewer, evidence, now, tid))
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        ready = [f"#{w['id']} {w['title']}" for w in board_tasks("WHERE state = 'todo'")
+                 if tid in w["after"] and all(states.get(i) == "done" for i in w["after"])]
+        if ready:  # anyone may take them now
+            post(sender, "all", f"Approved task #{tid} ({tests}): {t['title']}. Ready to claim now: {'; '.join(ready)}."
                                 f"{said}")
-            else:
-                post(me, owner, f"Approved task #{tid} ({tests}): {t['title']}.{said}")
-            return f"Task #{tid} is done: approve ({tests})." + (f" Ready to claim now: {'; '.join(ready)}." if ready
-                                                                 else ""), None
-        if away(owner, now):  # the owner can't take it back now: anyone may
-            con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ? WHERE"
-                        " id = ?", (me, evidence, now, tid))
-            con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)",
-                        (tid, owner, f"{me} asked for changes while you were away"))
-            post(me, "all", f"Task #{tid} needs changes ({tests}), and {owner} is away: anyone may claim it."
+        else:
+            post(sender, owner, f"Approved task #{tid} ({tests}): {t['title']}.{said}")
+        return f"Task #{tid} is done: approve ({tests})." + (f" Ready to claim now: {'; '.join(ready)}." if ready else "")
+    if away(owner, now):  # the owner can't take it back now: anyone may
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ? WHERE id = ?",
+                    (reviewer, evidence, now, tid))
+        con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)",
+                    (tid, owner, f"{reviewer} asked for changes while you were away"))
+        post(sender, "all", f"Task #{tid} needs changes ({tests}), and {owner} is away: anyone may claim it."
                             f" {t['title']}.{said}")
-            return f"Task #{tid}: changes ({tests}). {owner} is away, so it is back on the board.", None
-        con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ? WHERE id = ?",
-                    (me, evidence, now, tid))
-        post(me, owner, f"Changes asked on task #{tid} ({tests}): {t['title']}. It is yours again: change it, then"
-                        f" call board done.{said}")
-    return f"Task #{tid}: changes ({tests}). It goes back to {owner}.", None
+        return f"Task #{tid}: changes ({tests}). {owner} is away, so it is back on the board."
+    con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ? WHERE id = ?",
+                (reviewer, evidence, now, tid))
+    post(sender, owner, f"Changes asked on task #{tid} ({tests}): {t['title']}. It is yours again: change it, then call"
+                        f" board done.{said}")
+    return f"Task #{tid}: changes ({tests}). It goes back to {owner}."
+
+
+def auto_review(session, tid, owner, cwd, tested):
+    """With AGON_AUTO_REVIEW=1 and no agent from another company online, Agon asks one for the review itself: it runs
+    that company's app headless through ask (AGON_FALLBACK's order, the next one when one is out of quota), on the
+    user's plan, with the tests Agon ran at done. It runs in a thread of its own, after done has answered, and stops,
+    with the app, on STOP or when the app that called done goes; the verdict goes to the owner as a message."""
+    def halt():  # why the app must stop now, if it must
+        if session.closed:
+            return "the app that called done is gone"
+        if paused():
+            return "the human paused the team"
+
+    try:
+        started, end = time.monotonic(), time.monotonic() + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
+        t, skipped, answer, problem = board_task(tid), [], None, None
+        prompt = (f"Review task #{tid} of the team's board: {t['title']}\nFiles: {', '.join(t['files']) or 'any'}\n"
+                  f"What was asked:\n{indented(clip(t['spec'], 3000)) or '    (no spec)'}\n{owner}'s note:\n"
+                  f"{indented(clip(t['note'], 3000)) or '    (none)'}\nThe work is in the project folder as it is now.")
+        for name in fallbacks(vendor(owner), owner):  # the apps of the other companies
+            if until := quota_until(name):
+                skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+                continue
+            try:
+                answer, problem, limit, _, _, _ = ask_once(owner, name, "review", prompt, cwd, None, end, halt, None,
+                                                           tested)
+            except ToolError as e:  # its app isn't there, or git failed
+                skipped.append(str(e).rstrip("."))
+                continue
+            if limit:
+                out_of_quota(name, limit)  # marked until it resets, and the team is told
+                skipped.append(f"{name} hit its usage limit")
+                continue
+            break
+        else:
+            name, problem = None, f"nobody could review it: {'; '.join(skipped) or 'AGON_FALLBACK names nobody else'}"
+        if problem:
+            return post("agon", "human", f"Agon's automatic review of task #{tid} failed: {problem.rstrip('.')}. It"
+                                         " still waits for a review.")
+        found = verdict(answer)
+        by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
+        with transaction():
+            t = board_task(tid)
+            if t["state"] != "review" or t["owner"] != owner or not found:
+                why = "gave no verdict" if not found else "came after the task had moved on"
+                return post("agon", owner, f"{name}'s automatic review of task #{tid} {why}:\n"
+                                           f"{clip(answer.strip(), 3000)}")
+            settle(t, name, found, answer, "agon", by)
+    except Exception as e:  # a bad setting, agon.db locked...: the human hears of it, the task still waits
+        post("agon", "human", f"Agon's automatic review of task #{tid} failed: {e}")
+    finally:
+        close_db()
 
 
 def tool_board(session, args):

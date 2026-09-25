@@ -876,7 +876,8 @@ if "CRASH" in prompt:
 if "PLAIN" in prompt:
     print("plain words, no JSON")
     sys.exit()
-answer = f"{app} looked at {os.path.basename(os.getcwd())}: 3 tests passed.\nVERDICT: approve"
+verdict = "changes" if "ASK FOR FIXES" in prompt else "approve"
+answer = f"{app} looked at {os.path.basename(os.getcwd())}: 3 tests passed.\nVERDICT: {verdict}"
 if app == "claude":
     events = [{"type": "result", "subtype": "success", "is_error": False, "result": answer}]
 elif app == "codex":
@@ -2044,6 +2045,72 @@ text = res("board", action="list")
 assert text == "AGON_LEASE must be a number of seconds, such as 7200.", text
 res.close()
 
+# Phase 4, 11. With AGON_AUTO_REVIEW=1 (off by default), when no agent from another company is online at done, Agon runs
+# one's app headless for the review, as ask does (AGON_FALLBACK's order, the next one when one hits its usage limit), on
+# the user's plan and with the tests Agon ran at done. The verdict counts like an online agent's and goes to the owner
+AUTO = ASK | {"AGON_DB": str(Path(TMP, "auto.db")), "AGON_AUTO_REVIEW": "1"}
+adb = sqlite3.connect(AUTO["AGON_DB"], isolation_level=None)
+
+
+def auto_messages(n):
+    return adb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT ?", (n,)).fetchall()[::-1]
+
+
+solo = Agent("claude", env=AUTO)
+solo("board", action="add", title="Parser", spec="Parse the config.", files=["parser.py"])
+solo("board", action="claim", id=1)
+runs = len(fake_runs())
+text = solo("board", action="done", id=1, note="Parser done.", cwd=str(project))
+assert text.startswith("Task #1 is in review (no tests run: set AGON_TEST_CMD). No agent from another company is online,"
+                       " so Agon runs another company's app to review it, headless on the user's plan (AGON_AUTO_REVIEW)."
+                       " The verdict comes to you as a message."), text
+until(lambda: adb.execute("SELECT state FROM tasks WHERE id = 1").fetchone()[0] == "done", 60)
+run = fake_runs()[-1]
+assert since(runs) == ["codex"] and run["asked_by"] == "claude" and run["args"][-2:] == ["--sandbox", "read-only"], run
+assert ("What claude asks:\nReview task #1 of the team's board: Parser\nFiles: parser.py\nWhat was asked:\n    Parse the"
+        " config.\nclaude's note:\n    Parser done.\nThe work is in the project folder as it is now.") in run["prompt"]
+assert f"\n\n{NONE}\n\n" in run["prompt"] and adb.execute("SELECT reviewer FROM tasks WHERE id = 1").fetchone() == ("gpt",)
+started, approved = auto_messages(2)
+assert started == ("agon", "human", "Task #1 by claude waits for a review (no tests run: set AGON_TEST_CMD): Parser. No"
+                                    " agent from another company is online, so Agon runs another company's app to review"
+                                    " it (AGON_AUTO_REVIEW, on your plan)."), started
+assert approved[:2] == ("agon", "claude") and re.fullmatch(
+    r"Approved task #1 \(no tests run: set AGON_TEST_CMD\): Parser\.\ngpt, reviewing headless on the user's plan"
+    r" \(AGON_AUTO_REVIEW, \d+s\): codex looked at project: 3 tests passed\.\nVERDICT: approve", approved[2]), approved
+limited = Agent("claude", env=AUTO | {"FAKE_LIMIT": "codex"})  # gpt hits its usage limit: gemini reviews, in its copy
+limited("board", action="add", title="Lexer", spec="ASK FOR FIXES in the lexer.", files=["lexer.py"])
+limited("board", action="claim", id=2)
+runs = len(fake_runs())
+limited("board", action="done", id=2, cwd=str(project))
+until(lambda: adb.execute("SELECT state FROM tasks WHERE id = 2").fetchone()[0] == "doing", 60)
+assert since(runs) == ["codex", "agy"] and adb.execute("SELECT owner, reviewer FROM tasks WHERE id = 2").fetchone() == (
+    "claude", "gemini")
+assert adb.execute("SELECT out_of_quota_until FROM agents WHERE name = 'gpt'").fetchone()[0] > time.time()
+changes = auto_messages(1)[0]
+assert changes[:2] == ("agon", "claude") and changes[2].startswith(
+    "Changes asked on task #2 (no tests run: set AGON_TEST_CMD): Lexer. It is yours again: change it, then call board"
+    " done.\ngemini, reviewing headless on the user's plan (AGON_AUTO_REVIEW, ") and changes[2].endswith("VERDICT:"
+                                                                                            " changes"), changes
+assert adb.execute("SELECT COUNT(*) FROM msgs WHERE sender = 'agon' AND rcpt = 'all' AND text LIKE"
+                   " 'gpt hit its usage limit, resets ~%'").fetchone()[0] == 1  # the team is told
+limited("board", action="add", title="Tidy", spec="PLAIN, please", files=["tidy.py"])  # an answer with no verdict
+limited("board", action="claim", id=3)
+limited("board", action="done", id=3, cwd=str(project))
+until(lambda: auto_messages(1)[0][2].startswith("gemini's automatic review of task #3 gave no verdict:"), 60)
+assert auto_messages(1)[0] == ("agon", "claude", "gemini's automatic review of task #3 gave no verdict:\nplain words, no"
+                                                 " JSON") and adb.execute("SELECT state FROM tasks WHERE id = 3"
+                                                                          ).fetchone() == ("review",)
+limited.close()
+off = Agent("claude", env=AUTO | {"AGON_AUTO_REVIEW": "0"})  # the default: no app runs, the human is told
+off("board", action="add", title="Off", files=["off.py"])
+off("board", action="claim", id=4)
+runs = len(fake_runs())
+assert off("board", action="done", id=4).startswith("Task #4 is in review (no tests run: set AGON_TEST_CMD). No agent"
+                                                    " from another company is online to review it: the human is told.")
+time.sleep(1)
+assert since(runs) == [] and auto_messages(1)[0][2].endswith("ask one to review it, or set AGON_AUTO_REVIEW=1.")
+off.close()
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
@@ -2139,8 +2206,9 @@ for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers
         assert claim not in text, (readme, claim)
 assert "- [x] Phase 3.1 — Review evidence" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
-for a in (claude, gemini, gpt, lead, coder, gem):
+for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()
+adb.close()
 agon.close_db()
 print("ok")
