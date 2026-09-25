@@ -1855,6 +1855,98 @@ for i in range(1, 31):
     assert won == [owners[i]] and lost == [f"Nothing claimed: task #{i} is {owners[i]}'s, in progress."], (i, results)
 assert set(owners.values()) == {"claude", "gpt"}, owners  # the loser of one task arrives last and wins the next one
 
+# Phase 4, 8-11. done: only by the owner. Agon runs the human's test command (in the project folder, as for a review),
+# and the outcome labels the review but never stops done. The task goes to review by an online agent from another
+# company, and only that agent hears of it. review: never by the owner, nor by an agent in the same company's app;
+# changes send the task back to its owner (or to the board when the owner is away), approve closes it and frees the
+# tasks that wait for it. done takes minutes, so it runs in a thread of its own, like ask
+assert agon.slow({"name": "board", "arguments": {"action": "done"}}) and agon.slow({"name": "ask", "arguments": {}})
+assert not agon.slow({"name": "board", "arguments": {"action": "list"}}) and not agon.slow({"name": "board",
+                                                                                         "arguments": "done"})
+for who, args, why in ((lead, {"id": 1}, "Nothing done: task #1 isn't yours: gpt has it now (in progress). Don't edit"
+                                         " its files."),
+                       (coder, {"id": 3}, "Nothing done: task #3 isn't yours: nobody has it now. If you still work on"
+                                          " it, claim it again first."),
+                       (coder, {"id": 1, "note": 5}, "Nothing done: `note` must be a string")):
+    res = who.call("board", action="done", **args)
+    assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
+failer = Agent("gpt", env=BOARD | {"AGON_TEST_CMD": json.dumps(fake_tests("fail")[0])}, cwd=str(HERE))
+res = failer.call("board", action="done", id=1, note="Menu built.\nTried it by hand.")  # its app runs Agon in Agon's folder
+assert res["isError"] is True and res["content"][0]["text"] == ("Nothing done: pass `cwd`, the absolute path of your"
+                                                                " project folder (your app runs Agon in a folder of its"
+                                                                " own)."), res
+runs = len(fake_runs())
+text = failer("board", action="done", id=1, note="Menu built.\nTried it by hand.", cwd=str(project))
+assert text.startswith("Task #1 is in review (tests failed). claude is asked to review it.\n\nTest results, run by Agon:"
+                       " `"), text  # red tests don't stop done: the label says what they showed
+assert text.endswith("\n    1 failed, 2 passed in 0.02s") and since(runs) == ["tests"], text
+assert Path(fake_runs()[-1]["cwd"]).resolve() == project.resolve() and fake_runs()[-1]["settings"] == []
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
+    "gpt", "claude", "Task #1 is ready for your review (tests failed): Build the menu.\ngpt's note: Menu built.\nTried it"
+                     " by hand.\nCheck it, then call board: action review, id 1, verdict approve or changes, and your"
+                     " evidence.")
+detail = lead("board", action="list", id=1)
+assert "\nState: review: gpt, asked claude. Added by claude.\n" in detail and "\nTests at done: tests failed\n" in detail
+assert "\nLatest note:\n    Menu built.\n    Tried it by hand.\n" in detail and "failed with exit code 1" in detail
+twin = Agent("gpt-2", client="codex-mcp-client", env=BOARD)  # another Codex session: the same company as gpt
+for who, args, why in ((coder, {"verdict": "approve", "evidence": "fine"}, "Nothing reviewed: the agent that did a task"
+                                                                          " doesn't review it"),
+                       (twin, {"verdict": "approve", "evidence": "fine"}, "Nothing reviewed: you and gpt run in the same"
+                                                                         " company's app"),
+                       (lead, {"verdict": "maybe", "evidence": "x"}, "Nothing reviewed: `verdict` must be approve or"),
+                       (lead, {"verdict": "changes", "evidence": " "}, "Nothing reviewed: `evidence` must say what you"
+                                                                      " checked"),
+                       (lead, {"id": 2, "verdict": "approve", "evidence": "x"}, "Nothing reviewed: task #2 isn't waiting"
+                                                                                " for a review: it is to do.")):
+    res = who.call("board", action="review", **({"id": 1} | args))
+    assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
+twin.close()
+assert lead("board", action="review", id=1, verdict="changes", evidence="Quit is missing.\ntest_quit fails.") == (
+    "Task #1: changes (tests failed). It goes back to gpt.")
+assert bdb.execute("SELECT state, owner, reviewer FROM tasks WHERE id = 1").fetchone() == ("doing", "gpt", "claude")
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
+    "claude", "gpt", "Changes asked on task #1 (tests failed): Build the menu. It is yours again: change it, then call"
+                     " board done.\nclaude: Quit is missing.\ntest_quit fails.")
+failer.close()
+passer = Agent("gpt", env=BOARD | {"AGON_TEST_CMD": json.dumps(fake_tests("pass")[0])})
+gem = Agent("gemini", env=BOARD)  # seen last, but claude asked for the changes: claude looks again
+assert passer("board", action="done", id=1, cwd=str(project)).startswith("Task #1 is in review (tests passed). claude is"
+                                                                          " asked to review it.")
+passer.close()
+assert lead("board", action="review", id=1, verdict="approve", evidence="Read ui/menu.py; quit works.") == (
+    "Task #1 is done: approve (tests passed). Ready to claim now: #2 Test it.")
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
+    "claude", "all", "Approved task #1 (tests passed): Build the menu. Ready to claim now: #2 Test it.\nclaude: Read"
+                     " ui/menu.py; quit works.")  # everyone but claude hears that #2 is free
+assert "[done: gpt, approved by claude] Build the menu" in coder("board", action="list")
+# changes while the owner is away (no sign of it for AGON_LEASE s, or out of quota): the task goes back to the board
+assert lead("board", action="done", id=4, note="Docs written.").startswith("Task #4 is in review (no tests run: set"
+                                                                          " AGON_TEST_CMD). gpt is asked to review it.")
+bdb.execute("UPDATE agents SET last_seen = last_seen - 7300 WHERE name = 'claude'")
+assert coder("board", action="review", id=4, verdict="changes", evidence="Typos in docs/index.md.") == (
+    "Task #4: changes (no tests run: set AGON_TEST_CMD). claude is away, so it is back on the board.")
+assert bdb.execute("SELECT state, owner, reviewer FROM tasks WHERE id = 4").fetchone() == ("todo", None, "gpt")
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
+    "gpt", "all", "Task #4 needs changes (no tests run: set AGON_TEST_CMD), and claude is away: anyone may claim it."
+                  " Docs.\ngpt: Typos in docs/index.md.")
+res = lead.call("board", action="done", id=4)  # claude is back, and hears what happened to its task
+assert res["isError"] is True and res["content"][0]["text"] == (
+    "Nothing done: task #4 isn't yours: nobody has it now. It went back to the board: gpt asked for changes while you"
+    " were away. If you still work on it, claim it again first."), res
+# Nobody from another company online (seen by Agon in the last 15 minutes): the human hears that the task waits
+assert lead("board", action="claim", id=3).startswith("Task #3 is yours: Menu icons.")
+bdb.execute("UPDATE agents SET last_seen = last_seen - 1000 WHERE name != 'claude'")
+assert lead("board", action="done", id=3).startswith("Task #3 is in review (no tests run: set AGON_TEST_CMD). No agent"
+                                                     " from another company is online to review it: the human is told.")
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == (
+    "agon", "human", "Task #3 by claude waits for a review (no tests run: set AGON_TEST_CMD): Menu icons. No agent from"
+                     " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
+assert bdb.execute("SELECT state, reviewer FROM tasks WHERE id = 3").fetchone() == ("review", None)
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'STOP')")  # nothing is done while paused
+res = coder.call("board", action="done", id=2)
+assert res["isError"] is True and res["content"][0]["text"] == f"Nothing done: {agon.PAUSED}", res
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'go on')")
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
@@ -1950,7 +2042,7 @@ for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers
         assert claim not in text, (readme, claim)
 assert "- [x] Phase 3.1 — Review evidence" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
-for a in (claude, gemini, gpt, lead, coder):
+for a in (claude, gemini, gpt, lead, coder, gem):
     a.close()
 bdb.close()
 agon.close_db()

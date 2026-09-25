@@ -532,14 +532,23 @@ def ask_args(session, args):
     mode = "review" if mode is None else mode
     if mode not in MODE_ARGS:
         raise ToolError("Nothing asked: `mode` must be review or task.")
-    if cwd is None:  # Claude Code says where the project is; Codex and Antigravity start Agon in its plugin folder
+    try:
+        return agent, prompt, mode, project_folder(cwd)
+    except ToolError as e:
+        raise ToolError(f"Nothing asked: {e}") from None
+
+
+def project_folder(cwd):
+    """The project folder a tool works in: its `cwd` argument, else Claude Code's project folder or the server's own
+    folder. Not Agon's folder, where the Codex and Antigravity plugins start Agon: then the agent must pass `cwd`."""
+    if cwd is None:
         cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
         if Path(cwd).resolve() == Path(__file__).resolve().parent:
-            raise ToolError("Nothing asked: pass `cwd`, the absolute path of your project folder (your app runs Agon"
-                            " in a folder of its own).")
+            raise ToolError("pass `cwd`, the absolute path of your project folder (your app runs Agon in a folder of its"
+                            " own).")
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
-        raise ToolError("Nothing asked: `cwd` must be the absolute path of your project folder.")
-    return agent, prompt, mode, cwd
+        raise ToolError("`cwd` must be the absolute path of your project folder.")
+    return cwd
 
 
 def seconds(var, default):
@@ -1397,9 +1406,147 @@ def board_claim(session, args):
     return f"Task #{tid} is yours: {t['title']}. Work on it{files}; when you finish, call board with action done.", None
 
 
+def lease():
+    """AGON_LEASE: how many seconds a claim lasts after its owner's last sign of life (7200)."""
+    return seconds("AGON_LEASE", LEASE)
+
+
+def vendor(name):
+    """The company whose app agent `name` runs in: the app it connected with (initialize's clientInfo), else its name.
+    A review must come from another company's agent: they judge each other's work more fairly than their own."""
+    row = db().execute("SELECT client FROM agents WHERE name = ?", (name,)).fetchone()
+    return CLIENTS.get(row[0] if row else None, name)
+
+
+def away(name, now):
+    """Whether agent `name` can't work on its task now: out of quota, or no sign of it for AGON_LEASE seconds."""
+    row = db().execute("SELECT last_seen, out_of_quota_until FROM agents WHERE name = ?", (name,)).fetchone()
+    last_seen, until = row or (None, None)
+    return bool(until and until > now) or (last_seen or 0) < now - lease()
+
+
+def reviewers(owner, now):
+    """Who can review `owner`'s task now: another company's agents that are online (seen by Agon within ONLINE s) and
+    not out of quota, the most recently seen first."""
+    rows = db().execute("SELECT name FROM agents WHERE name != ? AND last_seen > ? AND (out_of_quota_until IS NULL OR"
+                        " out_of_quota_until <= ?) ORDER BY last_seen DESC", (owner, now - ONLINE, now)).fetchall()
+    return [name for (name,) in rows if vendor(name) != vendor(owner)]
+
+
+def owned(t, me):
+    """A ToolError unless agent `me` has task t in progress: it says who has the task now and, when Agon took it from
+    `me`, why. An agent may go on after a break (Claude Code resumes a task by itself when a usage limit resets)."""
+    if t["owner"] == me and t["state"] == "doing":
+        return
+    if t["owner"] == me and t["state"] == "review":
+        raise ToolError(f"task #{t['id']} is in review already.")
+    now = "it is done" if t["state"] == "done" else (f"{t['owner']} has it now ({STATES[t['state']]})" if t["owner"]
+                                                     else "nobody has it now")
+    row = db().execute("SELECT why FROM releases WHERE task = ? AND agent = ? ORDER BY id DESC LIMIT 1",
+                       (t["id"], me)).fetchone()
+    taken = f" It went back to the board: {row[0]}." if row else ""
+    again = " If you still work on it, claim it again first." if t["state"] == "todo" else " Don't edit its files."
+    raise ToolError(f"task #{t['id']} isn't yours: {now}.{taken}{again}")
+
+
+def board_done(session, args):
+    """The owner finishes a task: Agon runs the human's test command, and the task goes to review, by an online agent
+    from another company. Like a Claude Code TaskCompleted hook the human set up, the tests run unasked, as the user,
+    outside the apps' sandboxes (board is a local tool, so Codex doesn't ask either): the human chose the command, and
+    an agent can change what it runs. Their outcome labels the review; red tests don't stop done."""
+    me, tid, note = session.me, task_id(args.get("id")), args.get("note") or ""
+    if not isinstance(note, str):
+        raise ToolError("`note` must be a string: what you did, and how you checked it.")
+    if problem := too_long(note, "note"):
+        raise ToolError(problem)
+    if paused():
+        raise ToolError(PAUSED)
+    owned(board_task(tid), me)
+    tests = test_command()  # a bad setting stops done before anything runs
+    folder = project_folder(args.get("cwd")) if tests else None
+
+    def halt():  # why the tests must stop now, if they must
+        if session.stopped():
+            return "the call was cancelled, or the app that asked is gone"
+        if paused():
+            return "the human paused the team"
+
+    outcome, report, problem = run_tests(tests, folder, time.monotonic() + (tests[1] + 60 if tests else 0), halt)
+    if problem:
+        raise ToolError(problem)
+    now = time.time()
+    with transaction() as con:
+        t = board_task(tid)
+        owned(t, me)  # it may have gone back to the board while the tests ran
+        online = reviewers(me, now)  # after changes, the one who asked for them looks again
+        reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
+        con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?"
+                    " WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+        said = f"\n{me}'s note: {clip(note, 1000)}" if note.strip() else ""
+        if reviewer:
+            post(me, reviewer, f"Task #{tid} is ready for your review ({outcome}): {t['title']}.{said}\nCheck it, then"
+                               f" call board: action review, id {tid}, verdict approve or changes, and your evidence.")
+            then = f"{reviewer} is asked to review it."
+        else:
+            post("agon", "human", f"Task #{tid} by {me} waits for a review ({outcome}): {t['title']}. No agent from"
+                                  " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
+            then = "No agent from another company is online to review it: the human is told."
+    return f"Task #{tid} is in review ({outcome}). {then}\n\n{report}", None
+
+
+def board_review(session, args):
+    """An agent from another company reviews a task: approve closes it (and frees the tasks that wait for it), changes
+    sends it back to its owner, or to the board when the owner is away. The verdict carries what the tests showed."""
+    me, tid, verdict, evidence = session.me, task_id(args.get("id")), args.get("verdict"), args.get("evidence")
+    if verdict not in ("approve", "changes"):
+        raise ToolError("`verdict` must be approve or changes.")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ToolError("`evidence` must say what you checked and what you found: the tests you ran, the code you read.")
+    if problem := too_long(evidence, "evidence"):
+        raise ToolError(problem)
+    now = time.time()
+    with transaction() as con:
+        t = board_task(tid)
+        owner, tests = t["owner"], t["tests"] or NO_TESTS
+        if t["state"] != "review":
+            raise ToolError(f"task #{tid} isn't waiting for a review: it is {STATES[t['state']]}.")
+        if owner == me:
+            raise ToolError("the agent that did a task doesn't review it: another company's agent does.")
+        if vendor(me) == vendor(owner):
+            raise ToolError(f"you and {owner} run in the same company's app: a review comes from another company's"
+                            " agent.")
+        said = f"\n{me}: {clip(evidence, 1500)}"
+        if verdict == "approve":
+            con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ? WHERE id = ?",
+                        (me, evidence, now, tid))
+            states = dict(con.execute("SELECT id, state FROM tasks"))
+            ready = [f"#{w['id']} {w['title']}" for w in board_tasks("WHERE state = 'todo'")
+                     if tid in w["after"] and all(states.get(i) == "done" for i in w["after"])]
+            if ready:  # anyone may take them now
+                post(me, "all", f"Approved task #{tid} ({tests}): {t['title']}. Ready to claim now: {'; '.join(ready)}."
+                                f"{said}")
+            else:
+                post(me, owner, f"Approved task #{tid} ({tests}): {t['title']}.{said}")
+            return f"Task #{tid} is done: approve ({tests})." + (f" Ready to claim now: {'; '.join(ready)}." if ready
+                                                                 else ""), None
+        if away(owner, now):  # the owner can't take it back now: anyone may
+            con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ? WHERE"
+                        " id = ?", (me, evidence, now, tid))
+            con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)",
+                        (tid, owner, f"{me} asked for changes while you were away"))
+            post(me, "all", f"Task #{tid} needs changes ({tests}), and {owner} is away: anyone may claim it."
+                            f" {t['title']}.{said}")
+            return f"Task #{tid}: changes ({tests}). {owner} is away, so it is back on the board.", None
+        con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ? WHERE id = ?",
+                    (me, evidence, now, tid))
+        post(me, owner, f"Changes asked on task #{tid} ({tests}): {t['title']}. It is yours again: change it, then"
+                        f" call board done.{said}")
+    return f"Task #{tid}: changes ({tests}). It goes back to {owner}.", None
+
+
 def tool_board(session, args):
     action = args.get("action")
-    handlers = {"list": board_list, "add": board_add, "claim": board_claim}
+    handlers = {"list": board_list, "add": board_add, "claim": board_claim, "done": board_done, "review": board_review}
     if action not in handlers:
         raise ToolError("`action` must be list, add, claim, done or review.")
     try:
@@ -1586,14 +1733,21 @@ def answer_apart(session, msg):
         close_db()
 
 
+def slow(params):
+    """Whether a tools/call may take minutes: an ask, or board's done, which runs the tests."""
+    args = params.get("arguments")
+    return params.get("name") == "ask" or params.get("name") == "board" and isinstance(args, dict) and args.get(
+        "action") == "done"
+
+
 def work(session, todo):
-    """Answer the queued requests in order. An ask runs for minutes, so it gets a thread of its own and send and inbox
-    keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the background, and the agent
-    goes on. The process waits for those threads: a closed client stops their apps first."""
+    """Answer the queued requests in order. An ask (or board's done) runs for minutes, so it gets a thread of its own
+    and the other tools keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the
+    background, and the agent goes on. The process waits for those threads: a closed client stops their apps first."""
     try:
         while (msg := todo.get()) is not EOF:
             params = msg.get("params") if isinstance(msg, dict) else None  # msg may be any JSON value
-            if isinstance(params, dict) and msg.get("method") == "tools/call" and params.get("name") == "ask":
+            if isinstance(params, dict) and msg.get("method") == "tools/call" and slow(params):
                 threading.Thread(target=answer_apart, args=(session, msg)).start()
             elif not answer(session, msg):
                 return
