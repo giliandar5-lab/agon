@@ -228,8 +228,10 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
   gemini too (its copy lacks your installed dependencies). For a task, in its worktree once the agent is done, before
   Agon commits; Agon stages the agent's work first, so what the tests leave behind isn't committed.
 - **How:** without a shell, so `&&`, `|` and `>` are refused: put several commands in a script, or name the shell in
-  a JSON list, such as `["sh", "-c", "npm run build && npm test"]` (`["cmd", "/c", "..."]` on Windows). The tests get
-  their own input and at most `AGON_TEST_TIMEOUT` seconds (300), within the ask's own time. Agon stops them, with
+  a JSON list, such as `["sh", "-c", "npm run build && npm test"]` (`["cmd", "/c", "..."]` on Windows). On Windows a
+  batch file such as npm's `npm.cmd` gets no `&`, `|`, `<`, `>`, `^`, `%` or quotes in its arguments, since cmd.exe
+  would read them as its own: put such a command in a script. The tests get their own input and at most
+  `AGON_TEST_TIMEOUT` seconds (300), within the ask's own time. Agon stops them, with
   everything they started, when time is up, and stops what they leave running when they end. Agon's own settings
   (`AGON_*`) aren't passed on to them.
 - **What you get:** the reviewer and the asking agent read the exit code and the end of the output, about 3,000

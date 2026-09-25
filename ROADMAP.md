@@ -158,8 +158,9 @@ Fix, so that every verdict rests on evidence Agon itself produced:
   the README says so.
   - How it runs: found with `shutil.which` (so npm finds npm.cmd; a relative path is taken from the tests' folder), no
     shell (a command line with `&&`, `;`, `|`, `>` or a leading `NAME=value` is refused with a hint: a script, or a
-    shell named in a JSON list), its own stdin, no console window, and without Agon's own settings (`AGON_*`) in its
-    environment, so a suite that uses Agon never starts an ask of its own. A timeout (`AGON_TEST_TIMEOUT`, default
+    shell named in a JSON list; on Windows a batch file whose arguments hold `&`, `|`, `<`, `>`, `^`, `%` or quotes
+    can't start, since cmd.exe would read them), its own stdin, no console window, and without Agon's own settings
+    (`AGON_*`) in its environment, so a suite that uses Agon never starts an ask of its own. A timeout (`AGON_TEST_TIMEOUT`, default
     300 s) inside the ask's own time (so Codex's 960 s still cover the whole ask), and the same process-tree kill as
     `ask`, at the timeout and on STOP or a cancel; what the tests leave running when they exit is stopped too (the
     process group on POSIX, a job of its own on Windows).

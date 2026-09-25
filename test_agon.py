@@ -1798,7 +1798,7 @@ for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers
                    "`(tests failed)`", "`(tests timed out)`", "`(tests could not start)`",
                    "`(no tests run: set AGON_TEST_CMD)`", "`VERDICT: approve (tests failed)`",
                    '`["sh", "-c", "npm run build && npm test"]`', '`["cmd", "/c", "..."]`', "`--watchAll=false`",
-                   "`AGON_*`", "`C:\\proj\\.venv\\Scripts\\python.exe -m pytest"):
+                   "`AGON_*`", "`C:\\proj\\.venv\\Scripts\\python.exe -m pytest", "`npm.cmd`"):
         assert needed in text, (readme, needed)
     for claim in gone:
         assert claim not in text, (readme, claim)
