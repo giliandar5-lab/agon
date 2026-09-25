@@ -1747,7 +1747,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`permissions.allow`", "`git worktree remove --force", "(v0.3)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.3)"):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -1758,6 +1758,25 @@ for readme, copy in (("README.md", "gemini\n  reviews a throwaway copy of your g
     text = (HERE / readme).read_text(encoding="utf-8")
     assert copy in text and "`.gitignore`" in text and "`agon-review-gemini-...`" in text, readme
 assert "- [x] Phase 3 — Cross-vendor second opinion (`ask`)" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+# Phase 3.1: both READMEs say that Agon runs the tests, not the reviewers, and document AGON_TEST_CMD with examples,
+# AGON_TEST_TIMEOUT, the plugin option, the verdict labels, where the command must work, and what it may do
+for readme, gone in (("README.md", ("Agon tells it to run the tests", "Reviewers run your tests", "permissions.allow")),
+                     ("README.ru.md", ("Agon просит его запустить тесты", "Рецензенты запускают твои тесты",
+                                       "permissions.allow"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in ("### Tests (`AGON_TEST_CMD`)" if readme == "README.md" else "### Тесты (`AGON_TEST_CMD`)",
+                   "#tests-agon_test_cmd" if readme == "README.md" else "#тесты-agon_test_cmd",
+                   "`AGON_TEST_CMD`", "`AGON_TEST_TIMEOUT`", "`python -m pytest -q`", "`npm test`",
+                   "`python test_agon.py`", "`/plugin configure agon@agon`",
+                   '`--config "test_command=python -m pytest -q"`', "`VERDICT: approve (tests passed)`",
+                   "`(tests failed)`", "`(tests timed out)`", "`(tests could not start)`",
+                   "`(no tests run: set AGON_TEST_CMD)`", "`VERDICT: approve (tests failed)`",
+                   '`["sh", "-c", "npm run build && npm test"]`', '`["cmd", "/c", "..."]`', "`--watchAll=false`",
+                   "`AGON_*`", "`C:\\proj\\.venv\\Scripts\\python.exe -m pytest"):
+        assert needed in text, (readme, needed)
+    for claim in gone:
+        assert claim not in text, (readme, claim)
+assert "- [x] Phase 3.1 — Review evidence" in (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 
 for a in (claude, gemini, gpt):
     a.close()

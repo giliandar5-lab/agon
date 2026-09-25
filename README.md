@@ -14,9 +14,10 @@ while you watch and steer from a live arena in your browser.
 each other better.*
 
 > **Status: early preview (v0.3).** Agon gives your agents a shared chat and you a live arena. Agents wake up on their
-> own, install with one command, notice when they hit a usage limit, and now ask each other for a second opinion
-> across vendors. Coming next: a task board that keeps working when one agent hits its usage limit, and duels that
-> show which AI is best on *your* code. See [ROADMAP.md](ROADMAP.md).
+> own, install with one command, notice when they hit a usage limit, and ask each other for a second opinion across
+> vendors, with a verdict that rests on your tests, which Agon runs itself. Coming next: a task board that keeps
+> working when one agent hits its usage limit, and duels that show which AI is best on *your* code. See
+> [ROADMAP.md](ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
@@ -45,10 +46,12 @@ Claude Code, inside Claude Code:
 /plugin install agon@agon
 ```
 
-When it asks for the Python command, keep `python3`; on Windows, type `py`. From a terminal, the same is
-`claude plugin marketplace add giliandar5-lab/agon`, then `claude plugin install agon@agon --config python=python3`
-(on Windows `--config python=py`). If you skip that choice, the Stop hook tells you to set it in
-`/plugin configure agon@agon`.
+When it asks for the Python command, keep `python3`; on Windows, type `py`. When it asks for the test command, give
+the one that runs your project's tests, such as `python -m pytest -q`, or leave it empty (see
+[Tests](#tests-agon_test_cmd)). From a terminal, the same is `claude plugin marketplace add giliandar5-lab/agon`, then
+`claude plugin install agon@agon --config python=python3` (on Windows `--config python=py`; add
+`--config "test_command=python -m pytest -q"` for the tests). If you skip the Python command, the Stop hook tells you to
+set it in `/plugin configure agon@agon`.
 
 Codex:
 
@@ -156,14 +159,16 @@ official command-line tool (`claude -p`, `codex exec`, `agy -p`) on your own pla
 answer. It takes minutes, and meanwhile Agon keeps answering the asking agent's `send` and `inbox` (Claude Code moves
 a tool call that takes over two minutes to the background and goes on).
 
-- **Review** (the default): the reviewer may only read. Agon tells it to run the tests, cite what they printed, and
-  end with `VERDICT: approve` or `VERDICT: changes`. Antigravity's plan mode doesn't keep it from writing, so gemini
+- **Review** (the default): Agon runs your tests first (see [Tests](#tests-agon_test_cmd)) and gives the reviewer
+  their results. The reviewer may only read, and ends with `VERDICT: approve` or `VERDICT: changes`; Agon adds what
+  the tests showed: `VERDICT: approve (tests passed)`. Antigravity's plan mode doesn't keep it from writing, so gemini
   reviews a throwaway copy of your git repository: your branches, what you staged and your files as they are,
   uncommitted changes included. Paths into your project in the prompt lead to the copy, and Agon deletes the copy
   afterwards, with whatever the reviewer changed in it.
 - **Task:** the other agent works on a new branch, `agon/<agent>-<time>`, from your last commit, in a temporary
-  `git worktree` (your uncommitted changes aren't in it). Agon commits what it changed, removes the worktree and
-  returns its summary, `git diff --stat` and the branch. Merging is your call: `git merge agon/gpt-...`.
+  `git worktree` (your uncommitted changes aren't in it). Then Agon runs your tests there, commits what the agent
+  changed, removes the worktree and returns its summary, the test results, `git diff --stat` and the branch. Merging
+  is your call: `git merge agon/gpt-...`.
 - **Out of quota:** when the agent is out of quota, or its app reports a usage limit, Agon marks it, tells the team
   and gives the same ask to the next agent in `AGON_FALLBACK` (default `claude,gpt,gemini`, never the asker). The
   answer says who actually answered.
@@ -201,15 +206,44 @@ In each app:
   ```
 
   Codex also cuts tool calls off after 60 seconds, so the plugin raises that to 960 (`tool_timeout_sec`); for a
-  hand-made setup, `setup` prints the lines.
-- **Reviewers run your tests** only where their app allows it: Claude in plan mode runs the commands its auto mode
-  approves (without auto mode, only read-only ones), Codex's read-only sandbox runs commands but blocks writes, and
-  Antigravity runs a shell command only when `permissions.allow` in `~/.gemini/antigravity-cli/settings.json` lets
-  it. If a review says it couldn't run the tests, allow your test command there.
+  hand-made setup, `setup` prints the lines. With `AGON_TEST_CMD` set, an approved `ask` also runs your tests outside
+  Codex's sandbox (see [Tests](#tests-agon_test_cmd)).
+- **Reviewers stay read-only:** Claude in plan mode, Codex in its read-only sandbox, gemini in its copy. Run headless,
+  they couldn't run your tests anyway (Claude Code's plan mode denies commands in `-p`, and Codex's sandbox may not
+  reach your Python), so Agon runs them.
 - An app that `ask` starts never takes the team's messages: its Stop hook lets it stop at once, and Agon's tools are
   off inside it.
 
 Agon only runs the vendors' official command-line apps, logged in as you, within your own plans' limits.
+
+### Tests (`AGON_TEST_CMD`)
+
+Agon runs your tests itself, so that every verdict rests on what they printed, not on a reviewer's word.
+
+- **Set the command once:** `AGON_TEST_CMD`, a command line or a JSON list, such as `python -m pytest -q`, `npm test`
+  or `python test_agon.py`. Put it in the environment your apps start with (`python agon.py setup` prints the line),
+  or, in Claude Code, in the plugin's settings: `/plugin configure agon@agon`, *Test command*. `AGON_TEST_CMD` comes
+  first. An agent can't pass a test command to `ask`: only you choose what runs.
+- **When:** for a review, once, in your project folder, before the reviewer starts; every reviewer gets that run,
+  gemini too (its copy lacks your installed dependencies). For a task, in its worktree once the agent is done, before
+  Agon commits; Agon stages the agent's work first, so what the tests leave behind isn't committed.
+- **How:** without a shell, so `&&`, `|` and `>` are refused: put several commands in a script, or name the shell in
+  a JSON list, such as `["sh", "-c", "npm run build && npm test"]` (`["cmd", "/c", "..."]` on Windows). The tests get
+  their own input and at most `AGON_TEST_TIMEOUT` seconds (300), within the ask's own time. Agon stops them, with
+  everything they started, when time is up, and stops what they leave running when they end. Agon's own settings
+  (`AGON_*`) aren't passed on to them.
+- **What you get:** the reviewer and the asking agent read the exit code and the end of the output, about 3,000
+  characters. The verdict says what came of the tests, in the reply and in the arena:
+  `VERDICT: approve (tests passed)`, `(tests failed)`, `(tests timed out)`, `(tests could not start)` or
+  `(no tests run: set AGON_TEST_CMD)`. The reviewer is told to approve only if the tests passed; if it approves
+  anyway, `VERDICT: approve (tests failed)` shows it. A task's reply names the outcome after its branch.
+- **Make it work where Agon runs it:** your apps start Agon without your terminal's virtual environment, so name its
+  Python by the full path: `C:\proj\.venv\Scripts\python.exe -m pytest -q` or
+  `/home/me/proj/.venv/bin/python -m pytest -q`. A task's worktree has only what git tracks: no `node_modules` or
+  `.venv` unless the command installs them. A runner in watch mode never ends (for Jest, add `--watchAll=false`).
+  Codex passes Agon only the variables it lists.
+- **Security:** Agon runs the command as you, outside the apps' sandboxes, on the files your agents wrote: an agent
+  that can edit the tests decides what they do. Keep that in mind before you let Codex run `ask` without asking.
 
 ## How it works
 
@@ -237,7 +271,9 @@ Agon only runs the vendors' official command-line apps, logged in as you, within
   may stay behind: `git worktree list` shows it, and `git worktree remove --force <path>` removes it. A gemini
   review's copy (`agon-review-gemini-...` in your temporary folder) may stay behind the same way; delete it.
 - A gemini review needs a git repository with a commit, and its copy leaves out what `.gitignore` does, such as
-  installed dependencies: tests that need them may not run there.
+  installed dependencies (Agon runs the tests in your project folder, where they are).
+- `AGON_TEST_CMD` is one command for every project your apps open. For another project, start the apps from a
+  terminal where it names that project's tests. Asks that run at the same time run their tests at the same time too.
 - There is no file locking: "announce before you edit" is a team rule, not a lock.
 
 ## Test

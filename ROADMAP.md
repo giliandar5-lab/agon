@@ -20,7 +20,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 1 — Solid core
 - [x] Phase 2 — Agents wake up on their own, one-command install, limit awareness
 - [x] Phase 3 — Cross-vendor second opinion (`ask`)
-- [ ] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
+- [x] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
 - [ ] Phase 4 — Task board (no downtime)
 - [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [ ] Phase 6 — The arena
@@ -151,22 +151,38 @@ An audit on a Windows 11 PC ran `ask` in review mode with the **real** apps on a
   finish"), since `acceptEdits` doesn't approve shell commands in `-p` either.
 
 Fix, so that every verdict rests on evidence Agon itself produced:
-- **Agon runs the tests, not the reviewer.** `AGON_TEST_CMD` (a command line or a JSON list, set by the human in the
-  environment or the plugin config; never taken from a tool argument, so an agent can't use it to run commands
-  outside its own app's sandbox) runs with a timeout (`AGON_TEST_TIMEOUT`, default 300 s), no shell, its own stdin
-  and the same process-tree kill as `ask`. Review: in the project folder before the reviewer starts (for gemini, in
-  its throwaway copy). Task: in the task's worktree after the app finishes, before Agon commits. Its exit code and
-  output tail go into the reviewer's prompt ("Test results, run by Agon: …") and into the ask's result.
-- **A verdict states its evidence.** The result says `VERDICT: approve (tests passed)`, `VERDICT: approve (tests
-  failed)` or `VERDICT: approve (no tests run: set AGON_TEST_CMD)`; the arena line says the same. The review prompt
-  tells the reviewer to approve only if the tests Agon ran passed, and to report failing tests as changes.
+- **Agon runs the tests, not the reviewer.** `AGON_TEST_CMD` (a command line or a JSON list) is set by the human, in
+  the environment or in the Claude Code plugin's Test command option, which the plugin hands to Agon's server as
+  `CLAUDE_PLUGIN_OPTION_TEST_COMMAND` (`AGON_TEST_CMD` comes first). It is never taken from a tool argument, so an agent
+  can't choose the command line; it can still edit what the command runs (tests, `package.json`, `conftest.py`), and
+  the README says so.
+  - How it runs: found with `shutil.which` (so npm finds npm.cmd; a relative path is taken from the tests' folder), no
+    shell (a command line with `&&`, `;`, `|`, `>` or a leading `NAME=value` is refused with a hint: a script, or a
+    shell named in a JSON list), its own stdin, no console window, and without Agon's own settings (`AGON_*`) in its
+    environment, so a suite that uses Agon never starts an ask of its own. A timeout (`AGON_TEST_TIMEOUT`, default
+    300 s) inside the ask's own time (so Codex's 960 s still cover the whole ask), and the same process-tree kill as
+    `ask`, at the timeout and on STOP or a cancel; what the tests leave running when they exit is stopped too (the
+    process group on POSIX, a job of its own on Windows).
+  - Review: once per ask, in the project folder, before the first reviewer starts. Every reviewer reads that run: a
+    fallback, and gemini in its throwaway copy, which lacks what `.gitignore` leaves out (`node_modules`, `.venv`).
+  - Task: in the task's worktree once the app has finished, before Agon commits. Agon stages the app's work first and
+    commits only that, so what the tests leave behind stays out of the branch.
+  - Its exit code and output tail go into the reviewer's prompt ("Test results, run by Agon: …", indented as data from
+    the code under test) and into the ask's result: stdout and stderr in order, the last ~3,000 characters, read as
+    UTF-8, else on Windows as the ANSI code page (`mbcs`, not `locale.getpreferredencoding()`, see the facts below).
+- **A verdict states its evidence.** The result says `VERDICT: approve (tests passed)`, `(tests failed)`,
+  `(tests timed out)`, `(tests could not start)` or `(no tests run: set AGON_TEST_CMD)`, decided only from what Agon saw
+  itself (the exit code, its own kill, a start that failed), never from the output; the arena line says the same, and
+  a task names the outcome after its branch. The review prompt tells the reviewer to approve only if the tests Agon ran
+  passed, to report failing or unfinished tests as changes, and to say so when no tests ran.
 - **No AGON_TEST_CMD:** the ask still works, the result says clearly that no tests ran, and `setup`/README explain
   how to set it (examples: `python -m pytest -q`, `npm test`, `python test_agon.py`).
 - Keep the reviewers read-only (plan mode, read-only sandbox, gemini's copy): with Agon running the tests they no
   longer need shell access.
 - README: correct the claims that reviewers run the tests; document `AGON_TEST_CMD`, `AGON_TEST_TIMEOUT`.
-- Tests: fake CLIs plus a fake test command that passes, fails, prints a lot, hangs past the timeout; verdict labels
-  for each; `AGON_TEST_CMD` passed as a tool argument is ignored; a task's tests run in its worktree.
+- Tests: fake CLIs plus a fake test command that passes, fails, prints a lot, hangs past the timeout, forges Agon's
+  report, writes cp1251, leaves a process behind; verdict labels for each; `AGON_TEST_CMD` passed as a tool argument
+  is ignored; a task's tests run in its worktree; the ANSI fallback under `-X utf8`; the real `npm test` where npm is.
 - Manual test on Windows: repeat the audit (a tiny repo, `AGON_TEST_CMD=python test_app.py`, a real claude review)
   and check that the result quotes Agon's test run and the verdict label.
 
@@ -284,6 +300,12 @@ Sources are official docs unless marked *(secondary)*. Re-check when you can; th
   about 3 minutes, then `is_error: true`, `api_error_status: 429`, `result: "API Error: Request rejected (429) · ..."`
   and exit 1 (with an API key; a plan's usage-limit text wasn't seen). `-p` runs the project's Stop hooks and its
   MCP servers with the caller's environment. On exit Claude Code ends its MCP servers with SIGINT.
+- Plugin options (`userConfig`), seen with 2.1.282 and a real `claude -p` against a mock API (Phase 3.1): hooks get them
+  as `CLAUDE_PLUGIN_OPTION_<KEY>`, but a plugin's MCP server doesn't, although the
+  [docs](https://code.claude.com/docs/en/plugins-reference) say it does (nor does `claude mcp list`'s health check).
+  `"env": {"NAME": "${user_config.KEY}"}` in the server's config passes one; an option that was never set arrives as
+  its `default` (`claude plugin install` then says "1 userConfig option not yet set"). Plugin options are read only
+  from user, `--settings` and managed settings, never from a project's `.claude/settings*.json` (docs).
 - Plan mode lets the auto-mode classifier approve shell commands; without auto mode only the read-only set runs
   ([docs](https://code.claude.com/docs/en/permission-modes)). MCP tool calls: a wall-clock limit of
   `MCP_TOOL_TIMEOUT` (about 28 h by default) or a server's `timeout`, an idle limit of 30 min for stdio servers, and a
@@ -388,6 +410,16 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   into 1: a hook can't count on exit code 2 there, while a JSON decision on stdout gets through.
 - On Windows 11 with python.org Python 3.12 or 3.14, `python3` is the Microsoft Store stub (exit 9009) and `py -3`
   and `python` work (the maintainer's machine).
+- Python writes to a file or a pipe in the ANSI code page (cp1251 on a Russian Windows) unless UTF-8 mode is on
+  ([docs](https://docs.python.org/3/library/sys.html#sys.stdout)). In UTF-8 mode (`PYTHONUTF8=1`, `-X utf8`, the default
+  from Python 3.15) `locale.getpreferredencoding(False)` says `utf-8` whatever the other programs write, while
+  `bytes.decode("mbcs")` still reads the ANSI code page (the maintainer's Windows 11, Russian locale, Python 3.12.10 and
+  3.14.0 under `-X utf8`). `mbcs` exists on Windows only.
+- A batch file such as npm's `npm.cmd` starts through CreateProcess only by its full name (`shutil.which` adds the
+  PATHEXT ending), and then cmd.exe parses its arguments
+  ([docs](https://docs.python.org/3/library/subprocess.html#security-considerations)). In Python 3.12.0,
+  `shutil.which` could return the extensionless `npm` next to it, which Windows can't start
+  ([cpython#109590](https://github.com/python/cpython/issues/109590)) *(secondary)*.
 
 **MCP protocol**
 - Revision `2026-07-28` is stateless (no `initialize`; version and client info travel in `_meta`; `server/discover`
