@@ -978,7 +978,7 @@ in_repo("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "firs
 assert agon.MODE_ARGS["task"] == {"claude": ["--permission-mode", "acceptEdits"],
                                   "gpt": ["--sandbox", "workspace-write"], "gemini": ["--mode", "accept-edits"]}
 res, text = asked(rev, agent="gpt", prompt="EDIT notes.txt, please", mode="task", cwd=str(repo / "sub"))
-run, branch = fake_runs()[-1], re.search(r"on branch (agon/gpt-[\d-]+):", text)[1]
+run, branch = fake_runs()[-1], re.search(r"on branch (agon/gpt-[\d-]+) \(no tests run: set AGON_TEST_CMD\):", text)[1]
 assert "isError" not in res and text.startswith("gpt finished the task in "), text
 assert "notes.txt | 1 +\n 1 file changed, 1 insertion(+)\n" in text, text
 assert f"Merge it if you want it: git merge {branch} (or drop it: git branch -D {branch})." in text, text
@@ -991,8 +991,8 @@ assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"  # commi
 assert in_repo("log", "-1", "--format=%an <%ae>|%s", branch) == "gpt (Agon) <agon@localhost>|gpt: EDIT notes.txt," \
                                                                 " please"
 assert not (repo / "sub" / "notes.txt").exists() and in_repo("status", "--porcelain") == ""  # ...not in the caller's
-assert re.fullmatch(rf"rev asked gpt for a task: gpt finished in \d+s on branch {branch}: 1 file changed,"
-                    r" 1 insertion\(\+\)\.", agon_said()), agon_said()
+assert re.fullmatch(rf"rev asked gpt for a task: gpt finished in \d+s on branch {branch} \(no tests run: set"
+                    r" AGON_TEST_CMD\): 1 file changed, 1 insertion\(\+\)\.", agon_said()), agon_said()
 res, text = asked(rev, agent="gemini", prompt="EDIT g.txt and then CRASH", mode="task", cwd=str(repo))
 run = fake_runs()[-1]
 assert run["args"][-4:] == ["--add-dir", run["args"][-3], "--mode", "accept-edits"], run["args"]
@@ -1000,7 +1000,8 @@ assert Path(run["args"][-3]).resolve() == Path(run["cwd"]).resolve()  # agy's --
 assert res["isError"] is True and "gemini failed after" in text and "What it changed is on branch agon/gemini-" in text
 assert "g.txt | 1 +" in text and agon_said().endswith("1 file changed, 1 insertion(+)"), text  # the work is kept
 res, text = asked(rev, agent="claude", prompt="Just look around", mode="task", cwd=str(repo))
-assert re.fullmatch(r"claude finished the task in \d+s without changing any file\.\n\nIts summary:\n"
+assert re.fullmatch(r"claude finished the task in \d+s without changing any file \(no tests run: set AGON_TEST_CMD\)\."
+                    rf"\n\n{re.escape(NONE)}\n\nIts summary:\n"
                     r"claude looked at agon-claude-\w+: 3 tests passed\.\nVERDICT: approve", text), text
 assert fake_runs()[-1]["args"][-2:] == ["--permission-mode", "acceptEdits"]
 assert in_repo("branch", "--list", "agon/claude-*") == "" and len(in_repo("worktree", "list").splitlines()) == 1
@@ -1150,7 +1151,7 @@ mark("claude", 0)
 once = Agent("rev5", env=ASK | {"FAKE_LIMIT": "codex"})
 res, text = asked(once, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
 assert re.match(r"gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\), so claude finished the task in"
-                r" \d+s on branch agon/claude-[\d-]+:\n part\.txt \| 1 \+\n", text), text
+                r" \d+s on branch agon/claude-[\d-]+ \(no tests run: set AGON_TEST_CMD\):\n part\.txt \| 1 \+\n", text), text
 claude_branch = re.findall(r"agon/claude-[\d-]+", text)[0]
 assert in_repo("show", f"{claude_branch}:part.txt") == "written by claude"
 once.close()
@@ -1630,6 +1631,40 @@ if shutil.which("npm"):  # the real npm: npm.cmd on Windows, found through PATHE
             until(lambda: not beating())
             until(lambda: agon_said().startswith("npmer asked claude for a review: Agon stopped the tests after "))
         npmer.close()
+
+# Phase 3.1, 5 and 7-8. A task's tests run in its worktree once its app is done, before Agon commits: Agon stages the
+# app's work first, so what the tests leave behind isn't committed, and stops what they left running. The reply and the
+# arena say what came of them
+BEAT.unlink(missing_ok=True)
+tasker, runs = Agent("tasker", env=with_tests("leave")), len(fake_runs())
+res, text = asked(tasker, agent="gpt", prompt="EDIT notes.txt, please", mode="task", cwd=str(repo / "sub"))
+worked, tested = fake_runs()[runs:]
+branch = re.search(r"on branch (agon/gpt-[\d-]+) \(tests passed\):\n", text)[1]
+assert since(runs) == ["codex", "tests"] and tested["cwd"] == worked["cwd"] and Path(worked["cwd"]).name == "sub"
+assert "notes.txt" in tested["files"] and not Path(tested["cwd"]).exists() and not beating(), tested  # after the app
+assert "\n    the tests saw: written by codex\n\nIts summary:\ncodex looked at sub" in text, text
+assert "notes.txt | 1 +\n 1 file changed, 1 insertion(+)\n" in text and "leftover" not in text, text
+assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"
+assert in_repo("ls-tree", "-r", "--name-only", branch).splitlines() == ["sub/app.py", "sub/notes.txt"]  # no leftover.txt
+assert f"When you finish, Agon runs the project's tests (`{agon.command_line(fake_tests('leave')[0])}`) there, commits" \
+       f" what you changed to branch {branch}" in worked["prompt"], worked["prompt"]
+assert re.fullmatch(rf"tasker asked gpt for a task: gpt finished in \d+s on branch {branch} \(tests passed\): 1 file"
+                    r" changed, 1 insertion\(\+\)\.", agon_said()), agon_said()
+tasker.close()
+failing, runs = Agent("failing", env=with_tests("fail")), len(fake_runs())  # failing tests: the work is still there
+res, text = asked(failing, agent="claude", prompt="EDIT broken.txt, please", mode="task", cwd=str(repo))
+assert "isError" not in res and re.match(r"claude finished the task in \d+s on branch agon/claude-[\d-]+ \(tests"
+                                         r" failed\):\n broken\.txt \| 1 \+", text), text
+res, text = asked(failing, agent="gemini", prompt="EDIT g2.txt and then CRASH", mode="task", cwd=str(repo))
+assert res["isError"] is True and since(runs) == ["claude", "tests", "agy"], text  # an app that failed: no tests run
+failing.close()
+BEAT.unlink(missing_ok=True)  # the ask's time runs out during the tests: they timed out, and the work is on its branch
+late = Agent("late", env=with_tests("hang", AGON_ASK_TIMEOUT="5"))
+res, text = asked(late, agent="claude", prompt="EDIT late.txt, please", mode="task", cwd=str(repo))
+assert "isError" not in res and re.match(r"claude finished the task in \d+s on branch agon/claude-[\d-]+ \(tests timed"
+                                         r" out\):\n late\.txt \| 1 \+", text), text
+assert "until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it." in text and not beating(), text
+late.close()
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

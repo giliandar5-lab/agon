@@ -96,9 +96,9 @@ REVIEW_COPY = {"gemini"}
 COPY = (" You work in a throwaway copy of the project that has its uncommitted changes; what .gitignore leaves out,"
         " such as installed dependencies, and links that lead out of the project aren't in it.")
 TASK = """{asker} asks you to do a task through Agon, where AI agents from different companies build one project.
-You work in a git worktree of your own. When you finish, Agon commits what you changed to branch {branch}, and
+You work in a git worktree of your own. When you finish, Agon {tests}commits what you changed to branch {branch}, and
 {asker} decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, ask).
-Run the tests before you finish, and end with a short summary: what you changed and what the tests said.
+End with a short summary of what you changed.
 
 The task from {asker}:
 {prompt}"""
@@ -947,16 +947,18 @@ def same_folder(top, path, cwd):
     return str(folder) if folder.is_dir() else path
 
 
-def keep_work(top, path, branch, base, name, message):
+def keep_work(top, path, branch, base, name, message, staged=False):
     """Commit what agent `name`'s app changed in worktree `path` to its branch, remove the worktree and return the
-    branch's `git diff --stat` from `base`: None when nothing changed, and then the branch goes too."""
-    if git(path, "status", "--porcelain"):
-        try:
+    branch's `git diff --stat` from `base`: None when nothing changed, and then the branch goes too. When the work is
+    `staged` already (Agon stages it before it runs the tests), only that is committed, not what the tests left."""
+    try:
+        if not staged:
             git(path, "add", "-A")
+        if git(path, "diff", "--cached", "--name-only"):
             git(path, "-c", f"user.name={name} (Agon)", "-c", "user.email=agon@localhost", "-c", "commit.gpgsign=false",
                 "commit", "-q", "--no-verify", "-m", message)
-        except ToolError as e:
-            raise ToolError(f"{e} The work stays in {path}, on branch {branch}.") from None
+    except ToolError as e:
+        raise ToolError(f"{e} The work stays in {path}, on branch {branch}.") from None
     stat = git(top, "-c", "core.quotepath=off", "diff", "--stat", f"{base}..{branch}").splitlines()
     try:
         git(top, "worktree", "remove", "--force", path)
@@ -1026,12 +1028,19 @@ def ask_once(asker, name, mode, prompt, cwd, top, end, stopped, tests, tested):
             rmtree(copy)  # and with it whatever the reviewer changed
         return answer and repath(answer, back, mine), problem and repath(problem, back, mine), limit, None, None, tested
     path, branch, base = new_worktree(top, name)  # a task works on a branch of its own, in a temporary worktree
+    folder, tested, staged = same_folder(top, path, cwd), None, False
+    runs = f"runs the project's tests (`{command_line(tests[0])}`) there, " if tests else ""
     try:
-        answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt),
-                                         same_folder(top, path, cwd), end, stopped)
+        answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt,
+                                                                        tests=runs), folder, end, stopped)
+        if not problem:  # its app is done: Agon runs the tests on its work, which it stages first, so what the tests
+            git(path, "add", "-A")  # leave behind (caches, reports, snapshots they rewrote) isn't committed
+            staged = True
+            outcome, report, problem = run_tests(tests, folder, end, stopped)
+            tested = None if problem else (outcome, report)
     finally:
-        stat = keep_work(top, path, branch, base, name, f"{name}: {' '.join(prompt.split())[:72]}")
-    return answer, problem, limit, (branch if stat else None), stat, None
+        stat = keep_work(top, path, branch, base, name, f"{name}: {' '.join(prompt.split())[:72]}", staged)
+    return answer, problem, limit, (branch if stat else None), stat, tested
 
 
 def tool_ask(session, args):
@@ -1086,20 +1095,21 @@ def tool_ask(session, args):
             problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
         post("agon", "human", f"{head}: {lead if name else ''}{problem}")  # every ask shows in the arena, wakes no one
         raise ToolError(f"{lead if name else ''}{problem}")
+    outcome, report = tested  # what Agon's own run of the tests showed, whatever the agent says
+    summary = clip(answer, MAX_INBOX - 500 - len(report))
     if branch:
-        post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch}:"
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch} ({outcome}):"
                               f" {stat.splitlines()[-1].strip()}.")
-        return (f"{lead}{name} finished the task in {spent} on branch {branch}:\n{stat}\nMerge it if you want it: git"
-                f" merge {branch} (or drop it: git branch -D {branch}).\n\nIts summary:\n{clip(answer)}"), None
+        return (f"{lead}{name} finished the task in {spent} on branch {branch} ({outcome}):\n{stat}\nMerge it if you"
+                f" want it: git merge {branch} (or drop it: git branch -D {branch}).\n\n{report}\n\nIts summary:\n"
+                f"{summary}"), None
     if top:
-        post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file.")
-        return (f"{lead}{name} finished the task in {spent} without changing any file.\n\nIts summary:\n"
-                f"{clip(answer)}"), None
-    outcome, report = tested  # the verdict says what Agon's run of the tests showed, whatever the reviewer says
+        post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file ({outcome}).")
+        return (f"{lead}{name} finished the task in {spent} without changing any file ({outcome}).\n\n{report}\n\n"
+                f"Its summary:\n{summary}"), None
     seal = (f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict") + f" ({outcome})"
     post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
-    return (f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n"
-            f"{clip(answer, MAX_INBOX - 500 - len(report))}"), None
+    return f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n{summary}", None
 
 
 TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
