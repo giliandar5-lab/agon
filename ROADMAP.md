@@ -34,15 +34,20 @@ When asked to do "the next phase":
    separate sessions.
 2. Read this whole file (including "Working rules" and "Verified platform facts"), then README.md, agon.py and
    test_agon.py.
-3. Turn every bullet of the phase into a numbered checklist. Show the checklist and a short plan to the user and
-   wait for approval.
-4. Work item by item: implement, add assert-based checks to test_agon.py, run `python test_agon.py`, commit.
+3. Research before you plan. Find the phase's open questions: how comparable tools solve the same problem, the
+   current docs of every CLI, hook and manifest it relies on, and what can go wrong on Windows. Research them with
+   `/deep-research` (if you can't start it yourself, give the user the exact `/deep-research …` line to send), and
+   give the strongest argument against each key decision. Where the findings contradict this roadmap, say so and
+   let the user decide.
+4. Turn every bullet of the phase into a numbered checklist. Show the research's findings, the checklist and a short
+   plan to the user and wait for approval.
+5. Work item by item: implement, add assert-based checks to test_agon.py, run `python test_agon.py`, commit.
    Never move on while tests fail.
-5. If something is ambiguous, pick the simplest option that satisfies this roadmap and note it in the pull request.
-6. Done means: every checklist item is implemented and covered by a test, `python test_agon.py` prints `ok`, the
+6. If something is ambiguous, pick the simplest option that satisfies this roadmap and note it in the pull request.
+7. Done means: every checklist item is implemented and covered by a test, `python test_agon.py` prints `ok`, the
    phase is ticked in Progress, and a pull request lists each item with how it was verified, what could not be
    verified, and step-by-step manual test instructions for Windows.
-7. Reply in the language the user writes in.
+8. Reply in the language the user writes in.
 
 ## Design principles (and why)
 
