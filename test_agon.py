@@ -1781,6 +1781,7 @@ agon.migrate(v03)
 assert v03.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
 assert [row[1] for row in v03.execute("PRAGMA table_info(tasks)")][:6] == ["id", "title", "spec", "files", "after", "state"]
 assert [row[1] for row in v03.execute("PRAGMA table_info(releases)")] == ["id", "task", "agent", "why", "told"]
+assert [row[1] for row in v03.execute("PRAGMA table_info(tasks)")][-1] == "version"  # every change moves it on
 v03.close()
 if sys.version_info >= (3, 12):  # SQLite's own autocommit mode, whatever Python's default becomes: BEGIN IMMEDIATE works
     assert agon.db().autocommit is True
