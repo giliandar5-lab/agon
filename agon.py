@@ -229,6 +229,9 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     # the tasks Agon took from an agent (a usage limit, or no sign of it for AGON_LEASE s): the agent hears which, once
     "CREATE TABLE releases(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, agent TEXT NOT NULL, why TEXT NOT NULL,"
     " told INTEGER NOT NULL DEFAULT 0)",
+    # every change to a task moves its version on, so a verdict counts only for the task it saw. A time can't tell two
+    # changes apart: before Python 3.13, time.time() on Windows moves in 15.625 ms steps
+    "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
 ]
 _local = threading.local()
 
@@ -328,11 +331,14 @@ def too_long(text, what="message"):
 
 def touch(me, client=None):
     """Note that agent `me` was just seen; `client` (the app, from initialize) is kept until a new one comes.
-    Best effort: presence never fails the request it came with."""
+    last_seen only grows, across all agents: the agent seen last has the latest one, even when the clock hasn't moved
+    (before Python 3.13, time.time() on Windows moves in 15.625 ms steps), so the most recently seen is always one
+    agent (see reviewers()). Best effort: presence never fails the request it came with."""
     try:
         db().execute(
-            "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
-            " client = COALESCE(excluded.client, client), last_seen = excluded.last_seen",
+            "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, max(?, (SELECT COALESCE(MAX(last_seen), 0) + 1e-6"
+            " FROM agents))) ON CONFLICT(name) DO UPDATE SET client = COALESCE(excluded.client, client), last_seen ="
+            " excluded.last_seen",
             (me, client, time.time()),
         )
     except sqlite3.Error:
@@ -1211,7 +1217,7 @@ def tool_ask(session, args):
 
 # The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
 # an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
-BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, updated FROM"
+BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version FROM"
              " tasks")
 FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
 STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
@@ -1431,8 +1437,8 @@ def board_claim(session, args):
                  for theirs in other["files"] if any(overlap(theirs, mine) for mine in t["files"])]
         if taken:
             raise ToolError(f"{'; '.join(taken)}. Pick another task, or wait until that one is done.")
-        if con.execute("UPDATE tasks SET state = 'doing', owner = ?, updated = ? WHERE id = ? AND owner IS NULL"
-                       " AND state = 'todo'", (me, time.time(), tid)).rowcount != 1:
+        if con.execute("UPDATE tasks SET state = 'doing', owner = ?, updated = ?, version = version + 1 WHERE id = ?"
+                       " AND owner IS NULL AND state = 'todo'", (me, time.time(), tid)).rowcount != 1:
             raise ToolError(f"task #{tid} was just claimed by someone else.")  # the checks above make this rare
         post(me, "human", f"Claimed task #{tid}: {t['title']}.")  # the arena only: nobody needs to act on it
     files = f": edit only its files ({', '.join(t['files'])})" if t["files"] else ""
@@ -1503,8 +1509,8 @@ def release(con, agent, note, why, now):
     taken = board_tasks("WHERE state = 'doing' AND owner = ?", (agent,))
     for t in taken:  # the earlier notes stay, newest first: the next owner must see what a reviewer asked for
         notes = f"reassigned: {note}" + (f"\n{t['note']}" if t["note"].strip() else "")
-        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, note = ?, updated = ? WHERE id = ?",
-                    (clip(notes, MAX_TEXT), now, t["id"]))
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, note = ?, updated = ?, version = version + 1 WHERE"
+                    " id = ?", (clip(notes, MAX_TEXT), now, t["id"]))
         con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)", (t["id"], agent, why))
     if taken:
         tasks = "; ".join(f"#{t['id']} {t['title']}" for t in taken)
@@ -1513,7 +1519,7 @@ def release(con, agent, note, why, now):
                             " claim.")
     for t in board_tasks("WHERE state = 'review' AND reviewer = ?", (agent,)):  # its reviews go to someone else
         reviewer = next((name for name in reviewers(t, now) if name != agent), None)
-        con.execute("UPDATE tasks SET reviewer = ? WHERE id = ?", (reviewer, t["id"]))
+        con.execute("UPDATE tasks SET reviewer = ?, version = version + 1 WHERE id = ?", (reviewer, t["id"]))
         tests = t["tests"] or NO_TESTS
         if reviewer:
             post("agon", reviewer, f"Task #{t['id']} is ready for your review ({tests}): {t['title']}. {agent} can't"
@@ -1543,7 +1549,7 @@ def reap():
             release(con, agent, f"{agent} sent no sign of life for {gone}", f"Agon saw no sign of you for {gone}", now)
         for t in board_tasks(unasked):
             if reviewer := next(iter(reviewers(t, now)), None):
-                con.execute("UPDATE tasks SET reviewer = ? WHERE id = ?", (reviewer, t["id"]))
+                con.execute("UPDATE tasks SET reviewer = ?, version = version + 1 WHERE id = ?", (reviewer, t["id"]))
                 post("agon", reviewer, f"Task #{t['id']} by {t['owner']} is ready for your review"
                                        f" ({t['tests'] or NO_TESTS}): {t['title']}. Check it, then call board: action"
                                        f" review, id {t['id']}, verdict approve or changes, and your evidence.")
@@ -1607,8 +1613,9 @@ def board_done(session, args):
         owned(t, me)  # it may have gone back to the board while the tests ran
         online = reviewers(t, now)  # after changes, the one who asked for them looks again
         reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
-        con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?"
-                    " WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+        con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?,"
+                    " version = version + 1 WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+        version = t["version"] + 1  # what an automatic review must still find: nothing else wrote meanwhile
         said = f"\n{me}'s note:\n{indented(clip(note.strip(), 1000))}" if note.strip() else ""
         if reviewer:
             post(me, reviewer, f"Task #{tid} is ready for your review ({outcome}): {t['title']}.{said}\nCheck it, then"
@@ -1625,7 +1632,7 @@ def board_done(session, args):
                                   " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
             then = "No agent from another company is online to review it: the human is told."
     if not reviewer and auto:  # after the commit: the review reads the task as done left it
-        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report), now)).start()
+        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report), version)).start()
     return f"Task #{tid} is in review ({outcome}). {then}\n\n{report}", None
 
 
@@ -1658,8 +1665,8 @@ def settle(t, reviewer, verdict, evidence, sender, by):
     con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
     said = f"\n{by}:\n{indented(clip(evidence.strip(), 1500))}"
     if verdict == "approve":
-        con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ? WHERE id = ?",
-                    (reviewer, evidence, now, tid))
+        con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
+                    " id = ?", (reviewer, evidence, now, tid))
         states = dict(con.execute("SELECT id, state FROM tasks"))
         ready = [f"#{w['id']} {w['title']}" for w in board_tasks("WHERE state = 'todo'")
                  if tid in w["after"] and all(states.get(i) == "done" for i in w["after"])]
@@ -1670,27 +1677,27 @@ def settle(t, reviewer, verdict, evidence, sender, by):
             post(sender, owner, f"Approved task #{tid} ({tests}): {t['title']}.{said}")
         return f"Task #{tid} is done: approve ({tests})." + (f" Ready to claim now: {'; '.join(ready)}." if ready else "")
     if away(owner, now):  # the owner can't take it back now: anyone may
-        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ? WHERE id = ?",
-                    (reviewer, evidence, now, tid))
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ?, version ="
+                    " version + 1 WHERE id = ?", (reviewer, evidence, now, tid))
         con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)",
                     (tid, owner, f"{reviewer} asked for changes while you were away"))
         post(sender, "all", f"Task #{tid} needs changes ({tests}), and {owner} is away: anyone may claim it."
                             f" {t['title']}.{said}")
         return f"Task #{tid}: changes ({tests}). {owner} is away, so it is back on the board."
-    con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ? WHERE id = ?",
-                (reviewer, evidence, now, tid))
+    con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
+                " id = ?", (reviewer, evidence, now, tid))
     post(sender, owner, f"Changes asked on task #{tid} ({tests}): {t['title']}. It is yours again: change it, then call"
                         f" board done.{said}")
     return f"Task #{tid}: changes ({tests}). It goes back to {owner}."
 
 
-def auto_review(session, tid, owner, cwd, tested, since):
+def auto_review(session, tid, owner, cwd, tested, version):
     """With AGON_AUTO_REVIEW=1 and no agent from another company online, Agon asks one for the review itself: it runs
     that company's app headless through ask (AGON_FALLBACK's order, the next one when one is out of quota; a company
     that had the task before comes last), on the user's plan, with the tests Agon ran at done. It runs in a thread of
     its own, after done has answered, and stops, with the app, on STOP or when the app that called done goes; the
-    verdict goes to the owner as a message. It counts only while the task is as done left it at `since`: after
-    another agent's verdict and a new done, it would judge work it never saw."""
+    verdict goes to the owner as a message. It counts only while the task is as done left it, at `version`: after
+    another agent's verdict and a new done, say, it would judge work it never saw."""
     def halt():  # why the app must stop now, if it must
         if session.closed:
             return "the app that called done is gone"
@@ -1728,7 +1735,7 @@ def auto_review(session, tid, owner, cwd, tested, since):
         by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
         with transaction():
             t = board_task(tid)
-            if (t["state"], t["owner"], t["updated"]) != ("review", owner, since) or not found:
+            if (t["state"], t["owner"], t["version"]) != ("review", owner, version) or not found:
                 why = "gave no verdict" if not found else "came after the task had moved on"
                 return post("agon", owner, f"{name}'s automatic review of task #{tid} {why}:\n"
                                            f"{indented(clip(answer.strip(), 3000))}")

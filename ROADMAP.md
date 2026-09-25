@@ -529,6 +529,11 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
 - Two processes that claim the same 30 tasks at once (Python 3.10–3.13, SQLite 3.45.1): every task got one owner.
 - Windows paths: `os.path.normcase` lowercases only on Windows, and `realpath` resolves 8.3 names and junctions only for
   paths that exist. Agon compares a task's files as text (relative, `/`, NFC, case-folded) and resolves no links.
+- Clocks on Windows before Python 3.13: `time.time()` (`GetSystemTimeAsFileTime`) and `time.monotonic()`
+  (`GetTickCount64`) move in 15.6 ms steps; `time.get_clock_info("time").resolution` is 0.015625. From 3.13 both have
+  1 µs ([What's New in 3.13](https://docs.python.org/3/whatsnew/3.13.html)). So two quick events can get the same time:
+  a task's `version`, not its time, tells its changes apart, and `last_seen` only grows across agents. The tests run
+  every Python process of theirs on such a clock, on every system (found by CI on windows-latest, Python 3.10).
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,

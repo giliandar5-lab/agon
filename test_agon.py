@@ -20,6 +20,17 @@ from pathlib import Path
 
 faulthandler.dump_traceback_later(240, exit=True)  # a test that hangs shows where, long before CI gives up
 TMP = tempfile.mkdtemp()
+# Before Python 3.13, time.time() on Windows moves in 15.625 ms steps (time.get_clock_info("time").resolution), so two
+# quick events get the same time. Every Python process of these tests runs on such a clock, whatever the system: this
+# one, and through sitecustomize the servers, hooks and fake apps it starts
+STEP = 0.015625
+Path(TMP, "coarse").mkdir()
+Path(TMP, "coarse", "sitecustomize.py").write_text(f"import time\n_time = time.time\ntime.time = lambda: _time() // {STEP}"
+                                                   f" * {STEP}\n", encoding="utf-8")
+os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (str(Path(TMP, "coarse")), os.environ.get("PYTHONPATH"))))
+_time = time.time
+time.time = lambda: _time() // STEP * STEP
+assert subprocess.run([sys.executable, "-c", f"import time; assert time.time() % {STEP} == 0"]).returncode == 0
 HERE = Path(__file__).resolve().parent
 SERVER = str(HERE / "agon.py")
 for key in [key for key in os.environ if key.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_"))]:
@@ -2153,9 +2164,13 @@ time.sleep(1)
 assert since(runs) == [] and auto_messages(1)[0][2].endswith("ask one to review it, or set AGON_AUTO_REVIEW=1.")
 off.close()
 
-# Phase 4, found in review, in this process on a team of its own (the fake app below stands in for ask's)
+# Phase 4, found in review, in this process on a team of its own (the fake app below stands in for ask's). Everything
+# here happens in one step of the clock, as quick events may on Windows before Python 3.13: a task's version, not its
+# time, tells its changes apart, and last_seen still says which agent was seen last
 agon.close_db()
 agon.DB, test_db = str(Path(TMP, "rounds.db")), agon.DB
+coarse, frozen = time.time, time.time()
+time.time = lambda: frozen
 team = {name: agon.Session(name, None) for name in ("claude", "gpt", "gemini")}
 apps = {"claude": "claude-code", "gpt": "codex-mcp-client", "gemini": "antigravity-client"}
 
@@ -2175,7 +2190,7 @@ def said(n=1):
 act("claude", action="add", title="Parser", spec="Parse the config.", files=["parser.py"])
 act("claude", action="claim", id=1)
 assert "No agent from another company is online" in act("claude", action="done", id=1, note="v1")
-since = agon.board_task(1)["updated"]
+version = agon.board_task(1)["version"]
 
 
 def headless(*args):  # the app reviewing v1 takes a while
@@ -2188,7 +2203,7 @@ def headless(*args):  # the app reviewing v1 takes a while
 
 real_ask_once, agon.ask_once = agon.ask_once, headless
 try:
-    agon.auto_review(team["claude"], 1, "claude", str(project), ("tests passed", "report"), since)
+    agon.auto_review(team["claude"], 1, "claude", str(project), ("tests passed", "report"), version)
 finally:
     agon.ask_once = real_ask_once
 assert (agon.board_task(1)["state"], agon.board_task(1)["reviewer"]) == ("review", "gemini")
@@ -2233,7 +2248,7 @@ assert agon.board_task(2)["reviewer"] is None and said() == [
     ("agon", "human", "Task #2 by claude waits for a review (no tests run: set AGON_TEST_CMD): Menu. gpt can't review it"
                       " now (gpt sent no sign of life for 2h 1m), and no other agent from another company is online.")]
 agon.close_db()
-agon.DB = test_db
+agon.DB, time.time = test_db, coarse
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
