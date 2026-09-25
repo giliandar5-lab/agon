@@ -77,9 +77,15 @@ MODE_ARGS = {  # added at the end: a review only reads, a task writes (in a git 
              "gemini": ["--mode", "accept-edits"]},
 }
 REVIEW = """{asker} asks you for a code review through Agon, where AI agents from different companies build one project.
-Review only: don't change any files.{copy} Run the project's tests and cite the commands you ran and what they printed.
+Review only: don't change any files.{copy} Don't run the tests either: Agon ran them before you started, and their
+results are below. Approve only if the tests Agon ran passed: tests that failed or didn't finish mean changes. If no
+tests ran (they couldn't start, or the human hasn't set a test command), or their output shows that none ran, say so
+and review by reading the code. The tests can be changed too: look at changes to tests and their settings with extra
+care, and read the code in question in full, with the code that calls it.
 Your final message is the answer; don't use Agon's tools (send, inbox, ask).
 End it with one line: VERDICT: approve, or VERDICT: changes.
+
+{tests}
 
 What {asker} asks:
 {prompt}"""
@@ -997,11 +1003,15 @@ def fallbacks(agent, asker):
     return [name for name in dict.fromkeys(names) if name not in (agent, asker)]
 
 
-def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
+def ask_once(asker, name, mode, prompt, cwd, top, end, stopped, tests, tested):
     """Agent `name`'s go at an ask: (its answer or None, why it failed or None, the texts that show a usage limit or
-    None, the branch that holds a task's work or None, its diff stat or None)."""
-    if mode == "review" and name in REVIEW_COPY:  # its app can't be held to read-only: it reviews a throwaway copy
-        try:
+    None, the branch that holds a task's work or None, its diff stat or None, what came of the tests and their report,
+    or None). A review gets the tests Agon ran before any reviewer started (`tested`)."""
+    if mode == "review":
+        text = REVIEW.format(asker=asker, prompt=prompt, copy=COPY if name in REVIEW_COPY else "", tests=tested[1])
+        if name not in REVIEW_COPY:
+            return (*ask_run(asker, name, mode, text, cwd, end, stopped), None, None, tested)
+        try:  # its app can't be held to read-only: it reviews a throwaway copy
             source = repository(cwd)
         except ToolError as e:
             raise ToolError(f"Can't run {name}'s review: it works in a throwaway copy of your git repository, and"
@@ -1010,21 +1020,18 @@ def ask_once(asker, name, mode, prompt, cwd, top, end, stopped):
         copy, folder = review_copy(source, cwd, name)
         try:  # the paths into the user's repository in the prompt lead into the copy, and back in what it says
             back = [copy, os.path.realpath(copy)]
-            text = repath(REVIEW.format(asker=asker, prompt=prompt, copy=COPY), [source, mine], copy)
-            answer, problem, limit = ask_run(asker, name, mode, text, folder, end, stopped)
+            answer, problem, limit = ask_run(asker, name, mode, repath(text, [source, mine], copy), folder, end,
+                                             stopped)
         finally:
             rmtree(copy)  # and with it whatever the reviewer changed
-        return answer and repath(answer, back, mine), problem and repath(problem, back, mine), limit, None, None
-    if not top:
-        return (*ask_run(asker, name, mode, REVIEW.format(asker=asker, prompt=prompt, copy=""), cwd, end, stopped),
-                None, None)
+        return answer and repath(answer, back, mine), problem and repath(problem, back, mine), limit, None, None, tested
     path, branch, base = new_worktree(top, name)  # a task works on a branch of its own, in a temporary worktree
     try:
         answer, problem, limit = ask_run(asker, name, mode, TASK.format(asker=asker, branch=branch, prompt=prompt),
                                          same_folder(top, path, cwd), end, stopped)
     finally:
         stat = keep_work(top, path, branch, base, name, f"{name}: {' '.join(prompt.split())[:72]}")
-    return answer, problem, limit, (branch if stat else None), stat
+    return answer, problem, limit, (branch if stat else None), stat, None
 
 
 def tool_ask(session, args):
@@ -1035,8 +1042,10 @@ def tool_ask(session, args):
         top = repository(cwd) if mode == "task" else None
     except ToolError as e:
         raise ToolError(f"Nothing asked: a task works on a new branch from your last commit, and {e}.") from None
+    tests = test_command()  # a bad setting stops the ask before anything runs
     me, started = session.me, time.monotonic()
     end, head, skipped = started + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT), f"{me} asked {agent} for a {mode}", []
+    tested = None  # a review's tests: run once, in the project folder, before the first reviewer starts
 
     def halt():  # why the app must stop now, if it must
         if session.stopped():
@@ -1048,8 +1057,17 @@ def tool_ask(session, args):
         if until := quota_until(name):
             skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
             continue
+        if mode == "review" and tested is None:  # every reviewer, gemini in its copy too, reads this one run
+            outcome, report, problem = run_tests(tests, cwd, end, halt)
+            if not problem and time.monotonic() >= end:
+                problem = "Agon ran the tests until the ask's time ran out (AGON_ASK_TIMEOUT), so no reviewer started."
+            if problem:
+                branch = None
+                break
+            tested = outcome, report
         try:
-            answer, problem, limit, branch, stat = ask_once(me, name, mode, prompt, cwd, top, end, halt)
+            answer, problem, limit, branch, stat, tested = ask_once(me, name, mode, prompt, cwd, top, end, halt, tests,
+                                                                    tested)
         except ToolError as e:  # its app isn't there, or git failed
             if name != agent:
                 skipped.append(str(e).rstrip("."))
@@ -1077,9 +1095,11 @@ def tool_ask(session, args):
         post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file.")
         return (f"{lead}{name} finished the task in {spent} without changing any file.\n\nIts summary:\n"
                 f"{clip(answer)}"), None
-    seal = f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict"
+    outcome, report = tested  # the verdict says what Agon's run of the tests showed, whatever the reviewer says
+    seal = (f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict") + f" ({outcome})"
     post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
-    return f"{lead}{name} answered in {spent} ({mode}, {seal}):\n\n{clip(answer)}", None
+    return (f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n"
+            f"{clip(answer, MAX_INBOX - 500 - len(report))}"), None
 
 
 TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
