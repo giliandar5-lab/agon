@@ -21,7 +21,9 @@
         "AGON_TEST_CMD",
         "AGON_TEST_TIMEOUT",
         "AGON_LEASE",
-        "AGON_AUTO_REVIEW"
+        "AGON_AUTO_REVIEW",
+        "AGON_GEMINI_PLAN",
+        "GEMINI_API_KEY"
       ],
       "tool_timeout_sec": 960
     }

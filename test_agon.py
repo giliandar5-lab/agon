@@ -692,7 +692,8 @@ assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gp
 assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI",
                          "AGON_FALLBACK", "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS",  # Phase 3.1: the test command too
                          "AGON_TEST_CMD", "AGON_TEST_TIMEOUT",
-                         "AGON_LEASE", "AGON_AUTO_REVIEW"] and agon.TOOL_TIMEOUT == 960  # Phase 4: the board's
+                         "AGON_LEASE", "AGON_AUTO_REVIEW",  # Phase 4: the board's
+                         "AGON_GEMINI_PLAN", "GEMINI_API_KEY"] and agon.TOOL_TIMEOUT == 960  # Phase 5: agy's key
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
 [codex_prompt] = codex_plugin["hooks"]["hooks"]["UserPromptSubmit"][0]["hooks"]  # Phase 4: the same command, sooner
@@ -924,7 +925,8 @@ for event in events:
 APPS = {"claude": "claude", "gpt": "codex", "gemini": "agy"}
 NONE = "Test results, run by Agon: none, because the human hasn't set AGON_TEST_CMD."  # no AGON_TEST_CMD
 APPROVED = r"VERDICT: approve \(no tests run: set AGON_TEST_CMD\)\."  # the verdict of a review without it
-ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT))
+ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT),
+           AGON_GEMINI_PLAN="1")  # Phase 5: the fake agy stands in for one on a Google login (see barred())
 for name, app in APPS.items():  # the default command, with the fake in place of the app
     ASK[f"AGON_CMD_{name.upper()}"] = json.dumps([sys.executable, str(FAKE), app, *agon.COMMANDS[name][1:]])
 project, plain = Path(TMP, "project"), Path(TMP, "plain")  # a git repository with a commit, and a folder that isn't
@@ -2250,6 +2252,69 @@ assert agon.board_task(2)["reviewer"] is None and said() == [
                       " now (gpt sent no sign of life for 2h 1m), and no other agent from another company is online.")]
 agon.close_db()
 agon.DB, time.time = test_db, coarse
+
+# Phase 5, limits. What Codex 0.157 prints when a plan can't go on (seen against a mock of its API, with the source), and
+# Claude Code's limit of one model: each marks the agent out of quota
+for text in ("You’ve hit your usage limit for GPT-6 Sol. Switch to another model now, or try again at 8:36 PM.",
+             "Your workspace is out of credits. Add credits to continue.",
+             "You hit your spend cap set by the owner of your workspace.",
+             "Quota exceeded. Check your plan and billing details.",
+             "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus",
+             "stream disconnected before completion: The usage limit has been reached",
+             "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model"):
+    assert agon.shows_limit([text]) == text, text
+assert agon.shows_limit(["The test hit a quota of 5 files; Plus plans are fine"]) is None
+# agy 1.2.11 keeps status ERROR on every turn after an error it recovered from (a 429 it retried): an answer is an answer,
+# and a real failure exits 3 with no response. Found by running agy against a mock: ask threw such answers away
+recovered = {"conversation_id": "c", "status": "ERROR", "response": "fine\n", "num_turns": 1,
+             "error": "API error (attempt 1): Error 429, Message: ... Status: RESOURCE_EXHAUSTED"}
+assert agon.final_answer(json.dumps(recovered)) == ("fine\n", None)
+assert agon.final_answer(json.dumps(recovered | {"response": ""})) == (None, recovered["error"])
+# Google's Antigravity FAQ: "Using third party software, tools, or services to access Antigravity is a violation of our
+# Terms of Service ... we recommend using a Gemini Enterprise or Google AI Studio API key." So Agon runs agy headless
+# (ask, the automatic review, autopilot) only in agy's API-key mode, a setting of agy's own, unless AGON_GEMINI_PLAN=1
+gem_home = Path(TMP, "gem-home")
+settings = gem_home.joinpath(*agon.GEMINI_SETTINGS)
+settings.parent.mkdir(parents=True)
+home_vars = {"HOME": str(gem_home), "USERPROFILE": str(gem_home)}  # Path.home() on POSIX and on Windows
+
+
+def gemini_barred(**env):  # agon.barred("gemini") with the fake home and these settings
+    saved = {key: os.environ.get(key) for key in (*home_vars, "AGON_GEMINI_PLAN")}
+    os.environ.update(home_vars | env)
+    try:
+        return agon.barred("gemini")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+assert agon.barred("gpt") is None and agon.barred("claude") is None  # their vendors document headless runs on plans
+why = gemini_barred()
+assert why.startswith("Can't run gemini on your Google login: Google's terms forbid third-party software there, so Agon"
+                      " runs agy on a Gemini API key: set \"modelProvider\": \"gemini\" in") and str(settings) in why, why
+assert why.endswith("or AGON_GEMINI_PLAN=1 to use your Google login at your own risk"), why
+for content in ("{not json", "[1]", '{"modelProvider": "google"}'):
+    settings.write_text(content, encoding="utf-8")
+    assert gemini_barred() == why, content
+assert gemini_barred(AGON_GEMINI_PLAN="1") is None and gemini_barred(AGON_GEMINI_PLAN="yes") is None
+settings.write_text('{"modelProvider": "gemini", "theme": "dark"}', encoding="utf-8")
+assert gemini_barred() is None and gemini_barred(AGON_GEMINI_PLAN="0") is None
+settings.unlink()
+keyless = {key: value for key, value in ASK.items() if key != "AGON_GEMINI_PLAN"} | home_vars
+runs = len(fake_runs())
+asker = Agent("asker", env=keyless)  # an ask to gemini on the Google login goes to the next agent, and says why
+res, text = asked(asker, agent="gemini", prompt="Please review", cwd=str(project))
+assert "isError" not in res and since(runs) == ["claude"], (text, since(runs))
+assert text.startswith(f"{why}, so claude answered in "), text
+settings.write_text('{"modelProvider": "gemini"}', encoding="utf-8")  # in API-key mode, gemini answers itself
+res, text = asked(asker, agent="gemini", prompt="Please review", cwd=str(project))
+assert text.startswith("gemini answered in ") and since(runs) == ["claude", "agy"], text
+asker.close()
+settings.unlink()
 
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})

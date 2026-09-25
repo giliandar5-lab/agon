@@ -46,9 +46,13 @@ RING_DELAY = 1  # seconds a message may wait for inbox or the Stop hook before t
 FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
 CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
 LIMIT_PATTERNS = [  # what the apps print when a plan's usage limit is hit; AGON_LIMIT_PATTERNS replaces the list
-    r"you(?:['’]ve| have) hit your (?:\w+ ){0,2}limit",  # Claude Code ("You've hit your limit"), Codex
+    # Claude Code ("You've hit your limit", a model's "You've reached your Fable 5 limit"), Codex ("You’ve hit your usage
+    # limit")
+    r"you(?:['’]ve| have) (?:hit|reached) your (?:\w+ ){0,3}limit",
     r"usage limit reached|limit reached\W{1,5}resets",  # Claude Code ("5-hour limit reached ∙ resets 3pm")
     r"you(?:['’]re| are) out of (?:extra )?usage",  # Claude Code
+    # Codex 0.157: a limit reported mid-stream, workspace credits, a spend cap, billing, a plan without Codex
+    r"usage limit has been reached|out of credits|hit your spend cap|quota exceeded|to use codex with your chatgpt plan",
     r"(?:reached|exceeded|exhausted) (?:your|the) (?:\w+ ){0,2}quota|QUOTA_EXHAUSTED|RESOURCE_EXHAUSTED",  # Gemini
     r"^rate_limit$",  # Claude Code's StopFailure error type
 ]
@@ -71,10 +75,11 @@ MAX_TITLE = 200  # characters in a task's title
 MAX_FILES = 50  # files and folders one task may name...
 MAX_FILES_TEXT = 2000  # ...in this many characters: they go into messages and onto the board
 CLIENTS = {"claude-code": "claude", "codex-mcp-client": "gpt", "antigravity-client": "gemini"}  # vendor by app
-# The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
+# The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them; and GEMINI_API_KEY,
+# which the agy an ask starts needs in its API-key mode (see barred())
 ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
             "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS", "AGON_TEST_CMD", "AGON_TEST_TIMEOUT", "AGON_LEASE",
-            "AGON_AUTO_REVIEW"]
+            "AGON_AUTO_REVIEW", "AGON_GEMINI_PLAN", "GEMINI_API_KEY"]
 # How ask runs each agent's app headless, on the user's own plan. AGON_CMD_CLAUDE, AGON_CMD_GPT and AGON_CMD_GEMINI
 # replace a command (a JSON list or a command line): {prompt} marks where the prompt goes (otherwise it goes on stdin)
 # and {cwd} the folder the run works in. Checked with claude 2.1.281, codex 0.156.1 and agy 1.2.10
@@ -847,7 +852,9 @@ def final_answer(out):
                 else:
                     answer = event.get("result")
             elif "status" in event and "response" in event:  # Antigravity
-                if event["status"] == "SUCCESS":
+                # agy 1.2.11 keeps status ERROR on every later turn after an error it recovered from: a turn that
+                # answered succeeded (a real failure exits 3 and answers nothing)
+                if event["status"] == "SUCCESS" or event["response"]:
                     answer = event["response"]
                 else:
                     error = event.get("error") or event["status"]
@@ -1108,6 +1115,33 @@ def fallbacks(agent, asker):
     return [name for name in dict.fromkeys(names) if name not in (agent, asker)]
 
 
+def enabled(var):
+    """Whether yes/no setting `var` (such as AGON_AUTO_REVIEW) is on: 1, true, yes or on."""
+    return os.environ.get(var, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+GEMINI_SETTINGS = (".gemini", "antigravity-cli", "settings.json")  # agy's own settings, in the user's home folder
+
+
+def barred(name):
+    """Why Agon won't run agent `name`'s app headless for the team, or None. Google's Antigravity FAQ: "Using third party
+    software, tools, or services to access Antigravity is a violation of our Terms of Service ... we recommend using a
+    Gemini Enterprise or Google AI Studio API key." So Agon runs agy (ask, the automatic review, autopilot) only in its
+    API-key mode, which agy's own settings switch on, unless the human sets AGON_GEMINI_PLAN=1 to use the Google login at
+    their own risk. Claude Code and Codex document headless runs on the user's own plan."""
+    if name != "gemini" or enabled("AGON_GEMINI_PLAN"):
+        return None
+    path = Path.home().joinpath(*GEMINI_SETTINGS)
+    try:
+        if json.loads(path.read_text(encoding="utf-8")).get("modelProvider") == "gemini":
+            return None
+    except (OSError, ValueError, AttributeError):  # no settings yet, not JSON, not an object
+        pass
+    return (f"Can't run gemini on your Google login: Google's terms forbid third-party software there, so Agon runs agy"
+            f" on a Gemini API key: set \"modelProvider\": \"gemini\" in {path} and GEMINI_API_KEY (`python agon.py"
+            " setup` shows how), or AGON_GEMINI_PLAN=1 to use your Google login at your own risk")
+
+
 def ask_once(asker, name, mode, prompt, cwd, top, end, stopped, tests, tested):
     """Agent `name`'s go at an ask: (its answer or None, why it failed or None, the texts that show a usage limit or
     None, the branch that holds a task's work or None, its diff stat or None, what came of the tests and their report,
@@ -1168,6 +1202,9 @@ def tool_ask(session, args):
     for name in [agent, *fallbacks(agent, me)]:  # the next one answers while one is out of quota
         if until := quota_until(name):
             skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+            continue
+        if why := barred(name):
+            skipped.append(why)
             continue
         if mode == "review" and tested is None:  # every reviewer, gemini in its copy too, reads this one run
             outcome, report, problem = run_tests(tests, cwd, end, halt)
@@ -1595,7 +1632,7 @@ def board_done(session, args):
         raise ToolError(PAUSED)
     owned(board_task(tid), me)
     tests = test_command()  # a bad setting stops done before anything runs
-    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    auto = enabled("AGON_AUTO_REVIEW")
     folder = project_folder(args.get("cwd")) if tests or auto else None  # where the tests and a review run
 
     def halt():  # why the tests must stop now, if they must
@@ -1714,6 +1751,9 @@ def auto_review(session, tid, owner, cwd, tested, version):
         for name in sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before):  # the other companies
             if until := quota_until(name):
                 skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+                continue
+            if why := barred(name):
+                skipped.append(why)
                 continue
             try:
                 answer, problem, limit, _, _, _ = ask_once(owner, name, "review", prompt, cwd, None, end, halt, None,
@@ -2384,7 +2424,7 @@ def setup(out=None):
     say("Or keep it in the Claude Code plugin: /plugin configure agon@agon, Test command.")
 
     # the board: how long a claim lasts, and the automatic review, which only the human turns on
-    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    auto = enabled("AGON_AUTO_REVIEW")
     say("", "== Board: the team's tasks. board done runs the test command above, unasked (board is a local tool)",
         f"A claim lasts AGON_LEASE seconds ({LEASE}) after its owner's last sign of life; then the task goes back to"
         " the board.", "AGON_AUTO_REVIEW=1: when no agent from another company is online, Agon runs another company's"
