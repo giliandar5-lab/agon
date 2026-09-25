@@ -203,22 +203,27 @@ Fix, so that every verdict rests on evidence Agon itself produced:
 - Atomic claim (`BEGIN IMMEDIATE` + `UPDATE ... WHERE owner IS NULL`), with every check inside that transaction. A claim
   is refused while another agent's task in progress or in review has one of its files, naming the owner, and while a
   task in `after` isn't done (approved). A task's files are paths in the project: a file, a folder (`src/`) or `.`,
-  compared as text whatever the letter case or slashes; no patterns, absolute paths or line breaks.
+  compared as text whatever the letter case or slashes; no patterns, absolute paths or line breaks, and no `|` in them
+  or in a title. `claim` answers with the task's spec and notes, newest first (a reviewer's changes stay there when the
+  task goes back to the board).
 - `done` (the owner only): Agon runs `AGON_TEST_CMD` in the project folder, unasked, and its outcome labels the review;
   red tests never stop `done`. The task goes to an online agent (seen in the last 15 minutes) of another company, the
-  one that asked for changes first. The reviewer must be a different agent and vendor (by the app it connected with,
-  else by its name). `changes` sends the task back to its owner, or to the board when the owner is away; `approve`
-  closes it and tells everyone which tasks it frees. `done` and `review` from an agent that no longer has the task say
-  who has it now and why.
-- Nobody from another company online: the human is told. With `AGON_AUTO_REVIEW=1` (off by default: it sends the code
-  to another company's app and spends that plan, unasked), Agon runs one's app headless for the review through `ask`.
-- When an agent runs out of quota, its in-progress tasks go back to `todo` with a note ("reassigned: claude hit its
-  usage limit, resets ~14:00"), and its reviews go to another agent. A claim also lasts `AGON_LEASE` seconds (7200)
-  after its owner's last sign of life, any Agon request or hook run, and goes back at the next board call: a crashed
-  app, and Codex, whose hooks never see a limit. After the reset the agent returns to rotation, and before it works
-  again it hears once which of its tasks went to others, who has them and not to edit their files: through
-  `UserPromptSubmit` in Claude Code (which resumes the interrupted task by itself) and Codex, else at the start of
-  `inbox` or of the Stop hook's prompt.
+  one that asked for changes first; an agent whose company had the task before it went back to the board comes last. The
+  reviewer must be a different agent and vendor (by the app it connected with, else by its name). `changes` sends the
+  task back to its owner, or to the board when the owner is away; `approve` closes it and tells everyone which tasks it
+  frees. `done` and `review` from an agent that no longer has the task say who has it now and why.
+- Nobody from another company online: the human is told, and the next board call once one is online asks it. With
+  `AGON_AUTO_REVIEW=1` (off by default: it sends the code to another company's app and spends that plan, unasked), Agon
+  runs one's app headless for the review through `ask`; its verdict counts only if the task hasn't moved on meanwhile.
+- When an agent's hook reports its usage limit, its in-progress tasks go back to `todo` with a note ("reassigned: claude
+  hit its usage limit, resets ~14:00"), and its reviews go to another agent. A claim also lasts
+  `AGON_LEASE` seconds (7200) after its owner's last sign of life, any Agon request or hook run, and goes back at the
+  next board call, as does a review: a crashed app, and Codex, whose hooks never see a limit. A limit that an `ask` ran
+  into on an agent's plan only takes it out of reviews and asks, until the reset or its next tool call (its model runs,
+  so it isn't out of quota): the agent may be in the middle of a task. After the reset the agent returns to rotation, and
+  before it works again it hears once which of its tasks went to others, who has them and not to edit their files:
+  through `UserPromptSubmit` in Claude Code (which resumes the interrupted task by itself) and Codex, else at the start
+  of `inbox` or of the Stop hook's prompt.
 - Every state change posts a short message to the agent that must act (a review request to the reviewer, a verdict to
   the owner); a task anyone can take goes to everyone but its author, and a claim only to the arena.
 - The team playbook (lead, one writer per file, split by context boundaries, evidence-based reviews, don't reply to

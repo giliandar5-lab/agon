@@ -167,31 +167,35 @@ waits for.
 - **Plan:** the lead (the agent you name, else whoever plans first) splits the work with `add`, along context
   boundaries: each task is a part one agent can finish without the others' context. `files` are paths in the project:
   a file, a folder (`src/` covers everything in it) or `.` for all of it. `after` names the tasks it waits for. `list`
-  shows the board; `list` with an `id` shows one task in full.
+  shows the board; `list` with an `id` shows one task in full, and `claim` answers with its spec and notes, such as the
+  changes a reviewer asked for.
 - **Claim before you edit:** `claim` takes a task in one SQLite transaction, so of two agents that claim at once, one
   gets it. It is refused while another agent's task in progress or in review has one of its files (whatever the letter
   case or slashes), naming the owner, and while a task it waits for isn't done (approved) yet.
 - **Done, then a review by another company:** `done`, by the owner, first runs your tests (see
   [Tests](#tests-agon_test_cmd)) in the project folder, then sends the task to an agent from another company that is
-  online (Agon saw it in the last 15 minutes). Red tests don't stop `done`: they label the review. `review` is never by
-  the owner, nor by an agent in the same company's app. `approve` closes the task and frees the tasks that wait for it;
-  `changes` sends it back to its owner, or to the board when the owner is away. The verdict says what the tests showed:
-  `approve (tests passed)`.
+  online (Agon saw it in the last 15 minutes); an agent whose company had the task before comes last. Red tests don't
+  stop `done`: they label the review. `review` is never by the owner, nor by an agent in the same company's app.
+  `approve` closes the task and frees the tasks that wait for it; `changes` sends it back to its owner, or to the board
+  when the owner is away. The verdict says what the tests showed: `approve (tests passed)`.
 - **Who hears what:** a review request goes to the reviewer and a verdict to the owner; a task anyone can take goes to
   the whole team (never back to the agent that made it); a claim goes only to the arena. A message wakes an agent
   through its Stop hook and costs a turn, so Agon sends as few as it can.
-- **No downtime:** when an agent hits its usage limit, its tasks in progress go back to the board ("reassigned: claude
-  hit its usage limit, resets ~14:00"), and the reviews it was asked for go to another agent. A claim also lasts only
-  `AGON_LEASE` seconds (7200, two hours) after its owner's last sign of life, any call to Agon or hook run: after that,
-  the next board call gives the task back the same way. That covers an app that crashed or closed, and Codex, which
-  tells no hook about its usage limits.
+- **No downtime:** when an agent's hook reports its usage limit, its tasks in progress go back to the board
+  ("reassigned: claude hit its usage limit, resets ~14:00"), and the reviews it was asked for go to another agent. A
+  claim also lasts only `AGON_LEASE` seconds (7200, two hours) after its owner's last sign of life, any call to Agon or
+  hook run: after that, the next board call gives the task back the same way, and a review moves on too. That covers an
+  app that crashed or closed, and Codex, which tells no hook about its usage limits. A limit that an `ask` ran into on
+  an agent's plan only takes it out of reviews and asks, until the reset or its next tool call: it may be in the middle
+  of a task.
 - **Coming back:** before an agent works again, it hears which of its tasks went to others, who has them now, and not
   to edit their files. Claude Code resumes the task it had by itself after a usage limit resets; that prompt goes
   through the `UserPromptSubmit` hook, which adds the note (Codex's hook does the same). `inbox` and the Stop hook start
   with it too.
-- **Nobody online:** the arena tells you that a task waits for a review. With `AGON_AUTO_REVIEW=1`, Agon runs another
-  company's app headless to review it, as `ask` does (in `AGON_FALLBACK`'s order, the next one when one is out of
-  quota), and the verdict goes to the owner. It's off by default.
+- **Nobody online:** the arena tells you that a task waits for a review, and the next board call once an agent from
+  another company is online asks it. With `AGON_AUTO_REVIEW=1`, Agon runs another company's app headless to review
+  it, as `ask` does (in `AGON_FALLBACK`'s order, the next one when one is out of quota), and the verdict goes to the
+  owner. It's off by default.
 - **What runs without asking:** `board` only changes the board, so it is marked a local tool and Codex runs it without
   asking. But `done` runs your test command (`AGON_TEST_CMD`) with no prompt, as you, outside the apps' sandboxes, so
   code an agent put in the tests runs too: the trust you give a Claude Code `TaskCompleted` hook you set up yourself.
