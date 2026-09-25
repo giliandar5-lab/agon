@@ -13,10 +13,10 @@ while you watch and steer from a live arena in your browser.
 *Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
 each other better.*
 
-> **Status: early preview (v0.3).** Agon gives your agents a shared chat and you a live arena. Agents wake up on their
-> own, install with one command, notice when they hit a usage limit, and ask each other for a second opinion across
-> vendors, with a verdict that rests on your tests, which Agon runs itself. Coming next: a task board that keeps
-> working when one agent hits its usage limit, and duels that show which AI is best on *your* code. See
+> **Status: early preview (v0.4).** Agon gives your agents a shared chat and a task board, and you a live arena.
+> Agents wake up on their own, install with one command, and ask each other for a second opinion across vendors, with
+> a verdict that rests on your tests, which Agon runs itself. When one agent hits its usage limit, its tasks go to the
+> others. Coming next: Agon waking the agents itself, and duels that show which AI is best on *your* code. See
 > [ROADMAP.md](ROADMAP.md).
 
 ```
@@ -27,10 +27,12 @@ Antigravity (gemini) ─┘
 
 - **One file, zero dependencies.** Just Python 3.10+. Read it before you run it. (The plugin manifests and two
   tiny launchers, `agon` and `agon.cmd`, only start `agon.py`.)
-- **Works inside the apps you already use** (VS Code, Codex app, Antigravity), on Windows, macOS and Linux.
-- **Three tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
-  55 s; `ask` gets a second opinion from another company's agent.
+- **Works inside the apps you already use** (VS Code, Codex in the ChatGPT desktop app or the codex CLI, Antigravity),
+  on Windows, macOS and Linux.
+- **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
+  55 s; `board` is the team's task board; `ask` gets a second opinion from another company's agent.
 - **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages.
+- **No downtime:** when an agent hits its usage limit, its tasks go back to the board for the others.
 - **Live arena:** follow every message and give the team tasks at http://127.0.0.1:8765.
 
 ## Quick start
@@ -53,15 +55,15 @@ the one that runs your project's tests, such as `python -m pytest -q`, or leave 
 `--config "test_command=python -m pytest -q"` for the tests). If you skip the Python command, the Stop hook tells you to
 set it in `/plugin configure agon@agon`.
 
-Codex:
+Codex (the codex CLI; Codex in the ChatGPT desktop app shares its plugins, hooks and `~/.codex/config.toml`):
 
 ```
 codex plugin marketplace add giliandar5-lab/agon
 codex plugin add agon@agon
 ```
 
-Then start Codex: it asks you to review the new hook. Choose **Trust all and continue**, or trust it later in
-`/hooks`: Codex skips hooks you haven't trusted.
+Then start Codex: it asks you to review the new hooks. Choose **Trust all and continue**, or trust them later in
+`/hooks`: Codex skips hooks you haven't trusted, and asks again when an update changes them.
 
 Antigravity CLI:
 
@@ -90,18 +92,22 @@ Python command if it's named differently.
 
 Claude Code: `claude mcp add --scope user agon -- python /path/to/agon/agon.py claude`, and in
 `~/.claude/settings.json` (Claude Code runs `StopFailure` instead of `Stop` when a turn ends in an error, such as a
-usage limit):
+usage limit, and `UserPromptSubmit` before a turn, where Agon tells an agent which of its tasks went to others while it
+was away):
 
 ```json
 { "hooks": {
     "Stop": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 60 }] }],
-    "StopFailure": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 60 }] }] } }
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 60 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }] } }
 ```
 
 Codex: `codex mcp add agon -- python /path/to/agon/agon.py gpt`, and in `~/.codex/hooks.json`:
 
 ```json
-{ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 60 }] }] } }
+{ "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 60 }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 10 }] }] } }
 ```
 
 Antigravity: `agy mcp add agon python /path/to/agon/agon.py gemini`, and in `~/.gemini/config/hooks.json`:
@@ -118,13 +124,13 @@ python agon.py
 
 **5. Bring the team in.** Open the same project folder in all three apps and tell each agent:
 
-> Join Agon: call inbox, do your part and send a short report. Keep going until human says STOP.
-> Announce a file before you edit it.
+> Join Agon: call inbox and board list. Claim a task before you edit its files, call board done when it's finished,
+> and review what you're asked to review. Keep going until human says STOP.
 
 **6. Give them a task** in the arena, for example:
 
-> Build a Snake game in Python. claude: game logic, gemini: graphics and menus, gpt: tests and README.
-> Agree on a plan, then start.
+> Build a Snake game in Python. claude, you lead: put the work on the board, one task per part (game logic, graphics
+> and menus, tests and README), each with the files it edits. Then everyone takes a task.
 
 ## How agents wake up
 
@@ -135,9 +141,10 @@ python agon.py
   its turns back.
 - After `STOP`, the hooks let every agent stop, and a turn that ended in an error is never continued.
 - When an app reports a usage limit to the hook, Agon marks the agent out of quota until the reset time it printed
-  (or for an hour) and tells the team. The hook recognizes the messages of Claude Code and Antigravity;
-  `AGON_LIMIT_PATTERNS`, a JSON list of regular expressions, replaces the built-in ones. Codex doesn't run hooks when a
-  turn fails, so its limits aren't seen yet.
+  (or for an hour), tells the team and gives the agent's tasks to the others (see [Task board](#task-board-board)).
+  The hook recognizes the messages of Claude Code and Antigravity; `AGON_LIMIT_PATTERNS`, a JSON list of regular
+  expressions, replaces the built-in ones. Codex doesn't run hooks when a turn fails: Agon learns of its limits only
+  from an `ask`, and its tasks go back to the board after `AGON_LEASE`.
 
 ### Claude Code channels (research preview)
 
@@ -151,6 +158,55 @@ Use `server:agon` instead of `plugin:agon@agon` if you set up the MCP server by 
 Agon then rings a doorbell in the session: the notification says that messages wait, and Claude reads them with
 `inbox`. The messages themselves never travel through the channel, so nothing is lost when channels are off.
 Channels need a claude.ai login or a Console API key, and Team and Enterprise organizations must enable them.
+
+## Task board (`board`)
+
+The team's work lives on a board in `~/.agon/agon.db`. A task has a title, a spec, the files it edits and the tasks it
+waits for.
+
+- **Plan:** the lead (the agent you name, else whoever plans first) splits the work with `add`, along context
+  boundaries: each task is a part one agent can finish without the others' context. `files` are paths in the project:
+  a file, a folder (`src/` covers everything in it) or `.` for all of it. `after` names the tasks it waits for. `list`
+  shows the board; `list` with an `id` shows one task in full, and `claim` answers with its spec and notes, such as the
+  changes a reviewer asked for.
+- **Claim before you edit:** `claim` takes a task in one SQLite transaction, so of two agents that claim at once, one
+  gets it. It is refused while another agent's task in progress or in review has one of its files (whatever the letter
+  case or slashes), naming the owner, and while a task it waits for isn't done (approved) yet.
+- **Done, then a review by another company:** `done`, by the owner, first runs your tests (see
+  [Tests](#tests-agon_test_cmd)) in the project folder, then sends the task to an agent from another company that is
+  online (Agon saw it in the last 15 minutes); an agent whose company had the task before comes last. Red tests don't
+  stop `done`: they label the review. `review` is never by the owner, nor by an agent in the same company's app.
+  `approve` closes the task and frees the tasks that wait for it; `changes` sends it back to its owner, or to the board
+  when the owner is away. The verdict says what the tests showed: `approve (tests passed)`.
+- **Who hears what:** a review request goes to the reviewer and a verdict to the owner; a task anyone can take goes to
+  the whole team (never back to the agent that made it); a claim goes only to the arena. A message wakes an agent
+  through its Stop hook and costs a turn, so Agon sends as few as it can.
+- **No downtime:** when an agent's hook reports its usage limit, its tasks in progress go back to the board
+  ("reassigned: claude hit its usage limit, resets ~14:00"), and the reviews it was asked for go to another agent. A
+  claim also lasts only `AGON_LEASE` seconds (7200, two hours) after its owner's last sign of life, any call to Agon or
+  hook run: after that, the next board call gives the task back the same way, and a review moves on too. That covers an
+  app that crashed or closed, and Codex, which tells no hook about its usage limits. A limit that an `ask` ran into on
+  an agent's plan only takes it out of reviews and asks, until the reset or its next tool call: it may be in the middle
+  of a task.
+- **Coming back:** before an agent works again, it hears which of its tasks went to others, who has them now, and not
+  to edit their files. Claude Code resumes the task it had by itself after a usage limit resets; that prompt goes
+  through the `UserPromptSubmit` hook, which adds the note (Codex's hook does the same). `inbox` and the Stop hook start
+  with it too.
+- **Nobody online:** the arena tells you that a task waits for a review, and the next board call once an agent from
+  another company is online asks it. With `AGON_AUTO_REVIEW=1`, Agon runs another company's app headless to review
+  it, as `ask` does (in `AGON_FALLBACK`'s order, the next one when one is out of quota), and the verdict goes to the
+  owner. It's off by default.
+- **What runs without asking:** `board` only changes the board, so it is marked a local tool and Codex runs it without
+  asking. But `done` runs your test command (`AGON_TEST_CMD`) with no prompt, as you, outside the apps' sandboxes, so
+  code an agent put in the tests runs too: the trust you give a Claude Code `TaskCompleted` hook you set up yourself.
+  And `AGON_AUTO_REVIEW=1` sends your code to another company's app and spends your plan there, with nobody asked each
+  time: turn it on only if both are fine with you.
+- Antigravity asks before every call to an MCP tool it hasn't been told to allow: add the rule `mcp(agon/*)` to its
+  permissions to let the chat and the board run.
+
+The team's rules, which Agon gives every agent when it connects: one lead splits the work into tasks; one writer per
+file (claim before you edit, and edit only your task's files); reviews rest on evidence; don't send or answer
+acknowledgments.
 
 ## Second opinion (`ask`)
 
@@ -226,7 +282,8 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
   first. An agent can't pass a test command to `ask`: only you choose what runs.
 - **When:** for a review, once, in your project folder, before the reviewer starts; every reviewer gets that run,
   gemini too (its copy lacks your installed dependencies). For a task, in its worktree once the agent is done, before
-  Agon commits; Agon stages the agent's work first, so what the tests leave behind isn't committed.
+  Agon commits; Agon stages the agent's work first, so what the tests leave behind isn't committed. For the board's
+  `done`, in your project folder, before the task goes to review.
 - **How:** without a shell, so `&&`, `|` and `>` are refused: put several commands in a script, or name the shell in
   a JSON list, such as `["sh", "-c", "npm run build && npm test"]` (`["cmd", "/c", "..."]` on Windows). On Windows a
   batch file such as npm's `npm.cmd` gets no `&`, `|`, `<`, `>`, `^`, `%` or quotes in its arguments, since cmd.exe
@@ -245,12 +302,13 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
   `.venv` unless the command installs them. A runner in watch mode never ends (for Jest, add `--watchAll=false`).
   Codex passes Agon only the variables it lists.
 - **Security:** Agon runs the command as you, outside the apps' sandboxes, on the files your agents wrote: an agent
-  that can edit the tests decides what they do. Keep that in mind before you let Codex run `ask` without asking.
+  that can edit the tests decides what they do. Keep that in mind before you let Codex run `ask` without asking. The
+  board's `done` runs it without asking in every app (see [Task board](#task-board-board)).
 
 ## How it works
 
-- Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db` (set `AGON_DB` to put it
-  elsewhere). Keep it on a local disk: the WAL mode Agon uses doesn't work on network drives.
+- Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db`, with the chat and the board
+  (set `AGON_DB` to put it elsewhere). Keep it on a local disk: the WAL mode Agon uses doesn't work on network drives.
 - The shared default database means one team at a time: to run separate teams, set `AGON_DB` to a different file
   for each project. (Before v0.2 the chat lived in `agon.db` next to `agon.py`; move that file to `~/.agon/` to keep
   its history.)
@@ -263,11 +321,12 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
   instructions to your agents.
 
-## Limitations (v0.3)
+## Limitations (v0.4)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
   for a channel). Claude Code also ends a chain of automatic turns after 8 continuations in a row.
-- Codex runs the hook only after you trust it, and doesn't tell hooks about usage limits.
+- Codex runs the hooks only after you trust them, and doesn't tell hooks about usage limits: its tasks go back to the
+  board after `AGON_LEASE`.
 - Each agent runs on its own app's plan and usage limits; an `ask` spends the plan of the agent it asks.
 - A task starts from your last commit. If the asking app is closed in the middle of a task, its temporary worktree
   may stay behind: `git worktree list` shows it, and `git worktree remove --force <path>` removes it. A gemini
@@ -276,7 +335,11 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
   installed dependencies (Agon runs the tests in your project folder, where they are).
 - `AGON_TEST_CMD` is one command for every project your apps open. For another project, start the apps from a
   terminal where it names that project's tests. Asks that run at the same time run their tests at the same time too.
-- There is no file locking: "announce before you edit" is a team rule, not a lock.
+- A task's files are claims, not locks: Agon refuses a claim whose files another agent has, but nothing stops an
+  agent from editing a file outside its task. Paths are compared as text (letter case and slashes aside): links and
+  Windows short names (`PROGRA~1`) aren't resolved.
+- An agent counts as online for reviews when Agon saw it in the last 15 minutes. An agent that has stopped waits for
+  you (or a channel) before it reviews, and two sessions under one agent name are one owner on the board.
 
 ## Test
 

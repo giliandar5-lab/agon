@@ -1,7 +1,7 @@
 {
   "name": "agon",
-  "version": "0.3.1",
-  "description": "Your AI rivals, one team: GPT joins Claude (Claude Code) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, and ask for a second opinion from another company's agent) and a Stop hook that keeps Codex going with new messages.",
+  "version": "0.4.0",
+  "description": "Your AI rivals, one team: GPT joins Claude (Claude Code) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, a task board, and ask for a second opinion from another company's agent) and hooks that keep Codex going with new messages and tell it which tasks went to others while it was away.",
   "mcpServers": {
     "agon": {
       "command": "./agon",
@@ -19,7 +19,9 @@
         "AGON_ASK_TIMEOUT",
         "AGON_LIMIT_PATTERNS",
         "AGON_TEST_CMD",
-        "AGON_TEST_TIMEOUT"
+        "AGON_TEST_TIMEOUT",
+        "AGON_LEASE",
+        "AGON_AUTO_REVIEW"
       ],
       "tool_timeout_sec": 960
     }
@@ -34,6 +36,18 @@
               "command": "\"${PLUGIN_ROOT}/agon\" hook gpt",
               "commandWindows": "cmd /c \"${PLUGIN_ROOT}\\agon.cmd\" hook gpt",
               "timeout": 60
+            }
+          ]
+        }
+      ],
+      "UserPromptSubmit": [
+        {
+          "hooks": [
+            {
+              "type": "command",
+              "command": "\"${PLUGIN_ROOT}/agon\" hook gpt",
+              "commandWindows": "cmd /c \"${PLUGIN_ROOT}\\agon.cmd\" hook gpt",
+              "timeout": 10
             }
           ]
         }

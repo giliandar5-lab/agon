@@ -1,14 +1,17 @@
 """Agon: a shared chat where AI agents from different apps build one project together.
 
 python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
-python agon.py hook <name>   Stop hook that wakes the agent with its new messages (--help for options)
+python agon.py hook <name>   the agent's hook: Stop wakes it with new messages, UserPromptSubmit tells a returning
+                             agent which of its tasks went to others (--help for options)
 python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
+import contextlib
 import datetime
 import json
 import os
+import posixpath
 import queue
 import re
 import shlex
@@ -21,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,7 +32,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.3.1"  # also in the plugin manifests
+VERSION = "0.4.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -58,9 +62,19 @@ TEST_TIMEOUT = 300  # seconds the tests may run (AGON_TEST_TIMEOUT), within the 
 TEST_TAIL = 3000  # characters of their output that the reviewer and the asker get: the end, where failures are
 TEST_READ = 1 << 16  # bytes of that output Agon reads, from its end: plenty for the tail in any encoding
 NO_TESTS = "no tests run: set AGON_TEST_CMD"  # what came of the tests: this, or tests passed, failed, timed out...
+# The task board (Phase 4). A claim lasts while its owner shows signs of life: every Agon request and hook run renews it.
+# A turn that never calls Agon can run past an hour, and taking a task away mid-work causes the overwrites the board
+# exists to prevent, so a claim lasts AGON_LEASE seconds (2 hours) after the owner's last sign
+LEASE = 7200
+ONLINE = 900  # an agent seen by Agon this many seconds ago counts as online: it can be asked for a review
+MAX_TITLE = 200  # characters in a task's title
+MAX_FILES = 50  # files and folders one task may name...
+MAX_FILES_TEXT = 2000  # ...in this many characters: they go into messages and onto the board
+CLIENTS = {"claude-code": "claude", "codex-mcp-client": "gpt", "antigravity-client": "gemini"}  # vendor by app
 # The variables Agon reads, which Codex passes to an MCP server only when its env_vars lists them
 ENV_VARS = ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI", "AGON_FALLBACK",
-            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS", "AGON_TEST_CMD", "AGON_TEST_TIMEOUT"]
+            "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS", "AGON_TEST_CMD", "AGON_TEST_TIMEOUT", "AGON_LEASE",
+            "AGON_AUTO_REVIEW"]
 # How ask runs each agent's app headless, on the user's own plan. AGON_CMD_CLAUDE, AGON_CMD_GPT and AGON_CMD_GEMINI
 # replace a command (a JSON list or a command line): {prompt} marks where the prompt goes (otherwise it goes on stdin)
 # and {cwd} the folder the run works in. Checked with claude 2.1.281, codex 0.156.1 and agy 1.2.10
@@ -106,21 +120,30 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # Windows: the apps and 
 # Every process Agon starts gets its own stdin (DEVNULL at least). On Windows, a child that inherited the MCP server's
 # stdin blocks as soon as it touches it, while the server's main thread waits there for the client's next message
 
-INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from different apps
-(claude = Claude Code, gemini = Antigravity, gpt = Codex) and a human build ONE project together.
-- inbox gets your new messages, send replies (to "all" or to claude / gemini / gpt / human).
-- Loop: inbox -> do your part -> send a short report -> inbox again.
-- When inbox says the team is paused (the human said STOP), stop working and end your turn.
-- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon">
-  event only says that messages wait: call inbox to read them.
-- Announce a file before editing it, so two agents never edit the same file at once.
-- Keep messages short and concrete; put long content in a file and send its path.
-- ask gets a second opinion from another agent's app, which takes minutes: a review (read-only: Agon runs the
+# What every agent reads when it connects: the essentials first. Claude Code cuts it at 2,048 characters, and with MCP
+# tool search (its default) it is all Claude sees of Agon at the start; Codex asks for the first 512 to stand alone
+INSTRUCTIONS = """You are "{me}" in Agon: AI agents from rival companies (claude = Claude Code, gpt = Codex,
+gemini = Antigravity) and a human build ONE project, in a shared chat and on a task board.
+- Work from the board: claim a task before you edit its files, and edit only those. Call board done when you
+  finish: an agent from another company reviews it. Review others' tasks on evidence: Agon's test run, the
+  code you read, what you checked.
+- inbox gets your messages, send replies (to all, claude, gemini, gpt or human). Loop: inbox -> your task ->
+  a short report -> inbox. When inbox says the team is paused (the human said STOP), stop and end your turn.
+Team rules:
+- One lead (the human's pick, else whoever plans first) splits the work into board tasks along context
+  boundaries: each is a part one agent can finish without the others' context, with the files it edits and
+  the tasks it waits for (after).
+- One writer per file: never edit the files of a task you don't have.
+- Don't send or answer acknowledgments ("ok", "thanks"). Keep messages short; put long content in a file.
+- When you end your turn, Agon may start the next one with your new messages. A <channel source="agon"> event
+  only says that messages wait: call inbox to read them.
+- ask gets a second opinion from another company's app, headless (minutes): a read-only review (Agon runs the
   tests, and the VERDICT says whether they passed) or a task done on a new git branch that you may merge."""
 ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
 off here and team messages don't come to you."""
 
-# Both tools only add to the local chat (inbox moves a cursor forward): Codex runs such tools without asking
+# send and inbox only add to the local chat (inbox moves a cursor forward), and board only changes the board in agon.db:
+# Codex runs such tools without asking. So board's done runs the human's test command unasked (see board_done())
 LOCAL = {"destructiveHint": False, "openWorldHint": False}
 TOOLS = [
     {
@@ -139,23 +162,44 @@ TOOLS = [
     },
     {
         "name": "inbox",
-        "description": "Get your new Agon messages. Waits up to `wait` seconds (max 55) for one to arrive."
-        " A new session starts with a recap of earlier messages; a long backlog comes in parts;"
-        " says when the human has paused the team.",
-        "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer", "default": 30}}},
+        "description": "Your new Agon messages; waits up to `wait` s (max 55) for one. A new session starts with a"
+        " recap; a long backlog comes in parts; says if the human paused the team.",
+        "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer"}}},
+        "annotations": LOCAL,
+    },
+    {
+        "name": "board",
+        "description": "Task board: list; add (after: ids it waits for); claim a task before editing its files; done:"
+        " Agon runs the human's tests as the user, outside your sandbox, unasked; another company's agent reviews"
+        " (AGON_AUTO_REVIEW: headless, on the user's plan); review: approve or changes, with evidence.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "add", "claim", "done", "review"]},
+                "id": {"type": "integer"},
+                "title": {"type": "string"},
+                "spec": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "after": {"type": "array", "items": {"type": "integer"}},
+                "note": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["approve", "changes"]},
+                "evidence": {"type": "string"},
+                "cwd": {"type": "string"},
+            },
+            "required": ["action"],
+        },
         "annotations": LOCAL,
     },
     {
         "name": "ask",
-        "description": "Get a second opinion from another agent's app (claude, gpt or gemini), run headless on the"
-        " user's plan; it takes minutes. Agon runs the project's tests itself (the human sets the command) and says"
-        " whether they passed. review: read-only, ends with VERDICT: approve or changes. task: works on a new git"
-        " branch from your last commit and returns its summary, diff stat and branch; merging it is your call.",
+        "description": "A second opinion from another company's agent, run headless on the user's plan; takes minutes."
+        " Agon runs the project's tests itself (the human sets the command). review: read-only, ends with VERDICT:"
+        " approve or changes. task: on a new git branch you may merge.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agent": {"type": "string", "description": "claude, gpt or gemini (not yourself)"},
-                "prompt": {"type": "string", "description": "what to review or do (at most 8,000 characters)"},
+                "prompt": {"type": "string", "description": "what to review or do"},
                 "mode": {"type": "string", "enum": ["review", "task"], "default": "review"},
                 "cwd": {"type": "string", "description": "your project folder (absolute path)"},
             },
@@ -176,6 +220,18 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     # any message from the human gives every agent its automatic turns back (see out_of_turns())
     "CREATE TRIGGER human_resets_autoruns AFTER INSERT ON msgs WHEN NEW.sender = 'human'"
     " BEGIN UPDATE agents SET autoruns = 0; END",
+    # Phase 4, the task board: files and after are JSON lists (the board's paths, task ids); times are Unix seconds.
+    # tests is what came of the tests Agon ran at done, and report is their report
+    "CREATE TABLE tasks(id INTEGER PRIMARY KEY, title TEXT NOT NULL, spec TEXT NOT NULL DEFAULT '',"
+    " files TEXT NOT NULL DEFAULT '[]', after TEXT NOT NULL DEFAULT '[]', state TEXT NOT NULL DEFAULT 'todo',"
+    " author TEXT NOT NULL, owner TEXT, reviewer TEXT, note TEXT NOT NULL DEFAULT '', tests TEXT, report TEXT,"
+    " created REAL NOT NULL, updated REAL NOT NULL)",
+    # the tasks Agon took from an agent (a usage limit, or no sign of it for AGON_LEASE s): the agent hears which, once
+    "CREATE TABLE releases(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, agent TEXT NOT NULL, why TEXT NOT NULL,"
+    " told INTEGER NOT NULL DEFAULT 0)",
+    # every change to a task moves its version on, so a verdict counts only for the task it saw. A time can't tell two
+    # changes apart: before Python 3.13, time.time() on Windows moves in 15.625 ms steps
+    "ALTER TABLE tasks ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
 ]
 _local = threading.local()
 
@@ -185,8 +241,11 @@ def db():
     con = getattr(_local, "con", None)
     if con is None:
         Path(DB).parent.mkdir(parents=True, exist_ok=True)
-        # timeout=5 is busy_timeout=5000; isolation_level=None: every statement commits on its own
-        con = sqlite3.connect(DB, timeout=5, isolation_level=None)
+        # timeout=5 is busy_timeout=5000. SQLite's own autocommit mode: every statement commits on its own, and BEGIN
+        # IMMEDIATE starts a transaction. Python 3.12+ gets autocommit=True, since its default is to change to a
+        # transaction that is always open, and then BEGIN IMMEDIATE would fail
+        mode = {"autocommit": True} if sys.version_info >= (3, 12) else {"isolation_level": None}
+        con = sqlite3.connect(DB, timeout=5, **mode)
         try:
             for tries in range(50):  # WAL: readers and the writer don't block each other
                 try:
@@ -216,6 +275,22 @@ def migrate(con):
             con.execute(step)
         if done < len(SCHEMA):  # a newer agon may have gone further: never lower the version
             con.execute(f"PRAGMA user_version = {len(SCHEMA)}")
+        con.execute("COMMIT")
+    except BaseException:
+        if con.in_transaction:  # SQLite may have rolled back already
+            con.execute("ROLLBACK")
+        raise
+
+
+@contextlib.contextmanager
+def transaction():
+    """A write transaction on this thread's connection: BEGIN IMMEDIATE takes SQLite's one write lock at once (waiting
+    up to the busy timeout for another writer), so what it reads can't change before it writes. Commits at the end,
+    rolls back on any exception."""
+    con = db()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        yield con
         con.execute("COMMIT")
     except BaseException:
         if con.in_transaction:  # SQLite may have rolled back already
@@ -256,11 +331,14 @@ def too_long(text, what="message"):
 
 def touch(me, client=None):
     """Note that agent `me` was just seen; `client` (the app, from initialize) is kept until a new one comes.
-    Best effort: presence never fails the request it came with."""
+    last_seen only grows, across all agents: the agent seen last has the latest one, even when the clock hasn't moved
+    (before Python 3.13, time.time() on Windows moves in 15.625 ms steps), so the most recently seen is always one
+    agent (see reviewers()). Best effort: presence never fails the request it came with."""
     try:
         db().execute(
-            "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET"
-            " client = COALESCE(excluded.client, client), last_seen = excluded.last_seen",
+            "INSERT INTO agents(name, client, last_seen) VALUES (?, ?, max(?, (SELECT COALESCE(MAX(last_seen), 0) + 1e-6"
+            " FROM agents))) ON CONFLICT(name) DO UPDATE SET client = COALESCE(excluded.client, client), last_seen ="
+            " excluded.last_seen",
             (me, client, time.time()),
         )
     except sqlite3.Error:
@@ -433,8 +511,10 @@ def tool_inbox(session, args):
         raise ToolError("`wait` must be a number of seconds from 0 to 55.") from None
     cursor = cursor_of(session.me)
     head = recap(session.me, cursor, session.start) if session.recap else ""
-    wait = 0 if head or not wait > 0 else min(wait, MAX_WAIT)  # a recap comes back at once; NaN means no wait
-    rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - 300, session.stopped)  # 300: headers
+    note, upto = taken_note(session.me)  # tasks it had that went back to the board while it was away
+    wait = 0 if head or note or not wait > 0 else min(wait, MAX_WAIT)  # these come back at once; NaN means no wait
+    rows, more, halted = inbox(session.me, cursor, wait, MAX_INBOX - len(head) - len(note) - 300,  # 300: headers
+                               session.stopped)
     text = "\n".join(line(row) for row in rows) or "No new messages."
     if more:
         text += f"\n{more} more — call inbox again."
@@ -442,6 +522,8 @@ def tool_inbox(session, args):
         text = f"{head}\n\nNew messages:\n{text}"
     elif head:
         text = f"{head}\n\n{text}"
+    if note:
+        text = f"{note}\n\n{text}"
     if halted:
         text = f"{PAUSED}\n\n{text}"
 
@@ -449,6 +531,7 @@ def tool_inbox(session, args):
         session.recap = False
         if rows:
             advance(session.me, rows[-1][0])
+        told(session.me, upto)
 
     return text, delivered
 
@@ -469,14 +552,23 @@ def ask_args(session, args):
     mode = "review" if mode is None else mode
     if mode not in MODE_ARGS:
         raise ToolError("Nothing asked: `mode` must be review or task.")
-    if cwd is None:  # Claude Code says where the project is; Codex and Antigravity start Agon in its plugin folder
+    try:
+        return agent, prompt, mode, project_folder(cwd)
+    except ToolError as e:
+        raise ToolError(f"Nothing asked: {e}") from None
+
+
+def project_folder(cwd):
+    """The project folder a tool works in: its `cwd` argument, else Claude Code's project folder or the server's own
+    folder. Not Agon's folder, where the Codex and Antigravity plugins start Agon: then the agent must pass `cwd`."""
+    if cwd is None:
         cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
         if Path(cwd).resolve() == Path(__file__).resolve().parent:
-            raise ToolError("Nothing asked: pass `cwd`, the absolute path of your project folder (your app runs Agon"
-                            " in a folder of its own).")
+            raise ToolError("pass `cwd`, the absolute path of your project folder (your app runs Agon in a folder of its"
+                            " own).")
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
-        raise ToolError("Nothing asked: `cwd` must be the absolute path of your project folder.")
-    return agent, prompt, mode, cwd
+        raise ToolError("`cwd` must be the absolute path of your project folder.")
+    return cwd
 
 
 def seconds(var, default):
@@ -1094,7 +1186,7 @@ def tool_ask(session, args):
                 continue
             answer, problem, limit, branch, stat = None, str(e), None, None, None
         if limit:
-            out_of_quota(name, limit)  # marked until it resets, and the team is told
+            out_of_quota(name, limit, own=False)  # marked until it resets, and the team is told
             skipped.append(f"{name} hit its usage limit" + (f" (what it did is on branch {branch})" if branch else ""))
             continue
         break
@@ -1123,7 +1215,551 @@ def tool_ask(session, args):
     return f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n{summary}", None
 
 
-TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "ask": tool_ask}  # each returns (text, what to run then)
+# The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
+# an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
+BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version FROM"
+             " tasks")
+FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
+STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
+
+
+def board_path(raw):
+    """One file or folder of a task, as the board keeps it: relative to the project folder, with / between names (and
+    after a folder named with one), "." for the whole project. A pattern, an absolute path or a path out of the project
+    is a ToolError."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ToolError("`files` must be a list of paths in the project, such as src/app.py or tests/.")
+    path = unicodedata.normalize("NFC", raw.strip()).replace("\\", "/")  # macOS may spell é as e and an accent
+    if any(c != " " and (c.isspace() or not c.isprintable()) for c in path):  # a line break could fake a board line
+        raise ToolError(f"{raw!r} has a line break or another control character.")
+    if set(path) & set("*?[]"):
+        raise ToolError(f"{raw} is a pattern: name a folder instead (tests/ covers everything in it).")
+    if "|" in path:  # Windows allows none in a name either
+        raise ToolError(f"{raw} has a |, which the board puts between a task's fields.")
+    if path.startswith(("/", "~")) or re.match(r"[A-Za-z]:", path):
+        raise ToolError(f"{raw} is an absolute path: name files relative to the project folder, such as src/app.py.")
+    folder = path.endswith("/")
+    path = posixpath.normpath(path)
+    if path == ".." or path.startswith("../"):
+        raise ToolError(f"{raw} leads out of the project folder.")
+    return path + "/" if folder and path != "." else path
+
+
+def board_files(value):
+    """The `files` of a new task, checked and made the board's paths (see board_path()), each once."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ToolError("`files` must be a list of paths in the project, such as [\"src/app.py\", \"tests/\"].")
+    paths = {}
+    for raw in value:
+        path = board_path(raw)
+        paths.setdefault(path.casefold().rstrip("/"), path)
+    if len(paths) > MAX_FILES or len(", ".join(paths.values())) > MAX_FILES_TEXT:
+        raise ToolError(f"a task names at most {MAX_FILES} files and folders, {MAX_FILES_TEXT:,} characters in all:"
+                        " name the folders that hold them.")
+    return list(paths.values())
+
+
+def overlap(a, b):
+    """Whether board paths a and b cover a common file: the same path, a folder and what's in it, or "." (the whole
+    project). Letter case never counts, as on Windows and macOS: a project with both App.py and app.py is rare."""
+    a, b = a.casefold().rstrip("/"), b.casefold().rstrip("/")
+    return "." in (a, b) or a == b or b.startswith(a + "/") or a.startswith(b + "/")
+
+
+def number(value):
+    """A task number from a tool argument: a whole number, or one written in the digits 0-9; else None."""
+    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,15}", value.strip()):  # not ² or ①, which isdigit() takes
+        return int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10 ** 15:  # SQLite takes 64 bits
+        return value
+
+
+def task_ids(value, what):
+    """A list of task ids from a tool argument (numbers, or numbers as strings), each once."""
+    if value is None:
+        return []
+    ids = [number(i) for i in value] if isinstance(value, list) else [None]
+    if None in ids:
+        raise ToolError(f"`{what}` must be a list of task numbers, such as [1, 3].")
+    return list(dict.fromkeys(ids))
+
+
+def task_id(value):
+    """The task number in a tool argument `id`."""
+    if (tid := number(value)) is None:
+        raise ToolError("`id` must be the number of a task on the board (board list shows them).")
+    return tid
+
+
+def board_tasks(where="", params=()):
+    """The tasks on the board (`where` narrows them down), oldest first, as dicts with files and after as lists."""
+    cur = db().execute(f"{BOARD_SQL} {where} ORDER BY id", params)
+    names = [column[0] for column in cur.description]
+    found = [dict(zip(names, row)) for row in cur]
+    for t in found:
+        t["files"], t["after"] = json.loads(t["files"]), json.loads(t["after"])
+    return found
+
+
+def board_task(tid):
+    """Task `tid` from board_tasks(), or a ToolError when there is none."""
+    found = board_tasks("WHERE id = ?", (tid,))
+    if not found:
+        raise ToolError(f"there is no task #{tid} (board list shows the tasks).")
+    return found[0]
+
+
+def hashes(ids):
+    return ", ".join(f"#{i}" for i in ids)
+
+
+def indented(text):
+    """An agent's text, such as a spec or a note, with every line indented: data that can't pass for Agon's words."""
+    return "\n".join("    " + row for row in str(text).splitlines())
+
+
+def status(t):
+    """A task's state as the board shows it: todo, doing: gpt, review: gpt, asked claude, done: gpt, approved by..."""
+    state, owner, reviewer = t["state"], t["owner"], t["reviewer"]
+    if state == "doing":
+        return f"doing: {owner}"
+    if state == "review":
+        return f"review: {owner}" + (f", asked {reviewer}" if reviewer else "")
+    if state == "done":
+        return f"done: {owner}" + (f", approved by {reviewer}" if reviewer else "")
+    return "todo"
+
+
+def details(t):
+    """Task t's spec and notes (newest first: a change request, why it went back to the board...), indented."""
+    return [line for label, text in (("Spec", t["spec"]), ("Notes, newest first", t["note"])) if text.strip()
+            for line in (f"{label}:", indented(text))]
+
+
+def task_line(t, states):
+    """One task on one line: `#3 [doing: gpt] Build the menu | files: menu.py, ui | after: #1 done`."""
+    parts = [f"#{t['id']} [{status(t)}] {t['title']}"]
+    if t["files"]:
+        parts.append("files: " + ", ".join(t["files"]))
+    if t["after"]:
+        parts.append("after: " + ", ".join(f"#{i} {states.get(i, 'gone')}" for i in t["after"]))
+    return " | ".join(parts)
+
+
+def board_list(session, args):
+    """The board: its open tasks and the latest done ones, or with `id`, one task in full."""
+    everything = board_tasks()
+    states = {t["id"]: t["state"] for t in everything}
+    if args.get("id") is not None:
+        t = board_task(task_id(args.get("id")))
+        lines = [f"#{t['id']} {t['title']}", f"State: {status(t)}. Added by {t['author']}."]
+        if t["files"]:
+            lines.append("Files: " + ", ".join(t["files"]))
+        if t["after"]:
+            lines.append("After: " + ", ".join(f"#{i} {states.get(i, 'gone')}" for i in t["after"]))
+        lines += details(t)
+        if t["tests"]:
+            lines += [f"Tests at done: {t['tests']}", t["report"] or ""]
+        return clip("\n".join(lines)), None
+    if not everything:
+        return ("The board is empty. Add tasks with board: action add, a title, a spec, the files each task edits and"
+                " the tasks it waits for (after)."), None
+    shown = [t for t in everything if t["state"] != "done"]
+    done = [t for t in everything if t["state"] == "done"]
+    counts = [(sum(t["state"] == state for t in everything), word) for state, word in STATES.items()]
+    lines = [f"The board: {', '.join(f'{n} {word}' for n, word in counts if n)}."]
+    lines += [task_line(t, states) for t in shown + done[-5:]]
+    if len(done) > 5:
+        lines.append(f"({len(done) - 5} earlier tasks are done.)")
+    text = "\n".join(lines)
+    while len(text) > MAX_INBOX - 500 and len(lines) > 2:  # a huge board: the tasks it has room for
+        lines.pop(-2 if lines[-1].startswith("(") else -1)
+        text = "\n".join(lines) + "\n… more tasks: board list with an id shows any task."
+    return text, None
+
+
+def board_add(session, args):
+    """A new task on the board, by the session's agent; everyone hears of it once it can be claimed."""
+    me, title, spec = session.me, args.get("title"), args.get("spec") or ""
+    if not isinstance(title, str) or not title.strip():
+        raise ToolError("`title` must be a non-empty string.")
+    title = " ".join(title.split())  # one line: the board shows a task per line
+    if "|" in title:
+        raise ToolError("`title` can't have a |, which the board puts between a task's fields.")
+    if len(title) > MAX_TITLE:
+        raise ToolError(f"the title is {len(title)} characters; the limit is {MAX_TITLE}. Put the details in spec.")
+    if not isinstance(spec, str):
+        raise ToolError("`spec` must be a string.")
+    if problem := too_long(spec, "spec"):
+        raise ToolError(problem)
+    files, after = board_files(args.get("files")), task_ids(args.get("after"), "after")
+    with transaction() as con:
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        if missing := [i for i in after if i not in states]:
+            raise ToolError(f"there is no task {hashes(missing)} to wait for.")
+        now = time.time()
+        tid = con.execute("INSERT INTO tasks(title, spec, files, after, author, created, updated) VALUES"
+                          " (?, ?, ?, ?, ?, ?, ?)", (title, spec, json.dumps(files), json.dumps(after), me, now,
+                                                     now)).lastrowid
+        where = f" (files: {', '.join(files)})" if files else ""
+        if waiting := [i for i in after if states[i] != "done"]:  # nobody can take it yet: only the arena hears of it
+            post(me, "human", f"Added task #{tid}: {title}{where}; it waits for {hashes(waiting)}.")
+            return (f"Added task #{tid}. It can be claimed once {hashes(waiting)} {'is' if len(waiting) == 1 else 'are'}"
+                    " done (approved)."), None
+        post(me, "all", f"New task #{tid} on the board: {title}{where}. Claim it before you start on it.")
+    return f"Added task #{tid}. Anyone can claim it now.", None
+
+
+def board_claim(session, args):
+    """The session's agent takes a task, atomically: SQLite's one write lock covers the checks and the write, and the
+    UPDATE takes only an unowned task, so of two agents that claim at once, one gets it. Refused while another agent's
+    task (in progress or in review) has one of its files, or while a task it waits for isn't done (approved)."""
+    me, tid = session.me, task_id(args.get("id"))
+    if paused():
+        raise ToolError(PAUSED)
+    with transaction() as con:
+        t = board_task(tid)
+        if t["owner"] == me and t["state"] in ("doing", "review"):
+            return f"Task #{tid} is yours already ({status(t)}).", None  # claiming it again changes nothing
+        if t["state"] == "done":
+            raise ToolError(f"task #{tid} is done.")
+        if t["state"] != "todo":
+            raise ToolError(f"task #{tid} is {t['owner']}'s, {STATES[t['state']]}.")
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        if waiting := [i for i in t["after"] if states.get(i) != "done"]:
+            raise ToolError(f"task #{tid} waits for {', '.join(f'#{i} ({STATES[states[i]]})' for i in waiting)}: it"
+                            f" can be claimed once {'it is' if len(waiting) == 1 else 'they are'} done (approved).")
+        # one writer per file: another agent's task in progress or in review keeps its files
+        taken = [f"{other['owner']} has {theirs} in task #{other['id']} ({STATES[other['state']]})"
+                 for other in board_tasks("WHERE state IN ('doing', 'review') AND owner != ?", (me,))
+                 for theirs in other["files"] if any(overlap(theirs, mine) for mine in t["files"])]
+        if taken:
+            raise ToolError(f"{'; '.join(taken)}. Pick another task, or wait until that one is done.")
+        if con.execute("UPDATE tasks SET state = 'doing', owner = ?, updated = ?, version = version + 1 WHERE id = ?"
+                       " AND owner IS NULL AND state = 'todo'", (me, time.time(), tid)).rowcount != 1:
+            raise ToolError(f"task #{tid} was just claimed by someone else.")  # the checks above make this rare
+        post(me, "human", f"Claimed task #{tid}: {t['title']}.")  # the arena only: nobody needs to act on it
+    files = f": edit only its files ({', '.join(t['files'])})" if t["files"] else ""
+    return clip("\n".join([f"Task #{tid} is yours: {t['title']}. Work on it{files}; when you finish, call board with"
+                           " action done.", *details(t)])), None
+
+
+def lease():
+    """AGON_LEASE: how many seconds a claim lasts after its owner's last sign of life (7200)."""
+    return seconds("AGON_LEASE", LEASE)
+
+
+def vendor(name):
+    """The company whose app agent `name` runs in: the app it connected with (initialize's clientInfo), else its name.
+    A review must come from another company's agent: they judge each other's work more fairly than their own."""
+    row = db().execute("SELECT client FROM agents WHERE name = ?", (name,)).fetchone()
+    return CLIENTS.get(row[0] if row else None, name)
+
+
+def away(name, now):
+    """Whether agent `name` can't work on its task now: out of quota, or no sign of it for AGON_LEASE seconds."""
+    row = db().execute("SELECT last_seen, out_of_quota_until FROM agents WHERE name = ?", (name,)).fetchone()
+    last_seen, until = row or (None, None)
+    return bool(until and until > now) or (last_seen or 0) < now - lease()
+
+
+def had_it(tid):
+    """The companies whose agents had task `tid` before it went back to the board (see release())."""
+    return {vendor(agent) for (agent,) in db().execute("SELECT DISTINCT agent FROM releases WHERE task = ?", (tid,))}
+
+
+def reviewers(t, now):
+    """Who can review task t now: another company's agents that are online (seen by Agon within ONLINE s) and not out
+    of quota, the most recently seen first. Those whose company had the task before it went back to the board come
+    last: they would review some of their own work (a team of two companies may have nobody else)."""
+    rows = db().execute("SELECT name FROM agents WHERE name != ? AND last_seen > ? AND (out_of_quota_until IS NULL OR"
+                        " out_of_quota_until <= ?) ORDER BY last_seen DESC", (t["owner"], now - ONLINE, now)).fetchall()
+    before, owner = had_it(t["id"]), vendor(t["owner"])
+    return sorted((name for (name,) in rows if vendor(name) != owner), key=lambda name: vendor(name) in before)
+
+
+def owned(t, me):
+    """A ToolError unless agent `me` has task t in progress: it says who has the task now and, when Agon took it from
+    `me`, why. An agent may go on after a break (Claude Code resumes a task by itself when a usage limit resets)."""
+    if t["owner"] == me and t["state"] == "doing":
+        return
+    if t["owner"] == me and t["state"] == "review":
+        raise ToolError(f"task #{t['id']} is in review already.")
+    now = "it is done" if t["state"] == "done" else (f"{t['owner']} has it now ({STATES[t['state']]})" if t["owner"]
+                                                     else "nobody has it now")
+    row = db().execute("SELECT why FROM releases WHERE task = ? AND agent = ? ORDER BY id DESC LIMIT 1",
+                       (t["id"], me)).fetchone()
+    taken = f" It went back to the board: {row[0]}." if row else ""
+    again = " If you still work on it, claim it again first." if t["state"] == "todo" else " Don't edit its files."
+    raise ToolError(f"task #{t['id']} isn't yours: {now}.{taken}{again}")
+
+
+def ago(seconds):
+    """A long span of time as people read it: 2h 5m, or 45m 10s."""
+    seconds = round(seconds)
+    return f"{seconds // 3600}h {seconds % 3600 // 60}m" if seconds >= 3600 else took(seconds)
+
+
+def release(con, agent, note, why, now):
+    """Inside a transaction: put `agent`'s tasks in progress back on the board, with `note` (reassigned: claude hit its
+    usage limit, resets ~14:00), and ask another agent for the reviews `agent` was asked for. The team hears which tasks
+    are free; `agent` hears it too, with `why`, before it works again (see taken_note())."""
+    taken = board_tasks("WHERE state = 'doing' AND owner = ?", (agent,))
+    for t in taken:  # the earlier notes stay, newest first: the next owner must see what a reviewer asked for
+        notes = f"reassigned: {note}" + (f"\n{t['note']}" if t["note"].strip() else "")
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, note = ?, updated = ?, version = version + 1 WHERE"
+                    " id = ?", (clip(notes, MAX_TEXT), now, t["id"]))
+        con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)", (t["id"], agent, why))
+    if taken:
+        tasks = "; ".join(f"#{t['id']} {t['title']}" for t in taken)
+        post("agon", "all", f"{'Tasks' if len(taken) > 1 else 'Task'} {tasks} {'are' if len(taken) > 1 else 'is'} free"
+                            f" again: {note}. What {agent} did so far is in the project folder: read it before you"
+                            " claim.")
+    for t in board_tasks("WHERE state = 'review' AND reviewer = ?", (agent,)):  # its reviews go to someone else
+        reviewer = next((name for name in reviewers(t, now) if name != agent), None)
+        con.execute("UPDATE tasks SET reviewer = ?, version = version + 1 WHERE id = ?", (reviewer, t["id"]))
+        tests = t["tests"] or NO_TESTS
+        if reviewer:
+            post("agon", reviewer, f"Task #{t['id']} is ready for your review ({tests}): {t['title']}. {agent} can't"
+                                   f" review it now: {note}. Check it, then call board: action review, id {t['id']},"
+                                   " verdict approve or changes, and your evidence.")
+        else:
+            post("agon", "human", f"Task #{t['id']} by {t['owner']} waits for a review ({tests}): {t['title']}. {agent}"
+                                  f" can't review it now ({note}), and no other agent from another company is online.")
+    return taken
+
+
+def reap():
+    """Put back on the board the tasks whose owners sent no sign of life for AGON_LEASE seconds, and give the reviews
+    their reviewers were asked for to someone else: an app that crashed or closed, or a usage limit Codex tells no hook
+    about. Every Agon request and hook run of an agent renews its claims; this runs at the start of every board call,
+    like beads' reclaim, and costs one query when nothing expired."""
+    now, limit = time.time(), lease()
+    stale = ("SELECT DISTINCT agent, COALESCE(agents.last_seen, 0) FROM (SELECT owner AS agent FROM tasks WHERE state ="
+             " 'doing' UNION SELECT reviewer FROM tasks WHERE state = 'review' AND reviewer IS NOT NULL) LEFT JOIN"
+             " agents ON agents.name = agent WHERE COALESCE(agents.last_seen, 0) < ?")
+    unasked = "WHERE state = 'review' AND reviewer IS NULL"  # nobody was online at done, or its reviewer went away
+    if not db().execute(stale, (now - limit,)).fetchone() and not any(reviewers(t, now) for t in board_tasks(unasked)):
+        return
+    with transaction() as con:  # again, now that nobody else writes
+        for agent, seen in con.execute(stale, (now - limit,)).fetchall():
+            gone = ago(now - seen) if seen else "a long time"
+            release(con, agent, f"{agent} sent no sign of life for {gone}", f"Agon saw no sign of you for {gone}", now)
+        for t in board_tasks(unasked):
+            if reviewer := next(iter(reviewers(t, now)), None):
+                con.execute("UPDATE tasks SET reviewer = ?, version = version + 1 WHERE id = ?", (reviewer, t["id"]))
+                post("agon", reviewer, f"Task #{t['id']} by {t['owner']} is ready for your review"
+                                       f" ({t['tests'] or NO_TESTS}): {t['title']}. Check it, then call board: action"
+                                       f" review, id {t['id']}, verdict approve or changes, and your evidence.")
+
+
+def taken_note(me):
+    """What agent `me` must hear before it works again, when Agon gave tasks it had back to the board (a usage limit,
+    no sign of life): which tasks, who has each now, and not to edit their files. (The note, or "" when there is
+    nothing to say; the last release it covers, for told().) Claude Code resumes a task by itself after a usage limit
+    resets, and that prompt goes through the UserPromptSubmit hook: the hook adds this note to it."""
+    rows = db().execute("SELECT id, task, why FROM releases WHERE agent = ? AND told = 0 ORDER BY id", (me,)).fetchall()
+    why = {task: reason for _, task, reason in rows}  # each task once, with the latest reason
+    items = []
+    for t in board_tasks(f"WHERE id IN ({','.join('?' * len(why))})", tuple(why)) if why else []:
+        if t["owner"] == me and t["state"] in ("doing", "review"):
+            continue  # it took the task back
+        now = "it is done" if t["state"] == "done" else (f"{t['owner']} has it now ({STATES[t['state']]})" if t["owner"]
+                                                         else "nobody has it now")
+        files = f"; its files: {', '.join(t['files'])}" if t["files"] else ""
+        items.append(f"#{t['id']} {t['title']} ({why[t['id']]}): {now}{files}")
+    note = ("While you were away, Agon gave tasks you had back to the board: " + "; ".join(items) + ". Don't edit"
+            " their files unless you claim the task again: board list shows the board.") if items else ""
+    return clip(note, 4000), (rows[-1][0] if rows else 0)  # Codex shows a model ~2,500 tokens of a hook's context
+
+
+def told(me, upto):
+    """Agent `me` has heard of its tasks given back up to release `upto` (see taken_note())."""
+    if upto:
+        db().execute("UPDATE releases SET told = 1 WHERE agent = ? AND id <= ?", (me, upto))
+
+
+def board_done(session, args):
+    """The owner finishes a task: Agon runs the human's test command, and the task goes to review, by an online agent
+    from another company. Like a Claude Code TaskCompleted hook the human set up, the tests run unasked, as the user,
+    outside the apps' sandboxes (board is a local tool, so Codex doesn't ask either): the human chose the command, and
+    an agent can change what it runs. Their outcome labels the review; red tests don't stop done."""
+    me, tid, note = session.me, task_id(args.get("id")), args.get("note") or ""
+    if not isinstance(note, str):
+        raise ToolError("`note` must be a string: what you did, and how you checked it.")
+    if problem := too_long(note, "note"):
+        raise ToolError(problem)
+    if paused():
+        raise ToolError(PAUSED)
+    owned(board_task(tid), me)
+    tests = test_command()  # a bad setting stops done before anything runs
+    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    folder = project_folder(args.get("cwd")) if tests or auto else None  # where the tests and a review run
+
+    def halt():  # why the tests must stop now, if they must
+        if session.stopped():
+            return "the call was cancelled, or the app that asked is gone"
+        if paused():
+            return "the human paused the team"
+
+    outcome, report, problem = run_tests(tests, folder, time.monotonic() + (tests[1] + 60 if tests else 0), halt)
+    if problem:
+        raise ToolError(problem)
+    now = time.time()
+    with transaction() as con:
+        t = board_task(tid)
+        owned(t, me)  # it may have gone back to the board while the tests ran
+        online = reviewers(t, now)  # after changes, the one who asked for them looks again
+        reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
+        con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?,"
+                    " version = version + 1 WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+        version = t["version"] + 1  # what an automatic review must still find: nothing else wrote meanwhile
+        said = f"\n{me}'s note:\n{indented(clip(note.strip(), 1000))}" if note.strip() else ""
+        if reviewer:
+            post(me, reviewer, f"Task #{tid} is ready for your review ({outcome}): {t['title']}.{said}\nCheck it, then"
+                               f" call board: action review, id {tid}, verdict approve or changes, and your evidence.")
+            then = f"{reviewer} is asked to review it."
+        elif auto:  # the human allowed it: another company's app reviews it headless, on the user's plan
+            post("agon", "human", f"Task #{tid} by {me} waits for a review ({outcome}): {t['title']}. No agent from"
+                                  " another company is online, so Agon runs another company's app to review it"
+                                  " (AGON_AUTO_REVIEW, on your plan).")
+            then = ("No agent from another company is online, so Agon runs another company's app to review it, headless"
+                    " on the user's plan (AGON_AUTO_REVIEW). The verdict comes to you as a message.")
+        else:
+            post("agon", "human", f"Task #{tid} by {me} waits for a review ({outcome}): {t['title']}. No agent from"
+                                  " another company is online: ask one to review it, or set AGON_AUTO_REVIEW=1.")
+            then = "No agent from another company is online to review it: the human is told."
+    if not reviewer and auto:  # after the commit: the review reads the task as done left it
+        threading.Thread(target=auto_review, args=(session, tid, me, folder, (outcome, report), version)).start()
+    return f"Task #{tid} is in review ({outcome}). {then}\n\n{report}", None
+
+
+def board_review(session, args):
+    """An agent from another company reviews a task: approve closes it (and frees the tasks that wait for it), changes
+    sends it back to its owner, or to the board when the owner is away. The verdict carries what the tests showed."""
+    me, tid, verdict, evidence = session.me, task_id(args.get("id")), args.get("verdict"), args.get("evidence")
+    if verdict not in ("approve", "changes"):
+        raise ToolError("`verdict` must be approve or changes.")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise ToolError("`evidence` must say what you checked and what you found: the tests you ran, the code you read.")
+    if problem := too_long(evidence, "evidence"):
+        raise ToolError(problem)
+    with transaction():
+        t = board_task(tid)
+        if t["state"] != "review":
+            raise ToolError(f"task #{tid} isn't waiting for a review: it is {STATES[t['state']]}.")
+        if t["owner"] == me:
+            raise ToolError("the agent that did a task doesn't review it: another company's agent does.")
+        if vendor(me) == vendor(t["owner"]):
+            raise ToolError(f"you and {t['owner']} run in the same company's app: a review comes from another company's"
+                            " agent.")
+        return settle(t, me, verdict, evidence, me, me), None
+
+
+def settle(t, reviewer, verdict, evidence, sender, by):
+    """Inside a transaction: `reviewer`'s verdict on task t, in review. approve closes it, and everyone hears which
+    tasks it frees (else only its owner hears); changes send it back to its owner, or to the board when the owner is
+    away. `sender` posts the message, which quotes the `evidence` as `by`'s. Returns what the reviewer is told."""
+    con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
+    said = f"\n{by}:\n{indented(clip(evidence.strip(), 1500))}"
+    if verdict == "approve":
+        con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
+                    " id = ?", (reviewer, evidence, now, tid))
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        ready = [f"#{w['id']} {w['title']}" for w in board_tasks("WHERE state = 'todo'")
+                 if tid in w["after"] and all(states.get(i) == "done" for i in w["after"])]
+        if ready:  # anyone may take them now
+            post(sender, "all", f"Approved task #{tid} ({tests}): {t['title']}. Ready to claim now: {'; '.join(ready)}."
+                                f"{said}")
+        else:
+            post(sender, owner, f"Approved task #{tid} ({tests}): {t['title']}.{said}")
+        return f"Task #{tid} is done: approve ({tests})." + (f" Ready to claim now: {'; '.join(ready)}." if ready else "")
+    if away(owner, now):  # the owner can't take it back now: anyone may
+        con.execute("UPDATE tasks SET state = 'todo', owner = NULL, reviewer = ?, note = ?, updated = ?, version ="
+                    " version + 1 WHERE id = ?", (reviewer, evidence, now, tid))
+        con.execute("INSERT INTO releases(task, agent, why) VALUES (?, ?, ?)",
+                    (tid, owner, f"{reviewer} asked for changes while you were away"))
+        post(sender, "all", f"Task #{tid} needs changes ({tests}), and {owner} is away: anyone may claim it."
+                            f" {t['title']}.{said}")
+        return f"Task #{tid}: changes ({tests}). {owner} is away, so it is back on the board."
+    con.execute("UPDATE tasks SET state = 'doing', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
+                " id = ?", (reviewer, evidence, now, tid))
+    post(sender, owner, f"Changes asked on task #{tid} ({tests}): {t['title']}. It is yours again: change it, then call"
+                        f" board done.{said}")
+    return f"Task #{tid}: changes ({tests}). It goes back to {owner}."
+
+
+def auto_review(session, tid, owner, cwd, tested, version):
+    """With AGON_AUTO_REVIEW=1 and no agent from another company online, Agon asks one for the review itself: it runs
+    that company's app headless through ask (AGON_FALLBACK's order, the next one when one is out of quota; a company
+    that had the task before comes last), on the user's plan, with the tests Agon ran at done. It runs in a thread of
+    its own, after done has answered, and stops, with the app, on STOP or when the app that called done goes; the
+    verdict goes to the owner as a message. It counts only while the task is as done left it, at `version`: after
+    another agent's verdict and a new done, say, it would judge work it never saw."""
+    def halt():  # why the app must stop now, if it must
+        if session.closed:
+            return "the app that called done is gone"
+        if paused():
+            return "the human paused the team"
+
+    try:
+        started, end = time.monotonic(), time.monotonic() + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
+        t, skipped, answer, problem = board_task(tid), [], None, None
+        prompt = (f"Review task #{tid} of the team's board: {t['title']}\nFiles: {', '.join(t['files']) or 'any'}\n"
+                  f"What was asked:\n{indented(clip(t['spec'], 3000)) or '    (no spec)'}\n{owner}'s note:\n"
+                  f"{indented(clip(t['note'], 3000)) or '    (none)'}\nThe work is in the project folder as it is now.")
+        before = had_it(tid)
+        for name in sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before):  # the other companies
+            if until := quota_until(name):
+                skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
+                continue
+            try:
+                answer, problem, limit, _, _, _ = ask_once(owner, name, "review", prompt, cwd, None, end, halt, None,
+                                                           tested)
+            except ToolError as e:  # its app isn't there, or git failed
+                skipped.append(str(e).rstrip("."))
+                continue
+            if limit:
+                out_of_quota(name, limit, own=False)  # marked until it resets, and the team is told
+                skipped.append(f"{name} hit its usage limit")
+                continue
+            break
+        else:
+            name, problem = None, f"nobody could review it: {'; '.join(skipped) or 'AGON_FALLBACK names nobody else'}"
+        if problem:
+            return post("agon", "human", f"Agon's automatic review of task #{tid} failed: {problem.rstrip('.')}. It"
+                                         " still waits for a review.")
+        found = verdict(answer)
+        by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
+        with transaction():
+            t = board_task(tid)
+            if (t["state"], t["owner"], t["version"]) != ("review", owner, version) or not found:
+                why = "gave no verdict" if not found else "came after the task had moved on"
+                return post("agon", owner, f"{name}'s automatic review of task #{tid} {why}:\n"
+                                           f"{indented(clip(answer.strip(), 3000))}")
+            settle(t, name, found, answer, "agon", by)
+    except Exception as e:  # a bad setting, agon.db locked...: the human hears of it, the task still waits
+        post("agon", "human", f"Agon's automatic review of task #{tid} failed: {e}")
+    finally:
+        close_db()
+
+
+def tool_board(session, args):
+    action = args.get("action")
+    handlers = {"list": board_list, "add": board_add, "claim": board_claim, "done": board_done, "review": board_review}
+    if not isinstance(action, str) or action not in handlers:
+        raise ToolError("`action` must be list, add, claim, done or review.")
+    try:
+        reap()  # claims whose owners sent no sign of life for AGON_LEASE seconds go back to the board first
+        return handlers[action](session, args)
+    except ToolError as e:  # what went wrong, after what didn't happen
+        text = str(e)
+        raise ToolError(f"{FAILED[action]}: {text}" if action in FAILED else text[:1].upper() + text[1:]) from None
+
+
+TOOL_HANDLERS = {"send": tool_send, "inbox": tool_inbox, "board": tool_board, "ask": tool_ask}  # (text, what then)
 
 
 def handle(session, msg):
@@ -1192,6 +1828,11 @@ def call_tool(session, params):
     args = {} if args is None else args
     if not isinstance(args, dict):
         raise RpcError(-32602, "Invalid params: `arguments` must be an object")
+    try:  # its model called a tool, so it isn't out of quota (any more): it may review, and it is asked again
+        db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = ? AND out_of_quota_until IS NOT NULL",
+                     (session.me,))
+    except sqlite3.Error:
+        pass  # best effort, as for presence
     try:
         text, after = tool(session, args)
         return {"content": [{"type": "text", "text": text}]}, after
@@ -1300,14 +1941,21 @@ def answer_apart(session, msg):
         close_db()
 
 
+def slow(params):
+    """Whether a tools/call may take minutes: an ask, or board's done, which runs the tests."""
+    args = params.get("arguments")
+    return params.get("name") == "ask" or params.get("name") == "board" and isinstance(args, dict) and args.get(
+        "action") == "done"
+
+
 def work(session, todo):
-    """Answer the queued requests in order. An ask runs for minutes, so it gets a thread of its own and send and inbox
-    keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the background, and the agent
-    goes on. The process waits for those threads: a closed client stops their apps first."""
+    """Answer the queued requests in order. An ask (or board's done) runs for minutes, so it gets a thread of its own
+    and the other tools keep working meanwhile: Claude Code moves a tool call that takes over two minutes to the
+    background, and the agent goes on. The process waits for those threads: a closed client stops their apps first."""
     try:
         while (msg := todo.get()) is not EOF:
             params = msg.get("params") if isinstance(msg, dict) else None  # msg may be any JSON value
-            if isinstance(params, dict) and msg.get("method") == "tools/call" and params.get("name") == "ask":
+            if isinstance(params, dict) and msg.get("method") == "tools/call" and slow(params):
                 threading.Thread(target=answer_apart, args=(session, msg)).start()
             elif not answer(session, msg):
                 return
@@ -1360,8 +2008,13 @@ def limit_patterns():
 
 
 def shows_limit(texts):
-    """`texts` joined if one of them shows a usage limit (limit_patterns()), else None."""
+    """`texts` joined if one of them shows a usage limit (limit_patterns()), else None. Claude Code's "Server is
+    temporarily limiting requests (not your usage limit)" is a short throttle: its StopFailure error is rate_limit too,
+    so with such a line, the lines that say so and a bare rate_limit don't count; a real limit elsewhere still does."""
     texts = [text for text in texts if isinstance(text, str) and text]
+    if any("not your usage limit" in text.lower() for text in texts):
+        texts = [kept for text in texts if text.strip() != "rate_limit"
+                 if (kept := re.sub(r"(?im)^.*not your usage limit.*$\n?", "", text)).strip()]
     if any(re.search(pattern, text, re.I | re.M) for pattern in limit_patterns() for text in texts):
         return "\n".join(texts)
 
@@ -1382,21 +2035,33 @@ CLOCK = re.compile(  # "resets 3pm", "at 3:57 PM", "at Sep 25th, 2026 7:40 PM", 
     r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
 
 
+WEEKDAY = re.compile(  # "resets Mon 12:00am"
+    r"\b(?:at|resets?|until|on)\s+(?P<wd>mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?,?\s+(?:at\s+)?"
+    r"(?P<h>\d{1,2})(?::(?P<min>\d{2}))?(?::\d{2})?\s*(?P<ap>[ap]\.?m\b\.?)?", re.I)
+DAYS = "mon tue wed thu fri sat sun".split()
+
+
 def reset_time(text, now):
     """When a usage limit resets (Unix time), from the text an app printed: an older Claude Code timestamp, a
-    duration ("in 2 hours 5 minutes", "after 2h3m4s") or a local clock time with an optional date; else None."""
+    duration ("in 2 hours 5 minutes", "after 2h3m4s"), a weekday and a time ("resets Mon 12:00am") or a local clock
+    time with an optional date; else None."""
     if m := re.search(r"\|(\d{10})\b", text):  # "Claude AI usage limit reached|1760000000"
         return float(m[1])
     if m := re.search(rf"\b(?:in|after)\s+((?:{DURATION}[\s,]*(?:and\s+)?)+)", text, re.I):
         return now + sum(int(n) * UNITS[unit[0].lower()] for n, unit in re.findall(DURATION, m[1], re.I))
-    for m in CLOCK.finditer(text):
-        if not (m["min"] or m["ap"]):
-            continue  # a bare number isn't a time
+    # the first time the text names: "resets 3:45pm (weekly resets Mon 12:00am)" is at 3:45pm
+    for m in sorted([*WEEKDAY.finditer(text), *CLOCK.finditer(text)], key=lambda m: m.start()):
+        if not (m["min"] or m["ap"]) or int(m["h"]) > (12 if m["ap"] else 23):
+            continue  # a bare number isn't a time, nor is 13pm
         hour, minute = int(m["h"]), int(m["min"] or 0)
         if m["ap"]:
             hour = hour % 12 + (12 if m["ap"][0] in "pP" else 0)
         base = datetime.datetime.fromtimestamp(now)
         try:
+            if m.re is WEEKDAY:  # the next such day and time: Claude Code's weekly limit
+                day = base + datetime.timedelta(days=(DAYS.index(m["wd"][:3].lower()) - base.weekday()) % 7)
+                when = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                return (when if when.timestamp() > now else when + datetime.timedelta(days=7)).timestamp()
             if m["mon"]:
                 if m["mon"][:3].lower() not in MONTHS:
                     continue
@@ -1425,25 +2090,23 @@ def quota_until(name):
     return row[0] if row and row[0] and row[0] > time.time() else None
 
 
-def out_of_quota(me, text):
-    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say) and tell the
-    team, once per limit."""
+def out_of_quota(me, text, own=True):
+    """Mark agent `me` out of quota until its limit resets (an hour from now if `text` doesn't say), or until it calls
+    a tool, and tell the team once per limit. When the limit ended the agent's `own` turn (its hook said so), put its
+    tasks in progress back on the board: the others go on with them (no downtime). A limit that an ask ran into on its
+    plan leaves them: the agent may be in the middle of one, on another model's limit; if it is stuck, its lease runs
+    out (see reap())."""
     now = time.time()
     until = reset_time(text, now)
-    con = db()
-    con.execute("BEGIN IMMEDIATE")
-    try:
+    resets = f"resets ~{reset_clock(until, now)}" if until else "reset time unknown"
+    with transaction() as con:
         row = con.execute("SELECT out_of_quota_until FROM agents WHERE name = ?", (me,)).fetchone()
         con.execute("INSERT INTO agents(name, out_of_quota_until) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET"
                     " out_of_quota_until = excluded.out_of_quota_until", (me, until or now + 3600))
         if not (row and row[0] and row[0] > now):  # not already known
-            post("agon", "all", f"{me} hit its usage limit"
-                 + (f", resets ~{reset_clock(until, now)}." if until else "; reset time unknown."))
-        con.execute("COMMIT")
-    except BaseException:
-        if con.in_transaction:
-            con.execute("ROLLBACK")
-        raise
+            post("agon", "all", f"{me} hit its usage limit" + (f", {resets}." if until else "; reset time unknown."))
+        if own:
+            release(con, me, f"{me} hit its usage limit, {resets}", f"you hit your usage limit, {resets}", now)
 
 
 def max_autoruns():
@@ -1466,14 +2129,20 @@ def out_of_turns(me, limit):
 
 
 def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
-    """Stop hook of agent `me`: let it stop, or keep it going with its new messages as the next prompt.
-    The decision goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns
-    an exit code 2 into 1, so the other way to keep an agent going can get lost."""
-    fmt = fmt or FORMATS.get(me, "claude")
+    """Hook of agent `me`. Stop (and Claude Code's StopFailure): let it stop, or keep it going with its new messages as
+    the next prompt. UserPromptSubmit (Claude Code, Codex): tell it which of its tasks went to others while it was away.
+    The answer goes out as JSON on stdout with exit code 0 in every app: on Windows, PowerShell turns an exit code 2
+    into 1, so the other way to keep an agent going can get lost."""
+    fmt, out = fmt or FORMATS.get(me, "claude"), out or sys.stdout.buffer
     payload = read_payload(inp or sys.stdin.buffer)
     if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
         return
-    touch(me)  # the agent's row, so its cursor can move
+    touch(me)  # the agent's row, so its cursor can move; a sign of life that renews its claims on the board
+    if payload.get("hook_event_name") == "UserPromptSubmit":  # Claude Code and Codex, before the agent starts a turn
+        note, upto = taken_note(me)  # after a usage limit, Claude Code resumes the task it had by itself
+        if note:  # added to the prompt as context; otherwise the hook adds nothing
+            write_json(out, {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": note}})
+        return told(me, upto)
     if paused():  # 1. the human said STOP
         return
     if hit := usage_limit(payload):  # 2. out of quota: say so and let it stop
@@ -1481,18 +2150,25 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     if turn_failed(payload) or out_of_turns(me, max_autoruns()):
         return
     # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
-    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100)  # 100: header
+    note, upto = taken_note(me)
+    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0, MAX_INBOX - 100 - len(note))  # 100: header
     if halted or not rows:
         return  # exit 0 without output: the agent may stop
     text = "\n".join(line(row) for row in rows)
     if more:
         text += f"\n{more} more — call inbox again."
-    decision = {"decision": CONTINUE[fmt], "reason": f"New messages from your Agon team:\n{text}"}
-    out = out or sys.stdout.buffer
-    out.write(json.dumps(decision).encode() + b"\n")  # ASCII only (\u escapes): no console code page mangles it
-    out.flush()
+    write_json(out, {"decision": CONTINUE[fmt], "reason": (f"{note}\n\n" if note else "")
+                     + f"New messages from your Agon team:\n{text}"})
     advance(me, rows[-1][0])  # only once the app has the messages (at-least-once)
+    told(me, upto)
     db().execute("UPDATE agents SET autoruns = autoruns + 1 WHERE name = ?", (me,))
+
+
+def write_json(out, decision):
+    """A hook's answer to its app: one line of JSON on stdout. ASCII only (\\u escapes): no console code page mangles
+    it."""
+    out.write(json.dumps(decision).encode() + b"\n")
+    out.flush()
 
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -1632,6 +2308,7 @@ def setup(out=None):
         say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
 
     claude_hook = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 60}]}]
+    claude_prompt = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 10}]}]
     app("Claude Code", "claude")
     say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
         "  claude plugin marketplace add giliandar5-lab/agon",
@@ -1639,7 +2316,7 @@ def setup(out=None):
         "By hand:",
         "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", py, script, "claude"]),
         f"  and the hooks, merged into {home / '.claude' / 'settings.json'}:",
-        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook}}),
+        "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook, "UserPromptSubmit": claude_prompt}}),
         "Channels (research preview), to wake an idle Claude:",
         "  claude --dangerously-load-development-channels plugin:agon@agon   (by hand: server:agon)")
 
@@ -1653,8 +2330,8 @@ def setup(out=None):
         "  then start Codex and trust the hook when it asks (or in /hooks)",
         "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
-        "  " + json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": codex_hook,
-                                                          "timeout": 60}]}]}}),
+        "  " + json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": codex_hook, "timeout": timeout}]}]
+                                     for event, timeout in (("Stop", 60), ("UserPromptSubmit", 10))}}),
         f"  and under [mcp_servers.agon] in {home / '.codex' / 'config.toml'} (ask takes minutes, and Codex passes"
         " Agon only the variables it names):", f"  tool_timeout_sec = {TOOL_TIMEOUT}",
         f"  env_vars = {json.dumps(ENV_VARS)}")
@@ -1705,6 +2382,14 @@ def setup(out=None):
     else:
         say(f"  export AGON_TEST_CMD={shlex.quote(example)}")
     say("Or keep it in the Claude Code plugin: /plugin configure agon@agon, Test command.")
+
+    # the board: how long a claim lasts, and the automatic review, which only the human turns on
+    auto = os.environ.get("AGON_AUTO_REVIEW", "").strip().lower() in ("1", "true", "yes", "on")
+    say("", "== Board: the team's tasks. board done runs the test command above, unasked (board is a local tool)",
+        f"A claim lasts AGON_LEASE seconds ({LEASE}) after its owner's last sign of life; then the task goes back to"
+        " the board.", "AGON_AUTO_REVIEW=1: when no agent from another company is online, Agon runs another company's"
+        " app to review a finished task, headless, sending it your code and spending your plan there.",
+        f"Now: AGON_AUTO_REVIEW is {'on' if auto else 'off (the default)'}.")
 
 
 class Args(argparse.ArgumentParser):
