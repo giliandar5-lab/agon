@@ -1190,6 +1190,7 @@ def tool_ask(session, args):
 # an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
 BOARD_SQL = "SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report FROM tasks"
 FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
+STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
 
 
 def board_path(raw):
@@ -1321,8 +1322,7 @@ def board_list(session, args):
                 " the tasks it waits for (after)."), None
     shown = [t for t in everything if t["state"] != "done"]
     done = [t for t in everything if t["state"] == "done"]
-    counts = [(sum(t["state"] == state for t in everything), word) for state, word in
-              (("todo", "to do"), ("doing", "in progress"), ("review", "in review"), ("done", "done"))]
+    counts = [(sum(t["state"] == state for t in everything), word) for state, word in STATES.items()]
     lines = [f"The board: {', '.join(f'{n} {word}' for n, word in counts if n)}."]
     lines += [task_line(t, states) for t in shown + done[-5:]]
     if len(done) > 5:
@@ -1364,9 +1364,42 @@ def board_add(session, args):
     return f"Added task #{tid}. Anyone can claim it now.", None
 
 
+def board_claim(session, args):
+    """The session's agent takes a task, atomically: SQLite's one write lock covers the checks and the write, and the
+    UPDATE takes only an unowned task, so of two agents that claim at once, one gets it. Refused while another agent's
+    task (in progress or in review) has one of its files, or while a task it waits for isn't done (approved)."""
+    me, tid = session.me, task_id(args.get("id"))
+    if paused():
+        raise ToolError(PAUSED)
+    with transaction() as con:
+        t = board_task(tid)
+        if t["owner"] == me and t["state"] in ("doing", "review"):
+            return f"Task #{tid} is yours already ({status(t)}).", None  # claiming it again changes nothing
+        if t["state"] == "done":
+            raise ToolError(f"task #{tid} is done.")
+        if t["state"] != "todo":
+            raise ToolError(f"task #{tid} is {t['owner']}'s, {STATES[t['state']]}.")
+        states = dict(con.execute("SELECT id, state FROM tasks"))
+        if waiting := [i for i in t["after"] if states.get(i) != "done"]:
+            raise ToolError(f"task #{tid} waits for {', '.join(f'#{i} ({STATES[states[i]]})' for i in waiting)}: it"
+                            f" can be claimed once {'it is' if len(waiting) == 1 else 'they are'} done (approved).")
+        # one writer per file: another agent's task in progress or in review keeps its files
+        taken = [f"{other['owner']} has {theirs} in task #{other['id']} ({STATES[other['state']]})"
+                 for other in board_tasks("WHERE state IN ('doing', 'review') AND owner != ?", (me,))
+                 for theirs in other["files"] if any(overlap(theirs, mine) for mine in t["files"])]
+        if taken:
+            raise ToolError(f"{'; '.join(taken)}. Pick another task, or wait until that one is done.")
+        if con.execute("UPDATE tasks SET state = 'doing', owner = ?, updated = ? WHERE id = ? AND owner IS NULL"
+                       " AND state = 'todo'", (me, time.time(), tid)).rowcount != 1:
+            raise ToolError(f"task #{tid} was just claimed by someone else.")  # the checks above make this rare
+        post(me, "human", f"Claimed task #{tid}: {t['title']}.")  # the arena only: nobody needs to act on it
+    files = f": edit only its files ({', '.join(t['files'])})" if t["files"] else ""
+    return f"Task #{tid} is yours: {t['title']}. Work on it{files}; when you finish, call board with action done.", None
+
+
 def tool_board(session, args):
     action = args.get("action")
-    handlers = {"list": board_list, "add": board_add}
+    handlers = {"list": board_list, "add": board_add, "claim": board_claim}
     if action not in handlers:
         raise ToolError("`action` must be list, add, claim, done or review.")
     try:

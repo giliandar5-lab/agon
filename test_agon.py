@@ -1793,6 +1793,68 @@ coder = Agent("gpt", env=BOARD)
 text = coder("inbox", wait=0)
 assert "claude -> all: New task #1 on the board" in text and "Added task #2" not in text, text
 
+# Phase 4, 5-7. claim is atomic (BEGIN IMMEDIATE + UPDATE ... WHERE owner IS NULL): of two agents that claim at once,
+# one gets the task. It is refused while another agent's task in progress (or in review) has one of its files, naming
+# the owner, and while a task it waits for isn't done (approved). Claiming a task you have changes nothing
+assert coder("board", action="claim", id=1) == ("Task #1 is yours: Build the menu. Work on it: edit only its files"
+                                                " (ui/menu.py, tests/); when you finish, call board with action done.")
+assert coder("board", action="claim", id=1) == "Task #1 is yours already (doing: gpt)."
+lead("board", action="add", title="Menu icons", files=["UI/"])  # a folder that holds gpt's ui/menu.py
+lead("board", action="add", title="Docs", files=["docs/"])
+for args, why in (({"id": 1}, "Nothing claimed: task #1 is gpt's, in progress."),
+                  ({"id": 3}, "Nothing claimed: gpt has ui/menu.py in task #1 (in progress). Pick another task, or wait"
+                              " until that one is done."),
+                  ({"id": 2}, "Nothing claimed: task #2 waits for #1 (in progress): it can be claimed once it is"
+                              " done (approved)."),
+                  ({"id": 9}, "Nothing claimed: there is no task #9"), ({}, "Nothing claimed: `id` must be the number")):
+    res = lead.call("board", action="claim", **args)
+    assert res["isError"] is True and res["content"][0]["text"].startswith(why), (args, res)
+assert lead("board", action="claim", id=4).startswith("Task #4 is yours: Docs.")
+assert bdb.execute("SELECT id, state, owner FROM tasks ORDER BY id").fetchall() == [
+    (1, "doing", "gpt"), (2, "todo", None), (3, "todo", None), (4, "doing", "claude")]
+assert bdb.execute("SELECT sender, rcpt, text FROM msgs WHERE text LIKE 'Claimed%' ORDER BY id").fetchall() == [
+    ("gpt", "human", "Claimed task #1: Build the menu."), ("claude", "human", "Claimed task #4: Docs.")]  # arena only
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'STOP')")
+res = lead.call("board", action="claim", id=3)
+assert res["isError"] is True and res["content"][0]["text"] == f"Nothing claimed: {agon.PAUSED}", res
+bdb.execute("INSERT INTO msgs(sender, rcpt, text) VALUES ('human', 'all', 'go on')")
+# The race, between two processes that claim the same 30 tasks: before each one, both wait until the other is ready for
+# it, then claim it at once. The check inside the claim's transaction is slowed down (20 ms), so the second claim comes
+# in during the first and waits for SQLite's write lock. Each task gets exactly one owner, and the other hears whose
+RACE = dict(os.environ, AGON_DB=str(Path(TMP, "race.db")), RACE_DIR=str(Path(TMP, "race")))
+Path(RACE["RACE_DIR"]).mkdir()
+subprocess.run([sys.executable, "-c", "import agon\nfor i in range(30):\n    agon.tool_board(agon.Session('lead', None),"
+                " {'action': 'add', 'title': f'task {i}', 'files': [f'f{i}.py']})"], cwd=HERE, env=RACE, check=True)
+CLAIMER = """import agon, json, os, sys, time
+me, other = sys.argv[1], sys.argv[2]
+folder, check = os.environ["RACE_DIR"], agon.board_task
+def slow(tid):  # a slow check inside the claim's transaction: the other claim comes in meanwhile, and must wait
+    found = check(tid)
+    time.sleep(0.02)
+    return found
+agon.board_task = slow
+got = {}
+for i in range(1, 31):  # both claim task i at the same moment: each waits here until the other is ready for it
+    open(os.path.join(folder, f"{me}-{i}"), "w").close()
+    while not os.path.exists(os.path.join(folder, f"{other}-{i}")):
+        time.sleep(0.001)
+    try:
+        agon.tool_board(agon.Session(me, None), {"action": "claim", "id": i})
+        got[i] = "won"
+    except agon.ToolError as e:
+        got[i] = str(e)
+print(json.dumps(got))"""
+racers = [subprocess.Popen([sys.executable, "-c", CLAIMER, *names], cwd=HERE, env=RACE, stdout=subprocess.PIPE,
+                           text=True) for names in (("claude", "gpt"), ("gpt", "claude"))]
+results = [json.loads(p.communicate(timeout=120)[0]) for p in racers]
+assert [p.returncode for p in racers] == [0, 0], results
+owners = dict(sqlite3.connect(RACE["AGON_DB"]).execute("SELECT id, owner FROM tasks"))
+for i in range(1, 31):
+    won = [name for name, got in zip(("claude", "gpt"), results) if got[str(i)] == "won"]
+    lost = [got[str(i)] for got in results if got[str(i)] != "won"]
+    assert won == [owners[i]] and lost == [f"Nothing claimed: task #{i} is {owners[i]}'s, in progress."], (i, results)
+assert set(owners.values()) == {"claude", "gpt"}, owners  # the loser of one task arrives last and wins the next one
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
