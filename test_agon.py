@@ -646,7 +646,14 @@ assert claude_plugin["version"] == codex_plugin["version"] == agon.VERSION == se
 python = "${user_config.python}"  # Claude Code has no per-OS fields: on Windows the user picks py
 option = claude_plugin["userConfig"]["python"]
 assert option["default"] == "python3" and "On Windows use py" in option["description"], option
-assert claude_plugin["mcpServers"] == {"agon": {"command": python, "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "claude"]}}
+# Phase 3.1: Claude Code 2.1.282 gives plugin options to hooks but not to MCP servers: the plugin passes it
+passed = {"CLAUDE_PLUGIN_OPTION_TEST_COMMAND": "${user_config.test_command}"}
+assert claude_plugin["mcpServers"] == {"agon": {"command": python, "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "claude"],
+                                                "env": passed}}
+option = claude_plugin["userConfig"]["test_command"]
+assert option["type"] == "string" and option["title"] == "Test command" and option["default"] == "", option
+assert "python -m pytest -q" in option["description"], option
+assert "AGON_TEST_CMD, when set, comes first" in option["description"], option
 for event in ("Stop", "StopFailure"):  # a turn that ends in an API error (a usage limit) runs StopFailure, not Stop
     assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": 60,
                                                          "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
@@ -691,7 +698,7 @@ fake.write_text("@echo off\n" if windows else "#!/bin/sh\n")
 fake.chmod(0o755)
 env = {k: v for k, v in os.environ.items() if k != "AGON_DB"}
 env |= {"PATH": str(bin_dir), "HOME": str(setup_home), "USERPROFILE": str(setup_home)}
-for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db"))}):
+for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm test"}):
     p = subprocess.run([sys.executable, SERVER, "setup"], env=env | extra, capture_output=True, text=True, timeout=60)
     out, script = p.stdout, str(Path(SERVER).resolve())
     assert p.returncode == 0 and p.stderr == "", p
@@ -719,6 +726,19 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db"))}):
         [export] = [row.strip() for row in out.splitlines() if "export AGON_CMD_CLAUDE=" in row]
         shell = subprocess.run(["sh", "-c", f'{export}; printf %s "$AGON_CMD_CLAUDE"'], capture_output=True, text=True)
         assert shell.stdout == value, (export, shell)
+    # Phase 3.1: how to set the test command (with examples), what it is now, and the timeout
+    tests = extra.get("AGON_TEST_CMD", "python -m pytest -q")
+    for needed in ("== Tests: Agon runs your project's tests for every ask",
+                   "python -m pytest -q, npm test or python test_agon.py", "AGON_TEST_TIMEOUT (300)",
+                   "/plugin configure agon@agon, Test command.",
+                   "Now: AGON_TEST_CMD is npm test" if extra else "Now: AGON_TEST_CMD isn't set, so asks say (no"):
+        assert needed in out, (needed, out)
+    if windows:
+        assert f"  [Environment]::SetEnvironmentVariable('AGON_TEST_CMD', '{tests}', 'User')" in out, out
+    else:
+        [export] = [row.strip() for row in out.splitlines() if "export AGON_TEST_CMD=" in row]
+        shell = subprocess.run(["sh", "-c", f'{export}; printf %s "$AGON_TEST_CMD"'], capture_output=True, text=True)
+        assert shell.stdout == tests, (export, shell)
 
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
@@ -1151,7 +1171,8 @@ mark("claude", 0)
 once = Agent("rev5", env=ASK | {"FAKE_LIMIT": "codex"})
 res, text = asked(once, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
 assert re.match(r"gpt hit its usage limit \(what it did is on branch agon/gpt-[\d-]+\), so claude finished the task in"
-                r" \d+s on branch agon/claude-[\d-]+ \(no tests run: set AGON_TEST_CMD\):\n part\.txt \| 1 \+\n", text), text
+                r" \d+s on branch agon/claude-[\d-]+ \(no tests run: set AGON_TEST_CMD\):\n part\.txt \| 1 \+\n",
+                text), text
 claude_branch = re.findall(r"agon/claude-[\d-]+", text)[0]
 assert in_repo("show", f"{claude_branch}:part.txt") == "written by claude"
 once.close()
@@ -1551,6 +1572,10 @@ res, text = asked(rev, agent="claude", prompt="Please review", cwd=str(project),
                   AGON_TEST_CMD=json.dumps(fake_tests("pass")[0]))
 assert f"VERDICT: approve ({agon.NO_TESTS})." in text and since(runs) == ["claude"], text
 checker.close()
+opted = Agent("opted", env=ASK | {"CLAUDE_PLUGIN_OPTION_TEST_COMMAND": json.dumps(fake_tests("pass")[0])})
+res, text = asked(opted, agent="claude", prompt="Please review", cwd=str(project))  # the Claude Code plugin's option
+assert "VERDICT: approve (tests passed)." in text, text
+opted.close()
 for mode, outcome, shows, extra in (
     ("fail", "tests failed", "failed with exit code 1 after ", {}),  # the fake reviewer approves all the same
     ("hang", "tests timed out", "didn't finish in 2s (AGON_TEST_TIMEOUT), so Agon stopped it.",
@@ -1645,9 +1670,10 @@ assert "notes.txt" in tested["files"] and not Path(tested["cwd"]).exists() and n
 assert "\n    the tests saw: written by codex\n\nIts summary:\ncodex looked at sub" in text, text
 assert "notes.txt | 1 +\n 1 file changed, 1 insertion(+)\n" in text and "leftover" not in text, text
 assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"
-assert in_repo("ls-tree", "-r", "--name-only", branch).splitlines() == ["sub/app.py", "sub/notes.txt"]  # no leftover.txt
-assert f"When you finish, Agon runs the project's tests (`{agon.command_line(fake_tests('leave')[0])}`) there, commits" \
-       f" what you changed to branch {branch}" in worked["prompt"], worked["prompt"]
+assert in_repo("ls-tree", "-r", "--name-only", branch).splitlines() == ["sub/app.py", "sub/notes.txt"]  # no leftover
+shown = agon.command_line(fake_tests("leave")[0])
+assert f"Agon runs the project's tests (`{shown}`) there, commits what you changed to branch {branch}" \
+       in worked["prompt"], worked["prompt"]
 assert re.fullmatch(rf"tasker asked gpt for a task: gpt finished in \d+s on branch {branch} \(tests passed\): 1 file"
                     r" changed, 1 insertion\(\+\)\.", agon_said()), agon_said()
 tasker.close()
@@ -1676,6 +1702,12 @@ for tool in (send_tool, inbox_tool):  # Phase 2, Ж: local, additive tools, so C
 # Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
 assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
 assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
+# Phase 3.1: nothing tells the agents that a reviewer runs the tests; Agon does, with a command they can't pass
+assert "Agon runs the project's tests itself (the human sets the command)" in ask_tool["description"], ask_tool
+assert "runs the tests" not in ask_tool["description"] and set(ask_tool["inputSchema"]["properties"]) == {
+    "agent", "prompt", "mode", "cwd"}, ask_tool
+assert "a review (read-only: Agon runs the\n  tests, and the VERDICT says whether they passed)" in agon.INSTRUCTIONS
+assert "Run the tests" not in agon.TASK and "Run the project's tests" not in agon.REVIEW
 sam.close()
 
 # 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons

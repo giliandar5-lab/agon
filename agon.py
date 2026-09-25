@@ -28,7 +28,7 @@ from pathlib import Path
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.3.0"  # also in the plugin manifests
+VERSION = "0.3.1"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -115,8 +115,8 @@ INSTRUCTIONS = """You are "{me}" in Agon: a shared chat where AI agents from dif
   event only says that messages wait: call inbox to read them.
 - Announce a file before editing it, so two agents never edit the same file at once.
 - Keep messages short and concrete; put long content in a file and send its path.
-- ask gets a second opinion from another agent's app, which takes minutes: a review (read-only; it runs the
-  tests and ends with a VERDICT) or a task done on a new git branch that you may merge."""
+- ask gets a second opinion from another agent's app, which takes minutes: a review (read-only: Agon runs the
+  tests, and the VERDICT says whether they passed) or a task done on a new git branch that you may merge."""
 ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
 off here and team messages don't come to you."""
 
@@ -148,9 +148,9 @@ TOOLS = [
     {
         "name": "ask",
         "description": "Get a second opinion from another agent's app (claude, gpt or gemini), run headless on the"
-        " user's plan; it takes minutes. review: read-only, runs the tests, ends with VERDICT: approve or changes."
-        " task: works on a new git branch from your last commit and returns its summary, diff stat and branch;"
-        " merging it is your call.",
+        " user's plan; it takes minutes. Agon runs the project's tests itself (the human sets the command) and says"
+        " whether they passed. review: read-only, ends with VERDICT: approve or changes. task: works on a new git"
+        " branch from your last commit and returns its summary, diff stat and branch; merging it is your call.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -533,9 +533,10 @@ def split_command(raw, var, example=None):
 
 def test_command():
     """The human's test command, as (its arguments, the seconds it may take), or None when none is set: AGON_TEST_CMD,
-    or else the Claude Code plugin's Test command option, which Claude Code passes as CLAUDE_PLUGIN_OPTION_TEST_COMMAND
-    (and never takes from a project's settings). Never a tool argument: Agon runs it as the user, outside the apps'
-    sandboxes, so only the human chooses the command line, although the agents write what it runs."""
+    or else the Claude Code plugin's Test command option, which the plugin passes to Agon as
+    CLAUDE_PLUGIN_OPTION_TEST_COMMAND (Claude Code never takes plugin options from a project's settings). Never a tool
+    argument: Agon runs it as the user, outside the apps' sandboxes, so only the human chooses the command line,
+    although the agents write what it runs."""
     for var in TEST_VARS:
         if (raw := os.environ.get(var) or "").strip():
             name = var if var == "AGON_TEST_CMD" else "The Test command in Agon's plugin settings (/plugin configure)"
@@ -1676,6 +1677,24 @@ def setup(out=None):
             say(f"  [Environment]::SetEnvironmentVariable('{var}', '{quoted}', 'User')")
         else:
             say(f"  export {var}={shlex.quote(value)}")
+
+    # Agon runs the tests itself, so that a verdict rests on what they printed rather than on what a reviewer says
+    tests = os.environ.get("AGON_TEST_CMD", "").strip()
+    say("", "== Tests: Agon runs your project's tests for every ask, and each verdict says what came of them",
+        "AGON_TEST_CMD is the command that runs them, without a shell: a command line or a JSON list, such as",
+        "python -m pytest -q, npm test or python test_agon.py. It runs in the project folder (a task's: in its",
+        "worktree) as you, with the environment your app gives Agon: name a virtual environment's Python by its full",
+        f"path, since the apps don't activate one. AGON_TEST_TIMEOUT ({TEST_TIMEOUT}) is how many seconds it may take.",
+        f"Now: AGON_TEST_CMD is {tests}" if tests else f"Now: AGON_TEST_CMD isn't set, so asks say ({NO_TESTS}).",
+        "Run this in PowerShell, then restart the apps:" if windows else
+        "Add this to your shell profile, then start the apps from a new terminal:")
+    example = tests or " ".join(TEST_EXAMPLE)
+    if windows:  # single quotes as above
+        quoted = example.replace("'", "''")
+        say(f"  [Environment]::SetEnvironmentVariable('AGON_TEST_CMD', '{quoted}', 'User')")
+    else:
+        say(f"  export AGON_TEST_CMD={shlex.quote(example)}")
+    say("Or keep it in the Claude Code plugin: /plugin configure agon@agon, Test command.")
 
 
 class Args(argparse.ArgumentParser):
