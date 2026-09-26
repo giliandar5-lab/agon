@@ -1,4 +1,5 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
+import contextlib
 import datetime
 import faulthandler
 import http.client
@@ -9,6 +10,7 @@ import queue
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +20,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-faulthandler.dump_traceback_later(240, exit=True)  # a test that hangs shows where, long before CI gives up
+faulthandler.dump_traceback_later(420, exit=True)  # a test that hangs shows where, before CI gives up at 600 s
 TMP = tempfile.mkdtemp()
 # Before Python 3.13, time.time() on Windows moves in 15.625 ms steps (time.get_clock_info("time").resolution), so two
 # quick events get the same time. Every Python process of these tests runs on such a clock, whatever the system: this
@@ -33,8 +35,9 @@ time.time = lambda: _time() // STEP * STEP
 assert subprocess.run([sys.executable, "-c", f"import time; assert time.time() % {STEP} == 0"]).returncode == 0
 HERE = Path(__file__).resolve().parent
 SERVER = str(HERE / "agon.py")
-for key in [key for key in os.environ if key.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_"))]:
-    del os.environ[key]  # the human's own settings, such as a user-wide AGON_TEST_CMD, must not change these tests
+for key in [key for key in os.environ if key.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_", "CLAUDE_CODE_MESSAGING_"))]:
+    del os.environ[key]  # the human's own settings, such as a user-wide AGON_TEST_CMD, must not change these tests; and
+    # when they run in Claude Code, Agon must never post to the inbox of the session that runs them
 os.environ["AGON_DB"] = str(Path(TMP, "test.db"))
 import agon  # noqa: E402  (reads AGON_DB on import, so it comes after the line above)
 
@@ -692,7 +695,9 @@ assert codex_plugin["mcpServers"] == {"agon": {"command": "./agon", "args": ["gp
 assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CMD_GPT", "AGON_CMD_GEMINI",
                          "AGON_FALLBACK", "AGON_ASK_TIMEOUT", "AGON_LIMIT_PATTERNS",  # Phase 3.1: the test command too
                          "AGON_TEST_CMD", "AGON_TEST_TIMEOUT",
-                         "AGON_LEASE", "AGON_AUTO_REVIEW"] and agon.TOOL_TIMEOUT == 960  # Phase 4: the board's
+                         "AGON_LEASE", "AGON_AUTO_REVIEW",  # Phase 4: the board's
+                         "AGON_GEMINI_PLAN", "GEMINI_API_KEY",  # Phase 5: agy's key, and autopilot's mark
+                         "AGON_AUTOPILOT"] and agon.TOOL_TIMEOUT == 960
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
 [codex_prompt] = codex_plugin["hooks"]["hooks"]["UserPromptSubmit"][0]["hooks"]  # Phase 4: the same command, sooner
@@ -748,7 +753,7 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
     assert f"claude is {fake}".lower() in out.lower() and "codex isn't on PATH" in out and "agy isn't on PATH" in out
     assert f"Python  {sys.executable}" in out and f"Agon    {script}" in out and f"python={sys.executable}" in out
     snippets = [json.loads(line) for line in out.splitlines() if line.startswith("  {")]
-    assert len(snippets) == 3, out  # Claude Code, Codex and Antigravity
+    assert len(snippets) == 4, out  # Claude Code, Codex and Antigravity; Phase 5: agy's own settings
     [claude_hook] = snippets[0]["hooks"]["StopFailure"][0]["hooks"]
     assert claude_hook == {"type": "command", "command": sys.executable, "args": [script, "hook", "claude"],
                            "timeout": 60}  # exec form: no shell, so no quoting to get wrong
@@ -791,6 +796,17 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
         [export] = [row.strip() for row in out.splitlines() if "export AGON_TEST_CMD=" in row]
         shell = subprocess.run(["sh", "-c", f'{export}; printf %s "$AGON_TEST_CMD"'], capture_output=True, text=True)
         assert shell.stdout == tests, (export, shell)
+    # Phase 5: how to start autopilot, its brakes, and agy's API-key mode with the rule for Agon's tools
+    assert snippets[3] == {"modelProvider": "gemini", "permissions": {"allow": ["mcp(agon/*)"]}}, snippets[3]
+    for needed in ("== Autopilot: keeps the team working with no app open (python agon.py autopilot --help)",
+                   "  " + agon.command_line([sys.executable, script, "autopilot", "--agents", "claude,gpt,gemini",
+                                             "--lead", "claude"]) + "\n",
+                   "AGON_MAX_WAKES_PER_HOUR (12) wakes of an agent an hour", "AGON_MAX_WORKERS (3) apps at once",
+                   "AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them. Past its plan's"
+                   " limit, claude rests rather than bill your extra usage (AGON_EXTRA_USAGE=1 lets it go on).",
+                   f"Merge this into {setup_home.joinpath(*agon.GEMINI_SETTINGS)}:",
+                   "Now: agy won't run (AGON_GEMINI_PLAN=1 runs it on your Google login, at your own risk)."):
+        assert needed in out, (needed, out)
 
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
@@ -851,7 +867,8 @@ if prompt is None:
     prompt = sys.stdin.buffer.read().decode("utf-8")
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
-                          "asked_by": os.environ.get("AGON_ASKED_BY")}) + "\n")
+                          "asked_by": os.environ.get("AGON_ASKED_BY"),
+                          "inbox": sorted(k for k in os.environ if k.startswith("CLAUDE_CODE_MESSAGING_"))}) + "\n")
 if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
     with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
         f.write(f"written by {app}\n")
@@ -924,7 +941,8 @@ for event in events:
 APPS = {"claude": "claude", "gpt": "codex", "gemini": "agy"}
 NONE = "Test results, run by Agon: none, because the human hasn't set AGON_TEST_CMD."  # no AGON_TEST_CMD
 APPROVED = r"VERDICT: approve \(no tests run: set AGON_TEST_CMD\)\."  # the verdict of a review without it
-ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT))
+ASK = dict(os.environ, FAKE_LOG=str(FAKE_LOG), FAKE_BEAT=str(BEAT),
+           AGON_GEMINI_PLAN="1")  # Phase 5: the fake agy stands in for one on a Google login (see barred())
 for name, app in APPS.items():  # the default command, with the fake in place of the app
     ASK[f"AGON_CMD_{name.upper()}"] = json.dumps([sys.executable, str(FAKE), app, *agon.COMMANDS[name][1:]])
 project, plain = Path(TMP, "project"), Path(TMP, "plain")  # a git repository with a commit, and a folder that isn't
@@ -1455,7 +1473,8 @@ import json, os, subprocess, sys, time
 mode, args = sys.argv[1], sys.argv[2:]
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"app": "tests", "mode": mode, "args": args, "cwd": os.getcwd(), "stdin": sys.stdin.read(),
-                          "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_"))),
+                          "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_",
+                                                                                     "CLAUDE_CODE_MESSAGING_"))),
                           "files": sorted(os.listdir("."))}) + "\n")
 def beat():  # a child that keeps writing, to see whether it is stopped
     subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
@@ -1626,12 +1645,16 @@ def since(runs):  # which fakes ran after the first `runs`: tests, claude, codex
     return [run["app"] for run in fake_runs()[runs:]]
 
 
-checker = Agent("checker", env=with_tests("pass"))
+# The server runs in a Claude Code session, which gives it its inbox (a socket and a token): no program Agon starts gets
+# them, so neither the tests nor another company's app can post into the session
+checker = Agent("checker", env=with_tests("pass", CLAUDE_CODE_MESSAGING_SOCKET=str(Path(TMP, "no.sock")),
+                                          CLAUDE_CODE_MESSAGING_TOKEN="the-session's-token"))
 runs = len(fake_runs())
 res, text = asked(checker, agent="claude", prompt="Please review", cwd=str(project))
 tested, reviewed = fake_runs()[runs:]
 assert since(runs) == ["tests", "claude"] and Path(tested["cwd"]).resolve() == project.resolve(), fake_runs()[runs:]
 assert tested["settings"] == [] and tested["stdin"] == "", tested  # without Agon's settings, with stdin of its own
+assert reviewed["inbox"] == [] and reviewed["asked_by"] == "checker", reviewed
 assert "Test results, run by Agon: `" in reviewed["prompt"] and "passed (exit code 0)" in reviewed["prompt"]
 assert "\n    3 passed in 0.01s\n\nWhat checker asks:\nPlease review" in reviewed["prompt"], reviewed["prompt"]
 assert "Approve only if the tests Agon ran passed: tests that failed or didn't finish mean" in reviewed["prompt"]
@@ -2251,6 +2274,937 @@ assert agon.board_task(2)["reviewer"] is None and said() == [
 agon.close_db()
 agon.DB, time.time = test_db, coarse
 
+# Phase 5, limits. What Codex 0.157 prints when a plan can't go on (seen against a mock of its API, with the source), and
+# Claude Code's limit of one model: each marks the agent out of quota
+for text in ("You’ve hit your usage limit for GPT-6 Sol. Switch to another model now, or try again at 8:36 PM.",
+             "Your workspace is out of credits. Add credits to continue.",
+             "You hit your spend cap set by the owner of your workspace.",
+             "Quota exceeded. Check your plan and billing details.",
+             "To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus",
+             "stream disconnected before completion: The usage limit has been reached",
+             "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model"):
+    assert agon.shows_limit([text]) == text, text
+assert agon.shows_limit(["The test hit a quota of 5 files; Plus plans are fine"]) is None
+# agy 1.2.11 keeps status ERROR on every turn after an error it recovered from (a 429 it retried): an answer is an answer,
+# and a real failure exits 3 with no response. Found by running agy against a mock: ask threw such answers away
+recovered = {"conversation_id": "c", "status": "ERROR", "response": "fine\n", "num_turns": 1,
+             "error": "API error (attempt 1): Error 429, Message: ... Status: RESOURCE_EXHAUSTED"}
+assert agon.final_answer(json.dumps(recovered)) == ("fine\n", None)
+assert agon.final_answer(json.dumps(recovered | {"response": ""})) == (None, recovered["error"])
+# Google's Antigravity FAQ: "Using third party software, tools, or services to access Antigravity is a violation of our
+# Terms of Service ... we recommend using a Gemini Enterprise or Google AI Studio API key." So Agon runs agy headless
+# (ask, the automatic review, autopilot) only in agy's API-key mode, a setting of agy's own, unless AGON_GEMINI_PLAN=1
+gem_home = Path(TMP, "gem-home")
+settings = gem_home.joinpath(*agon.GEMINI_SETTINGS)
+settings.parent.mkdir(parents=True)
+home_vars = {"HOME": str(gem_home), "USERPROFILE": str(gem_home)}  # Path.home() on POSIX and on Windows
+
+
+def gemini_barred(**env):  # agon.barred("gemini") with the fake home and these settings
+    saved = {key: os.environ.get(key) for key in (*home_vars, "AGON_GEMINI_PLAN")}
+    os.environ.update(home_vars | env)
+    try:
+        return agon.barred("gemini")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+assert agon.barred("gpt") is None and agon.barred("claude") is None  # their vendors document headless runs on plans
+why = gemini_barred()
+assert why.startswith("Can't run gemini on your Google login: Google's terms forbid third-party software there, so Agon"
+                      " runs agy on a Gemini API key: set \"modelProvider\": \"gemini\" in") and str(settings) in why, why
+assert why.endswith("or AGON_GEMINI_PLAN=1 to use your Google login at your own risk"), why
+for content in ("{not json", "[1]", '{"modelProvider": "google"}'):
+    settings.write_text(content, encoding="utf-8")
+    assert gemini_barred() == why, content
+assert gemini_barred(AGON_GEMINI_PLAN="1") is None and gemini_barred(AGON_GEMINI_PLAN="yes") is None
+settings.write_text('{"modelProvider": "gemini", "theme": "dark"}', encoding="utf-8")
+assert gemini_barred() is None and gemini_barred(AGON_GEMINI_PLAN="0") is None
+settings.unlink()
+keyless = {key: value for key, value in ASK.items() if key != "AGON_GEMINI_PLAN"} | home_vars
+runs = len(fake_runs())
+asker = Agent("asker", env=keyless)  # an ask to gemini on the Google login goes to the next agent, and says why
+res, text = asked(asker, agent="gemini", prompt="Please review", cwd=str(project))
+assert "isError" not in res and since(runs) == ["claude"], (text, since(runs))
+assert text.startswith(f"{why}, so claude answered in "), text
+settings.write_text('{"modelProvider": "gemini"}', encoding="utf-8")  # in API-key mode, gemini answers itself
+res, text = asked(asker, agent="gemini", prompt="Please review", cwd=str(project))
+assert text.startswith("gemini answered in ") and since(runs) == ["claude", "agy"], text
+asker.close()
+settings.unlink()
+
+# Phase 5, autopilot: `python agon.py autopilot` wakes each agent when messages come for it: an idle Claude Code session
+# through its inbox socket, else the agent's app, headless, for one turn that resumes the agent's own session. The fake
+# apps below take a turn the way claude 2.1.282, codex 0.157.0 and agy 1.2.11 do (seen against mocks of their APIs)
+FAKE_WAKE, WAKE_LOG, WAKE_STATE = Path(TMP, "fake_wake.py"), Path(TMP, "wake-log"), Path(TMP, "wake-state")
+WAKE_LOG.mkdir()  # a file for each run: on Windows, two processes that append to one file at once can lose a line
+WAKE_STATE.mkdir()
+FAKE_WAKE.write_text(r'''"""A fake Claude Code, Codex or agy for autopilot: python fake_wake.py claude|codex|agy ARGS...
+It takes a turn the way its app does (Claude Code and agy: one stream-json line, and its stdin stays open; Codex: all of
+stdin), writes down what it got, keeps each session's running totals in a file (the apps restore them on resume), and
+acts on words in the new messages: @SEND name:text| sends a message as the agent, @HANG waits to be stopped, @SLOW takes
+a second, @CRASH fails, @LIMIT hits a usage limit, @DENIED is agy refusing Agon's tools; Claude Code only: @BUSY runs a
+turn that asks for Agon's tools and doesn't get them, @ZERO crashes with its totals zeroed, @EXTRA goes past the plan's
+limit on extra usage."""
+import json, os, signal, subprocess, sys, time, uuid
+sys.path.insert(0, os.environ["FAKE_AGON"])
+import agon
+app, args = sys.argv[1], sys.argv[2:]
+me = {"claude": "claude", "codex": "gpt", "agy": "gemini"}[app]
+
+
+def say(event):
+    sys.stdout.write(json.dumps(event) + "\n")
+    sys.stdout.flush()
+
+
+def value(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+def model_usage(zero=False):  # Claude Code's running totals per model, like its cost, with its subagents'
+    return {model: dict(zip(("inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens"),
+                            [0] * 4 if zero else counts)) for model, counts in state["models"].items()}
+
+
+def rest():  # Claude Code and agy take more lines until their stdin closes; an interrupt ends Claude Code's turn
+    for raw in sys.stdin.buffer:
+        request = json.loads(raw)
+        if request.get("type") == "control_request":
+            say({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}})
+            say({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid,
+                 "terminal_reason": "aborted_streaming", "usage": {}, "total_cost_usd": state["usd"],
+                 "modelUsage": model_usage(), "num_turns": 1})
+
+
+def hang():  # waits to be stopped, with a child that keeps writing (the whole process tree must go)
+    subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
+                      "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
+    time.sleep(600)
+
+
+if app == "codex":  # codex exec reads its stdin to the end first
+    prompt, asked = sys.stdin.buffer.read().decode("utf-8"), (args[args.index("resume") + 1] if "resume" in args
+                                                               else None)
+else:
+    prompt = json.loads(sys.stdin.buffer.readline())["message"]["content"]  # UTF-8, whatever the console uses
+    asked = value("--resume") if app == "claude" else value("--conversation")
+sid = asked or value("--session-id") or str(uuid.uuid4())
+record = os.path.join(os.environ["FAKE_WAKE_LOG"], f"{time.time_ns():020d}-{os.getpid()}")
+with open(record + ".tmp", "w", encoding="utf-8") as log:  # complete, then renamed: a reader never sees half of it
+    json.dump({"app": app, "args": args, "prompt": prompt, "cwd": os.getcwd(), "session": sid,
+               "autopilot": os.environ.get("AGON_AUTOPILOT")}, log)
+os.replace(record + ".tmp", record + ".json")
+path = os.path.join(os.environ["FAKE_STATE"], f"{app}-{sid}.json")
+if asked and not os.path.exists(path):
+    if app == "claude":
+        sys.stderr.write(f"No conversation found with session ID: {sid}\n")
+        sys.exit(1)
+    if app == "codex":
+        sys.stderr.write(f"Error: thread/resume: thread/resume failed: no rollout found for thread id {sid} (code"
+                         " -32600)\n")
+        sys.exit(1)
+    sys.stderr.write(f'warning: conversation "{sid}" not found\n')  # agy starts a new one
+    sid = str(uuid.uuid4())
+    path = os.path.join(os.environ["FAKE_STATE"], f"{app}-{sid}.json")
+
+
+def save():
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+
+
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as f:
+        state = json.load(f)
+else:
+    state = {"turns": 0, "in": 0, "cached": 0, "out": 0, "usd": 0.0, "models": {}}
+save()
+new = prompt.rsplit("New messages from your Agon team:", 1)[-1]  # not the recap of a new session
+if "@CRASH" in new:
+    sys.stderr.write("boom: the fake crashed\n")
+    sys.exit(3)
+for part in new.split("@SEND ")[1:]:
+    name, _, text = part.split("|", 1)[0].partition(":")
+    agon.post(me, name, text)
+if "@SLOW" in new:
+    time.sleep(1)
+answer = "Handed off: the lexer is half done." if "Write a hand-off" in prompt else f"{me} did it."
+state["turns"] += 1
+if app == "claude":
+    say({"type": "system", "subtype": "init", "session_id": sid, "cwd": os.getcwd(), "claude_code_version": "2.1.282"})
+    if "@LIMIT" in new:  # a plan's limit: no retry, and the stream-json process exits 1
+        say({"type": "rate_limit_event", "rate_limit_info": {"status": "rejected",
+                                                             "resetsAt": int(time.time()) + 7200}})
+        say({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429, "session_id": sid,
+             "result": "You've hit your limit · resets 3pm (Europe/Berlin)", "usage": {},
+             "total_cost_usd": state["usd"], "modelUsage": model_usage()})
+        rest()
+        sys.exit(1)
+    usage = {"input_tokens": 100, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 1000,
+             "output_tokens": 20}
+    say({"type": "assistant", "message": {"role": "assistant", "usage": usage}})
+    if "@HANG" in new:  # it waits for the interrupt on stdin
+        rest()
+        sys.exit(0)
+    if "@ZERO" in new:  # a crash: its result may carry zeroed totals (Claude Code's docs), and it saves none
+        say({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid, "usage": {},
+             "total_cost_usd": 0, "modelUsage": model_usage(zero=True), "num_turns": 1})
+        sys.exit(1)
+    if "@EXTRA" in new:  # past the plan's limit, on the human's extra usage: the turn goes on
+        say({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour",
+            "overageStatus": "allowed", "isUsingOverage": True}})
+    state["usd"] = round(state["usd"] + 0.05, 4)  # a session's running totals: Claude Code restores them on resume
+    for model, turn in (("model-a", (100, 50, 1000, 20)), ("model-b", (30, 0, 200, 10))):  # the main loop, a subagent
+        state["models"][model] = [a + b for a, b in zip(state["models"].get(model, [0] * 4), turn)]
+    save()
+    denied = [{"tool_name": "mcp__agon__send", "tool_use_id": "t1", "tool_input": {}}] if "@BUSY" in new else []
+    say({"type": "result", "subtype": "success", "is_error": False, "result": answer, "session_id": sid, "usage": usage,
+         "total_cost_usd": state["usd"], "modelUsage": model_usage(), "num_turns": 1, "permission_denials": denied})
+    rest()
+elif app == "codex":
+    say({"type": "thread.started", "thread_id": sid})
+    say({"type": "turn.started"})
+    if "@LIMIT" in new:
+        said = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 7:48 PM."
+        say({"type": "error", "message": said})
+        say({"type": "turn.failed", "error": {"message": said}})
+        sys.exit(1)
+    say({"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "ls", "exit_code": 0}})
+    if "@HANG" in new:
+        signal.signal(signal.SIGINT, lambda *_: sys.exit(1))  # codex exits 1 on SIGINT, its stdout ends at the turn
+        hang()
+    state.update({"in": state["in"] + 500, "cached": state["cached"] + 1000, "out": state["out"] + 30})
+    save()
+    say({"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": answer}})
+    say({"type": "turn.completed", "usage": {"input_tokens": state["in"] + state["cached"],  # the thread's totals
+                                             "cached_input_tokens": state["cached"], "output_tokens": state["out"]}})
+else:
+    say({"event": "init", "conversation_id": sid, "init": {"cwd": os.getcwd(), "permission_mode": "request-review"}})
+    if "@LIMIT" in new:  # retries used up: AGY_ERROR on stderr, exit 3
+        said = ("agent executor error: generating and executing: Error 429, Message: You have exhausted your capacity"
+                " on this model. Your quota will reset after 2h3m4s., Status: RESOURCE_EXHAUSTED, Details: []")
+        sys.stderr.write(f'error: {said}\nAGY_ERROR: {{"short_error": "Your quota will reset after 2h3m4s.", "status":'
+                         ' "RESOURCE_EXHAUSTED", "error_code": 429, "code_kind": "http", "retryable": true}\n')
+        say({"event": "result", "result": {"conversation_id": sid, "status": "ERROR", "response": "", "error": said,
+                                           "usage": {"input_tokens": 0, "output_tokens": 0}}})
+        sys.exit(3)
+    state.update({"in": state["in"] + 400, "cached": state["cached"] + 900, "out": state["out"] + 25})
+    usage = {"input_tokens": state["in"], "cache_read_tokens": state["cached"], "output_tokens": state["out"],
+             "thinking_tokens": 7}  # the conversation's running totals
+    say({"event": "step_update", "step_update": {"conversation_id": sid, "step_index": 1, "state": "ACTIVE",
+                                                 "step_type": "agent_response", "text_delta": "Work"}})
+    if "@DENIED" in new:  # no mcp(agon/*) rule: headless, agy can't ask, so it refuses the tool and ends the turn
+        save()
+        say({"event": "result", "result": {"conversation_id": sid, "status": "SUCCESS", "response": "", "usage": usage,
+                                           "num_turns": state["turns"],
+                                           "denied_actions": [{"action": "mcp", "target": "agon/board"}]}})
+        rest()
+        sys.exit(0)
+    if "@HANG" in new:
+        def stop(*_):
+            say({"event": "result", "result": {"conversation_id": sid, "status": "ERROR", "response": "", "error":
+                                               "interrupted", "usage": {"input_tokens": 0, "output_tokens": 0}}})
+            sys.exit(1)
+        signal.signal(signal.SIGINT, stop)
+        hang()
+    save()
+    say({"event": "result", "result": {"conversation_id": sid, "status": "SUCCESS", "response": answer + "\n",
+                                       "num_turns": state["turns"], "usage": usage}})
+    rest()
+''', encoding="utf-8")
+
+
+def wake_runs():  # what the fake apps autopilot started got, oldest first
+    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(WAKE_LOG.glob("*.json"))]
+
+
+@contextlib.contextmanager
+def settings(**changes):  # environment variables for a while (None: unset), as the human sets them
+    saved = {key: os.environ.get(key) for key in changes}
+    for key, value in changes.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+# The programs Agon starts (an app, the tests, git) never get the inbox of the Claude Code session its server runs in
+with settings(CLAUDE_CODE_MESSAGING_SOCKET="/tmp/x.sock", CLAUDE_CODE_MESSAGING_TOKEN="t", AGON_TEST_CMD="make"):
+    env = agon.environment(("AGON_",), AGON_ASKED_BY="claude")
+    assert not [k for k in env if k.startswith("CLAUDE_CODE_MESSAGING_")] and "AGON_TEST_CMD" not in env, env
+    assert env["AGON_ASKED_BY"] == "claude" and env["PATH"] == os.environ["PATH"]
+
+# Phase 5, triage: a message wakes the agent it is addressed to; one to all only the lead (AGON_WAKE_ON_BROADCAST: lead,
+# all or none); never its own message, nor an acknowledgment of under 40 characters (AGON_ACK_PATTERNS replaces them)
+rows = [(1, "human", "claude", "Fix the parser"), (2, "gpt", "claude", "ok"), (3, "gpt", "all", "Plan: the lexer first"),
+        (4, "claude", "all", "mine"), (5, "gemini", "gpt", "for gpt"), (6, "gpt", "claude", "Thanks!"),
+        (7, "human", "all", " STOP "), (8, "gpt", "claude", "STOP")]  # the human's STOP means stop: it wakes nobody
+assert agon.wakes("claude", rows, False) == [rows[0], rows[7]] and agon.wakes("claude", rows, True) == [
+    rows[0], rows[2], rows[7]]
+assert agon.wakes("gpt", rows, False) == [rows[4]]
+for text in ("ok", "OK!", "okay.", "thanks", "Thank you", "got it", "👍", "ack", "noted", " done. "):
+    assert agon.is_ack(text), text
+for text in ("ok, but the parser fails on empty lines", "done: task #3 is in review", "thanks" + "!" * 40, "okk"):
+    assert not agon.is_ack(text), text
+with settings(AGON_ACK_PATTERNS='["lgtm"]'):
+    assert agon.is_ack("LGTM") and not agon.is_ack("ok")
+with settings(AGON_ACK_PATTERNS="[1]"):
+    try:
+        agon.is_ack("ok")
+        raise AssertionError("a bad AGON_ACK_PATTERNS")
+    except ValueError as e:
+        assert str(e) == "AGON_ACK_PATTERNS must be a JSON list of regular expressions, or one expression", e
+assert agon.broadcast_mode() == "lead"
+for mode in ("all", "NONE", " lead "):
+    with settings(AGON_WAKE_ON_BROADCAST=mode):
+        assert agon.broadcast_mode() == mode.strip().lower()
+with settings(AGON_WAKE_ON_BROADCAST="everyone"):
+    try:
+        agon.broadcast_mode()
+        raise AssertionError("a bad AGON_WAKE_ON_BROADCAST")
+    except ValueError as e:
+        assert str(e) == "AGON_WAKE_ON_BROADCAST must be lead, all or none", e
+
+# Phase 5, the commands: each app runs headless for one turn, resuming the agent's own session by its id (never
+# --continue, which would take the human's latest session in the folder). The program comes from AGON_CMD_* without the
+# arguments ask adds (so the lines setup prints serve both), and the prompt goes on stdin: Claude Code and agy read a
+# stream-json line and keep their stdin open (Claude Code takes an interrupt there), Codex reads all of it
+python = shutil.which(sys.executable)
+fake = {name: json.dumps([sys.executable, str(FAKE_WAKE), app, *agon.COMMANDS[name][1:]]) for name, app in APPS.items()}
+with settings(**{f"AGON_CMD_{name.upper()}": command for name, command in fake.items()}):
+    for name, app in APPS.items():
+        assert agon.wake_program(name) == [sys.executable, str(FAKE_WAKE), app], name
+    argv, feed, keep = agon.wake_command("claude", "Hi 🙂", None, 1.5, "u-1")
+    assert argv == [python, str(FAKE_WAKE), "claude", "-p", "--input-format", "stream-json", "--output-format",
+                    "stream-json", "--verbose", "--permission-mode", "acceptEdits", "--permission-prompts", "none",
+                    "--allowedTools=mcp__agon,mcp__plugin_agon_agon", "--max-turns", "30", "--session-id", "u-1",
+                    "--max-budget-usd", "1.50"], argv
+    assert json.loads(feed) == {"type": "user", "message": {"role": "user", "content": "Hi 🙂"}} and feed.endswith(b"\n")
+    assert keep is True
+    with settings(AGON_CLAUDE_MODEL="opus", AGON_CLAUDE_EFFORT="high", AGON_CLAUDE_ARGS="--fallback-model sonnet",
+                  AGON_MAX_TURNS="5", AGON_UNSAFE="1"):
+        argv, _, _ = agon.wake_command("claude", "Hi", "s-1", None, "u-2")
+    assert argv[3:] == ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                        "--permission-mode", "bypassPermissions", "--model", "opus", "--effort", "high",
+                        "--allowedTools=mcp__agon,mcp__plugin_agon_agon", "--max-turns", "5", "--resume", "s-1",
+                        "--fallback-model", "sonnet"], argv
+    argv, feed, keep = agon.wake_command("gpt", "Hi 🙂", None, None, "u-3")
+    assert argv[3:] == ["exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", "-"], argv
+    assert (feed, keep) == ("Hi 🙂".encode(), False)
+    with settings(AGON_GPT_MODEL="gpt-6-sol", AGON_GPT_EFFORT="low", AGON_GPT_ARGS='["--disable", "plugins"]'):
+        argv, _, _ = agon.wake_command("gpt", "Hi", "t-1", None, "u-4")
+    assert argv[3:] == ["exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", "-m", "gpt-6-sol", "-c",
+                        "model_reasoning_effort=low", "--disable", "plugins", "resume", "t-1", "-"], argv  # flags first
+    with settings(AGON_UNSAFE="yes"):
+        assert agon.wake_command("gpt", "Hi", None, None, "")[0][6] == "--dangerously-bypass-approvals-and-sandbox"
+    argv, feed, keep = agon.wake_command("gemini", "Hi 🙂", None, 2.0, "u-5")  # no budget: only Claude Code estimates
+    assert argv[3:] == ["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
+                        "--mode", "accept-edits"], argv  # no -p: it would take --input-format as its prompt
+    assert json.loads(feed) == {"event": "user", "message": {"content": "Hi 🙂"}} and keep is True
+    with settings(AGON_GEMINI_MODEL="gemini-3.8-flash-low", AGON_UNSAFE="1"):
+        argv, _, _ = agon.wake_command("gemini", "Hi", "c-1", None, "u-6")
+    assert argv[8:] == ["--mode", "accept-edits", "--dangerously-skip-permissions", "--model", "gemini-3.8-flash-low",
+                        "--conversation", "c-1"], argv
+for raw, program in (('["node", "/x/cli.js", "-p", "--output-format", "json"]', ["node", "/x/cli.js"]),
+                     ("claude --model opus", ["claude"]), (None, ["claude"])):  # other arguments: only the program
+    with settings(AGON_CMD_CLAUDE=raw):
+        assert agon.wake_program("claude") == program, raw
+with settings(AGON_CMD_GPT='["no-such-codex-7"]'):
+    try:
+        agon.wake_command("gpt", "Hi", None, None, "")
+        raise AssertionError("a missing app")
+    except agon.ToolError as e:  # where Agon looked: PATH, and on Windows the endings in PATHEXT
+        assert str(e) == (f"Can't wake gpt: {agon.missing('no-such-codex-7')}. Install it, or set AGON_CMD_GPT to its"
+                          " full command (`python agon.py setup` prints it)."), e
+
+# Phase 5, what came of a turn, as each app prints it (the shapes seen against mocks of their APIs). Claude Code: the
+# session, the answer, the session's cost and tokens so far per model, its subagents' too (restored on resume since
+# 2.1.277), the turn's own tokens (its main loop only), the context of the last call; a plan's limit comes as a rejected
+# rate_limit_event with its reset time
+init = {"type": "system", "subtype": "init", "session_id": "s1"}
+calls = [{"type": "assistant", "message": {"usage": {"input_tokens": 3, "cache_read_input_tokens": 20000,
+                                                     "cache_creation_input_tokens": 500, "output_tokens": 40}}},
+         {"type": "assistant", "message": {"usage": {"input_tokens": 5, "cache_read_input_tokens": 20500,
+                                                     "cache_creation_input_tokens": 300, "output_tokens": 60}}}]
+result = {"type": "result", "subtype": "success", "is_error": False, "result": "Done.", "session_id": "s1",
+          "usage": {"input_tokens": 8, "cache_creation_input_tokens": 800, "cache_read_input_tokens": 40500,
+                    "output_tokens": 100}, "total_cost_usd": 0.1234, "num_turns": 2, "permission_denials": [],
+          "modelUsage": {"model-a": {"inputTokens": 1008, "outputTokens": 900, "cacheReadInputTokens": 90500,
+                                     "cacheCreationInputTokens": 1800, "costUSD": 0.1134},
+                         "model-b": {"inputTokens": 40, "outputTokens": 25, "cacheReadInputTokens": 3000,
+                                     "cacheCreationInputTokens": 0, "costUSD": 0.01}}}
+assert agon.outcome("claude", 0, [init, *calls, result], "") == {
+    "session": "s1", "answer": "Done.", "ok": True, "heard": True, "error": None, "limit": None, "usd": 0.1234,
+    "totals": (2848, 93500, 925), "turn": (808, 40500, 100), "context": 20805, "calls": 2, "denied": False,
+    "restores": True, "overage": None}
+assert agon.outcome("claude", 0, [init, *calls, result | {"modelUsage": {}}], "")["totals"] is None
+rejected = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 1790380800000}}
+got = agon.outcome("claude", 1, [init, rejected, result | {"is_error": True, "usage": {}, "result":
+                                                           "You've hit your limit · resets 3pm (Europe/Berlin)"}], "")
+assert not got["ok"] and not got["heard"] and got["error"] == "You've hit your limit · resets 3pm (Europe/Berlin)", got
+assert agon.reset_time(got["limit"], 1790366400) == 1790380800, got["limit"]  # the event's time wins (ms, or s)
+# Past the plan's limit, a turn goes on at the human's extra usage, which is paid: the event says so (seen at runtime)
+extra = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 1790380800,
+                                                         "rateLimitType": "five_hour", "isUsingOverage": True}}
+got = agon.outcome("claude", 0, [init, extra, *calls, result], "")
+assert got["ok"] and got["limit"] is None and got["overage"] == "usage limit reached|1790380800", got
+extra["rate_limit_info"] |= {"status": "allowed", "isUsingOverage": False}
+assert agon.outcome("claude", 0, [init, extra, *calls, result], "")["overage"] is None
+got = agon.outcome("claude", 0, [init, *calls, result | {"permission_denials": [{"tool_name": "mcp__team__board"}]}], "")
+assert got["ok"] and got["denied"], got  # Agon's server under a name --allowedTools doesn't cover
+assert agon.outcome("claude", 1, [], "No conversation found with session ID: s9\n")["error"] == (
+    "No conversation found with session ID: s9")
+for version, restores in (("2.1.277", True), ("2.1.282", True), ("2.2.0", True), ("2.1.276", False), ("1.0.9", False),
+                          (None, True), ("next", True)):  # before 2.1.277, a resumed session's cost starts at zero
+    assert agon.outcome("claude", 0, [init | {"claude_code_version": version}], "")["restores"] is restores, version
+# Codex: the thread, the last agent message; its usage is the thread's running total, across processes
+thread = [{"type": "thread.started", "thread_id": "t1"}, {"type": "turn.started"},
+          {"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "Hmm."}},
+          {"type": "error", "message": "Reconnecting... 1/5"}]  # a retry: the turn goes on
+done = [{"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "ls"}},
+        {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "Done."}},
+        {"type": "turn.completed", "usage": {"input_tokens": 15055, "cached_input_tokens": 12000, "output_tokens": 300,
+                                             "reasoning_output_tokens": 100}}]
+assert agon.outcome("gpt", 0, thread + done, "") == {
+    "session": "t1", "answer": "Done.", "ok": True, "heard": True, "error": None, "limit": None, "usd": None,
+    "totals": (3055, 12000, 300), "turn": None, "context": None, "calls": 2, "denied": False,
+    "restores": True, "overage": None}
+limit_text = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 9:39 PM."
+got = agon.outcome("gpt", 1, [*thread, {"type": "error", "message": limit_text}, {"type": "turn.failed", "error": {
+    "message": limit_text}}], "")
+assert (got["ok"], got["heard"], got["error"]) == (False, False, limit_text) and limit_text in got["limit"], got
+# agy: the conversation, the response; usage is the conversation's running total. It keeps status ERROR after an error it
+# recovered from, so an answer with exit code 0 is a success; a failure prints AGY_ERROR and exits 3
+steps = [{"event": "init", "conversation_id": "c1"},
+         {"event": "step_update", "step_update": {"step_type": "user_input", "state": "DONE"}},
+         {"event": "step_update", "step_update": {"step_type": "tool", "state": "DONE"}},
+         {"event": "step_update", "step_update": {"step_type": "agent_response", "state": "DONE"}}]
+answer = {"event": "result", "result": {"conversation_id": "c1", "status": "SUCCESS", "response": "Done.\n",
+                                        "num_turns": 3, "usage": {"input_tokens": 1500, "output_tokens": 123,
+                                                                  "thinking_tokens": 24, "cache_read_tokens": 1509}}}
+assert agon.outcome("gemini", 0, steps + [answer], "") == {
+    "session": "c1", "answer": "Done.\n", "ok": True, "heard": True, "error": None, "limit": None, "usd": None,
+    "totals": (1500, 1509, 123), "turn": None, "context": None, "calls": 2, "denied": False,
+    "restores": True, "overage": None}
+answer["result"]["status"] = "ERROR"
+assert agon.outcome("gemini", 0, steps + [answer], "")["ok"]
+quota = ("error: agent executor error: Error 429, Message: You have exhausted your capacity on this model. Your quota"
+         " will reset after 2h3m4s., Status: RESOURCE_EXHAUSTED\nAGY_ERROR: {\"status\": \"RESOURCE_EXHAUSTED\"}\n")
+got = agon.outcome("gemini", 3, steps[:1] + [{"event": "result", "result": {"conversation_id": "c1", "status": "ERROR",
+                                                                             "response": "", "error": "429"}}], quota)
+assert not got["ok"] and not got["heard"] and "Your quota will reset after 2h3m4s." in got["limit"], got
+got = agon.outcome("gemini", 0, steps[:1] + [{"event": "result", "result": {
+    "conversation_id": "c1", "status": "SUCCESS", "response": "", "denied_actions": [{"action": "mcp"}]}}], "")
+assert got["denied"] and got["answer"] is None, got
+day = agon.midnight(time.time())
+assert datetime.datetime.fromtimestamp(day).time() == datetime.time(0) and day <= time.time() < agon.midnight(day, 1)
+# Found by CI: every MCP server now has a watch thread, and one that napped 1 s kept its closing app waiting that long.
+# Its naps end as soon as the app is gone
+t0 = time.monotonic()
+agon.nap(5, lambda: True)
+assert time.monotonic() - t0 < 0.5
+t0 = time.monotonic()
+agon.nap(0.3, lambda: False)
+assert 0.25 <= time.monotonic() - t0 < 2
+
+# Phase 5, a turn that runs too long, or that STOP ends: Claude Code gets an interrupt on stdin and gives its result;
+# Codex and agy get SIGINT (Windows: Agon ends them at once). GRACE seconds later, or at once, the whole tree goes
+for name, app in APPS.items():
+    BEAT.unlink(missing_ok=True)
+    t0 = time.monotonic()
+    with settings(AGON_CMD_CLAUDE=fake["claude"], AGON_CMD_GPT=fake["gpt"], AGON_CMD_GEMINI=fake["gemini"],
+                  FAKE_AGON=str(HERE), FAKE_STATE=str(WAKE_STATE), FAKE_WAKE_LOG=str(WAKE_LOG), FAKE_BEAT=str(BEAT)):
+        argv, feed, keep = agon.wake_command(name, "New messages from your Agon team:\n@HANG", None, None,
+                                             "00000000-0000-4000-8000-00000000000" + str(len(name)))
+        code, events, err, reason = agon.drive(argv, feed, keep, str(project), dict(os.environ), time.monotonic() + 4,
+                                               lambda: None, lambda event: agon.last_event(name, event),
+                                               lambda p: agon.interrupt_turn(name, p))
+    got = agon.outcome(name, code, events, err)
+    assert reason == "timeout" and not got["ok"] and got["heard"] and time.monotonic() - t0 < 25, (name, code, events,
+                                                                                                    err)
+    if name == "claude":  # it ended the turn itself, and went when its stdin closed
+        assert code == 0 and events[-1]["subtype"] == "error_during_execution", events
+    if name != "claude":
+        assert not beating(), name  # the child it started went too
+
+# Phase 5, the supervisor, in this process on a team of its own: it sees the messages, waits the debounce, and wakes each
+# agent with all that waits for it, in a thread of its own; the fake apps send messages through agon.db as the agents
+for path in WAKE_LOG.glob("*.json"):
+    path.unlink()
+agon.close_db()
+agon.DB, test_db = str(Path(TMP, "pilot.db")), agon.DB
+pilot_env = {"AGON_DB": agon.DB, "FAKE_AGON": str(HERE), "FAKE_STATE": str(WAKE_STATE), "FAKE_WAKE_LOG": str(WAKE_LOG),
+             "FAKE_BEAT": str(BEAT), "AGON_GEMINI_PLAN": "1", "AGON_DEBOUNCE_SECONDS": "0.3",
+             **{f"AGON_CMD_{name.upper()}": command for name, command in fake.items()}}
+saved_env = {key: os.environ.get(key) for key in pilot_env}
+os.environ.update(pilot_env)
+told = []
+pilot = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+
+
+def settle(p, seconds=60):  # the apps autopilot runs have ended their turns
+    end = time.monotonic() + seconds
+    for thread in list(p.running.values()):
+        thread.join(max(0.1, end - time.monotonic()))
+    assert not p.running, p.running
+
+
+def step(p=None):  # autopilot's loop when messages come: it sees them, waits the debounce, wakes; the new runs' apps
+    p = p or pilot
+    before = len(wake_runs())
+    p.tick(time.time())
+    time.sleep(p.debounce + 0.05)
+    p.tick(time.time())
+    settle(p)
+    return [run["app"] for run in wake_runs()[before:]]
+
+
+def last_run(agent):  # autopilot's record of agent's last run
+    cur = agon.db().execute("SELECT * FROM runs WHERE agent = ? ORDER BY id DESC LIMIT 1", (agent,))
+    return dict(zip([column[0] for column in cur.description], cur.fetchone()))
+
+
+def heard(n=1):  # what autopilot told the human last
+    return [t for (t,) in agon.db().execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human' ORDER BY id"
+                                            " DESC LIMIT ?", (n,))][::-1]
+
+
+agon.post("human", "claude", "Plan the parser. @SEND gpt:Build the lexer.|")
+pilot.tick(time.time())
+assert set(pilot.due) == {"claude"} and not pilot.running and wake_runs() == []  # it waits the debounce first
+assert step() == ["claude"]
+run = wake_runs()[-1]
+sid = run["session"]
+assert run["autopilot"] == "1" and Path(run["cwd"]).resolve() == project.resolve() and run["args"][
+    run["args"].index("--session-id") + 1] == sid and "--resume" not in run["args"], run
+first = agon.db().execute("SELECT id FROM msgs WHERE text LIKE 'Plan the parser.%'").fetchone()[0]
+assert run["prompt"].startswith('Agon\'s autopilot woke you ("claude") because messages came for you. Do what they ask'
+                                " of you, then end your turn;\nsend a short report to whoever needs one.\nAgon started"
+                                ' this session anew for you: you are "claude" in Agon'), run["prompt"]
+assert f"\nNew messages from your Agon team:\n#{first} human -> claude: Plan the parser. @SEND gpt:Build the lexer.|\n" \
+       "Team rules: claim a board task before you edit its files" in run["prompt"], run["prompt"]
+assert "The board is empty." in run["prompt"] and agon.cursor_of("claude") == first
+p = pilot.pilot("claude")
+assert (p["session"], p["turns"], p["context"], p["usd"], p["failures"]) == (sid, 1, 1150, 0.05, 0), p
+r = last_run("claude")
+assert (r["trigger"], r["session"], r["status"], r["tokens_in"], r["tokens_cached"], r["tokens_out"], r["usd"]) == (
+    f"#{first} human -> claude", sid, "done", 180, 1200, 30, 0.05), r  # its subagent's tokens too (modelUsage)
+assert told[-1] == "claude: done (180 in / 1,200 cached / 30 out tokens, ~$0.05)", told
+assert step() == ["codex"]  # claude's message wakes gpt, in a Codex thread of its own
+run = wake_runs()[-1]
+thread_id = run["session"]
+assert run["args"][:6] == ["exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", "-"], run["args"]
+assert "#%d claude -> gpt: Build the lexer." % agon.cursor_of("gpt") in run["prompt"], run["prompt"]
+assert (pilot.pilot("gpt")["session"], last_run("gpt")["tokens_in"], last_run("gpt")["tokens_cached"]) == (
+    thread_id, 500, 1000)
+# The next wake resumes the session: no recap, and the run's share of the running totals
+agon.post("human", "claude", "Now the tests.")
+agon.post("human", "gpt", "And the docs.")
+woke = step()  # both at once
+assert sorted(woke) == ["claude", "codex"], (woke, told[-6:])
+runs = {run["app"]: run for run in wake_runs()[-2:]}
+assert runs["claude"]["args"][runs["claude"]["args"].index("--resume") + 1] == sid, runs["claude"]["args"]
+assert "--session-id" not in runs["claude"]["args"] and "anew" not in runs["claude"]["prompt"]
+assert runs["codex"]["args"][-3:] == ["resume", thread_id, "-"] and runs["codex"]["session"] == thread_id
+assert (last_run("claude")["usd"], pilot.pilot("claude")["usd"], pilot.pilot("claude")["turns"]) == (0.05, 0.1, 2)
+assert (last_run("claude")["tokens_in"], pilot.pilot("claude")["tokens_in"]) == (180, 360)
+r = last_run("gpt")
+assert (r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == (500, 1000, 30), r  # not the thread's 1,000 / 2,000
+assert (pilot.pilot("gpt")["tokens_in"], pilot.pilot("gpt")["tokens_cached"]) == (1000, 2000)
+# Acknowledgments wake nobody; a message to all wakes only the lead, and comes along when the others wake
+agon.post("gpt", "claude", "Thanks!")
+pilot.tick(time.time())
+assert not pilot.due
+agon.post("gemini", "all", "I'll write the docs.")
+assert step() == ["claude"] and "#%d gpt -> claude: Thanks!\n" % (agon.newest_id() - 1) in wake_runs()[-1]["prompt"]
+with settings(AGON_WAKE_ON_BROADCAST="none"):
+    agon.post("human", "all", "Lunch break soon.")
+    assert step() == []
+with settings(AGON_WAKE_ON_BROADCAST="all"):  # now it wakes everyone else, the one who wrote it aside
+    woke = step()
+    assert sorted(woke) == ["agy", "claude", "codex"], (woke, told[-9:])
+assert "I'll write the docs." in next(run for run in wake_runs()[-3:] if run["app"] == "codex")["prompt"]
+# Three messages within the debounce: one wake with all three
+for i in range(3):
+    agon.post("human", "gpt", f"Point {i}.")
+assert step() == ["codex"] and all(f"Point {i}." in wake_runs()[-1]["prompt"] for i in range(3))
+assert last_run("gpt")["trigger"] == f"#{agon.newest_id() - 2} human -> gpt and 2 more"
+# A session starts anew after AGON_ROTATE_TURNS turns, with the recap: the last messages, the board, its last report
+agon.db().execute("UPDATE pilot SET turns = 30 WHERE agent = 'claude'")
+agon.post("claude", "human", "Report: the parser plan is in PLAN.md.")
+agon.post("human", "claude", "Go on with the parser.")
+assert step() == ["claude"]
+run = wake_runs()[-1]
+new_sid = run["args"][run["args"].index("--session-id") + 1]
+assert new_sid != sid and run["session"] == new_sid and "Agon started this session anew" in run["prompt"]
+assert "Recap of the messages before this session (already read):\n" in run["prompt"] and (
+    "Your last report:\n    Report: the parser plan is in PLAN.md." in run["prompt"]), run["prompt"]
+assert last_run("claude")["note"] == "new session: 30 turns (AGON_ROTATE_TURNS)", last_run("claude")
+assert (pilot.pilot("claude")["session"], pilot.pilot("claude")["turns"]) == (new_sid, 1)
+# With AGON_HANDOFF_NOTE=1, the old session first writes a hand-off (one more turn), which the new one reads
+agon.db().execute("UPDATE pilot SET context = 130000 WHERE agent = 'claude'")
+agon.post("human", "claude", "Wrap up the parser.")
+with settings(AGON_HANDOFF_NOTE="1"):
+    assert step() == ["claude", "claude"]
+off, on = wake_runs()[-2:]
+assert off["args"][off["args"].index("--resume") + 1] == new_sid and off["prompt"] == agon.HANDOFF, off
+assert "Your hand-off note from your last session:\n    Handed off: the lexer is half done.\n" in on["prompt"], on
+assert "--session-id" in on["args"] and last_run("claude")["note"] == (
+    "new session: a context of 130,000 tokens (AGON_ROTATE_TOKENS)"), last_run("claude")
+# A session its app lost (deleted, or archived) starts anew at the next wake; the messages wait for it
+agon.db().execute("UPDATE pilot SET session = '00000000-dead-4000-8000-000000000000' WHERE agent = 'gpt'")
+agon.post("human", "gpt", "Check the lexer.")
+assert step() == ["codex"] and last_run("gpt")["status"] == "failed" and pilot.pilot("gpt")["session"] is None
+assert "no rollout found for thread id" in last_run("gpt")["note"] and pilot.pilot("gpt")["failures"] == 0
+assert step() == ["codex"] and "Check the lexer." in wake_runs()[-1]["prompt"] and "anew" in wake_runs()[-1]["prompt"]
+assert last_run("gpt")["status"] == "done" and pilot.pilot("gpt")["session"] == wake_runs()[-1]["session"]
+# STOP interrupts a running turn at once; the next human message resumes the team, and the lead hears both
+agon.post("human", "claude", "@HANG on this.")
+pilot.tick(time.time())
+time.sleep(pilot.debounce + 0.05)
+pilot.tick(time.time())
+until(lambda: "@HANG on this." in (wake_runs()[-1:] or [{}])[0].get("prompt", ""))
+t0 = time.monotonic()
+agon.post("human", "all", "STOP")
+settle(pilot)
+assert last_run("claude")["status"] == "stopped" and time.monotonic() - t0 < 5, last_run("claude")
+assert pilot.stopped() == "the human paused the team" and pilot.tick(time.time()) == agon.LIVE / 5 and not pilot.due
+agon.post("human", "all", "Go on.")
+assert step() == ["claude"] and "human -> all: STOP\n" in wake_runs()[-1]["prompt"] and (
+    "human -> all: Go on.\n" in wake_runs()[-1]["prompt"])
+# An app that fails rests a minute, twice as long after each failure in a row; the human hears it
+agon.post("human", "gpt", "@CRASH now.")
+now = time.time()
+assert step() == ["codex"] and last_run("gpt")["status"] == "failed"
+p = pilot.pilot("gpt")
+assert p["failures"] == 1 and now + 55 < p["parked"] < now + 70 and p["why"] == "its app failed (boom: the fake crashed)"
+assert heard() == [f"Autopilot lets gpt rest until ~{agon.reset_clock(p['parked'], now)}: its app failed (boom: the fake"
+                   " crashed)."], heard()
+assert step() == [] and pilot.resting("gpt", time.time())[0] == "its app failed (boom: the fake crashed)"
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'gpt'")
+assert step() == ["codex"] and pilot.pilot("gpt")["failures"] == 2 and pilot.pilot("gpt")["parked"] > time.time() + 110
+agon.advance("gpt", agon.newest_id())
+agon.db().execute("UPDATE pilot SET parked = NULL, failures = 0 WHERE agent = 'gpt'")
+# A usage limit: out of quota until it resets, its tasks back on the board, and the lead hears it at once
+team = {name: agon.Session(name, None) for name in ("claude", "gpt")}
+
+
+def board(name, **args):  # agent `name` calls board, as its app would
+    agon.touch(name)
+    res, _ = agon.call_tool(team[name], {"name": "board", "arguments": args})
+    return res["content"][0]["text"]
+
+
+board("claude", action="add", title="Lexer", spec="Tokens.", files=["lexer.py"])
+board("gpt", action="claim", id=1)
+agon.post("human", "gpt", "Finish the lexer. @LIMIT")
+assert step() == ["codex"] and last_run("gpt")["status"] == "limit" and agon.quota_until("gpt")
+assert agon.board_task(1)["state"] == "todo" and "reassigned: gpt hit its usage limit, resets ~" in agon.board_task(1)[
+    "note"]
+assert step() == ["claude"] and "Task #1 Lexer is free again: gpt hit its usage limit" in wake_runs()[-1]["prompt"]
+agon.post("human", "gpt", "Still there?")
+assert step() == [] and pilot.resting("gpt", time.time())[0].startswith("out of quota until ~")
+agon.db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = 'gpt'")
+agon.advance("gpt", agon.newest_id())
+# Claude Code's limit: its rejected rate_limit_event says when it resets
+agon.post("human", "claude", "One more thing. @LIMIT")
+assert step() == ["claude"] and last_run("claude")["status"] == "limit"
+assert abs(agon.quota_until("claude") - time.time() - 7200) < 60, agon.quota_until("claude")
+agon.db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = 'claude'")
+agon.advance("claude", agon.newest_id())
+# The brakes: wakes in the last hour, and since local midnight Claude Code's cost estimate and the tokens; the agent
+# rests and the human hears why. A wake of Claude Code gets what is left of the day's budget as --max-budget-usd
+with settings(AGON_MAX_WAKES_PER_HOUR="3"):
+    braked = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+    agon.post("human", "claude", "Anything else?")
+    assert step(braked) == [] and pilot.pilot("claude")["why"].endswith("times in the last hour"
+                                                                        " (AGON_MAX_WAKES_PER_HOUR)")
+    assert heard()[0].startswith("Autopilot lets claude rest until ~") and heard()[0].endswith(
+        " times in the last hour (AGON_MAX_WAKES_PER_HOUR)."), heard()
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'claude'")
+spent = agon.db().execute("SELECT SUM(usd) FROM runs WHERE agent = 'claude'").fetchone()[0]
+with settings(AGON_DAILY_USD="5", AGON_MAX_WAKES_PER_HOUR="100"):
+    braked = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+    assert step(braked) == ["claude"]
+    run = wake_runs()[-1]
+    assert run["args"][run["args"].index("--max-budget-usd") + 1] == f"{5 - spent:.2f}", (run["args"], spent)
+with settings(AGON_DAILY_USD="0.1", AGON_MAX_WAKES_PER_HOUR="100"):
+    braked = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+    agon.post("human", "claude", "And now?")
+    assert step(braked) == [] and pilot.pilot("claude")["parked"] == agon.midnight(time.time(), 1)
+    assert heard()[0].endswith(f": it spent ~${spent + 0.05:.2f} today by Claude Code's estimate"
+                               " (AGON_DAILY_USD)."), heard()
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'claude'")
+agon.advance("claude", agon.newest_id())
+with settings(AGON_DAILY_TOKENS="1000", AGON_MAX_WAKES_PER_HOUR="100"):
+    braked = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+    agon.post("human", "gpt", "Tokens?")
+    assert step(braked) == [] and heard()[0].endswith("tokens today (AGON_DAILY_TOKENS)."), heard()
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'gpt'")
+agon.advance("gpt", agon.newest_id())
+# At most AGON_MAX_WORKERS apps at once: the others wait for one to end
+with settings(AGON_MAX_WORKERS="1", AGON_MAX_WAKES_PER_HOUR="100"):
+    narrow = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+    agon.post("human", "claude", "@SLOW please.")
+    agon.post("human", "gpt", "Quick one.")
+    narrow.tick(time.time())
+    time.sleep(narrow.debounce + 0.05)
+    narrow.tick(time.time())
+    assert list(narrow.running) == ["claude"] and set(narrow.due) == {"gpt"}, (narrow.running, narrow.due)
+    settle(narrow)
+    assert step(narrow) == ["codex"]
+# gemini: agy on the Google login is barred (autopilot says so once); in its API-key mode it wakes, and resumes its
+# conversation by its id. Headless, agy refuses Agon's tools without an mcp(agon/*) rule: the human hears how to add one
+with settings(AGON_GEMINI_PLAN=None, **home_vars):
+    agon.post("human", "gemini", "Write the docs.")
+    assert step() == [] and step() == [] and heard()[0] == f"Autopilot won't wake gemini. {why}.", heard()
+    assert sum(t.startswith("Autopilot won't wake gemini.") for t in told) == 1, told
+    gem_settings = gem_home.joinpath(*agon.GEMINI_SETTINGS)
+    gem_settings.write_text('{"modelProvider": "gemini"}', encoding="utf-8")
+    assert step() == ["agy"] and "Write the docs." in wake_runs()[-1]["prompt"]
+    conversation = wake_runs()[-1]["session"]
+    assert wake_runs()[-1]["args"][:7] == ["--input-format", "stream-json", "--output-format", "stream-json",
+                                           "--disable-slash-commands", "--mode", "accept-edits"]
+    agon.post("human", "gemini", "@DENIED Add a board task.")
+    assert step() == ["agy"] and wake_runs()[-1]["args"][-2:] == ["--conversation", conversation]
+    r = last_run("gemini")
+    assert (r["status"], r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == ("done", 400, 900, 25), r
+    assert heard()[0] == ("gemini couldn't use Agon's tools: headless, agy refuses an MCP tool it would ask about. Add"
+                          ' "permissions": {"allow": ["mcp(agon/*)"]} to ' + str(gem_settings) + " (python agon.py"
+                          " setup shows it)."), heard()
+    gem_settings.unlink()
+# From here on, the hourly brake has room: the runs above count toward it
+with settings(AGON_MAX_WAKES_PER_HOUR="1000"):
+    pilot = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+# Found by the research: a crashed Claude Code turn may report its totals zeroed (its docs). The run counts nothing, and
+# the next one only what it added, not the session's whole spend
+before = pilot.pilot("claude")
+agon.post("human", "claude", "@ZERO this.")
+assert step() == ["claude"] and last_run("claude")["status"] == "failed", last_run("claude")
+r, p = last_run("claude"), pilot.pilot("claude")
+assert (r["usd"], r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == (0, 0, 0, 0), r
+assert (p["session"], p["usd"], p["tokens_in"]) == (before["session"], before["usd"], before["tokens_in"]), (before, p)
+agon.db().execute("UPDATE pilot SET parked = NULL, failures = 0 WHERE agent = 'claude'")
+agon.post("human", "claude", "Again.")
+assert step() == ["claude"]
+r = last_run("claude")
+assert r["status"] == "done" and abs(r["usd"] - 0.05) < 1e-9 and (r["tokens_in"], r["tokens_cached"],
+                                                                   r["tokens_out"]) == (180, 1200, 30), r
+# Found by the research: past its plan's limit, Claude Code goes on at the human's extra usage, which is paid. Autopilot
+# runs on the plan: claude rests until the limit resets (AGON_EXTRA_USAGE=1 lets it go on)
+agon.post("human", "claude", "@EXTRA Go on.")
+now = time.time()
+assert step() == ["claude"] and last_run("claude")["status"] == "done"
+p = pilot.pilot("claude")
+assert abs(p["parked"] - now - 3600) < 60 and p["why"] == (
+    "its plan's usage limit is used up, and Claude Code now bills its turns to your extra usage (AGON_EXTRA_USAGE=1"
+    " lets it go on)"), p
+assert heard()[0] == f"Autopilot lets claude rest until ~{agon.reset_clock(p['parked'], now)}: {p['why']}.", heard()
+agon.post("human", "claude", "Still there?")
+assert step() == [] and pilot.resting("claude", time.time())[0] == p["why"]
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'claude'")
+with settings(AGON_EXTRA_USAGE="1"):
+    agon.post("human", "claude", "@EXTRA Then go on.")
+    assert step() == ["claude"] and "Still there?" in wake_runs()[-1]["prompt"] and not pilot.pilot("claude")["parked"]
+# An app the human has open for an agent: autopilot runs no second session of the agent beside it. Codex and agy get
+# their messages from their Stop hooks, and the human hears so once; when the app closes, autopilot runs the agent again
+codex_app = Agent("gpt", client="codex-mcp-client")
+until(lambda: agon.apps("gpt", time.time()))
+agon.post("human", "gpt", "Are you there?")
+assert step() == [] and step() == [] and heard()[0] == (
+    "gpt's app is open, so autopilot leaves gpt to it: its Stop hook hands gpt its messages when a turn ends. Close the"
+    " app to let autopilot run gpt headless."), heard()
+codex_app.close()
+assert agon.apps("gpt", time.time()) == [] and step() == ["codex"] and "Are you there?" in wake_runs()[-1]["prompt"]
+
+
+# An idle Claude Code session the human has open takes its messages from its inbox socket (Claude Code 2.1.224+): the
+# session's own MCP server posts them, since Claude Code gives its MCP servers and hooks the socket's path and a token,
+# with the auth line first and priority next. Its UserPromptSubmit hook knows the wake: only then does the cursor move,
+# and a wake whose messages the Stop hook handed over meanwhile is dropped. A working session gets no wake
+def inbox_server():  # a stand-in for a Claude Code session's inbox: what each connection sent
+    posted = []
+    if os.name == "nt":  # a named pipe, as Claude Code's on Windows
+        import _winapi
+        path = rf"\\.\pipe\agon-test-{os.getpid()}"
+
+        def serve():
+            while True:
+                pipe = _winapi.CreateNamedPipe(path, _winapi.PIPE_ACCESS_INBOUND, _winapi.PIPE_WAIT, 255, 65536, 65536,
+                                               0, _winapi.NULL)
+                try:
+                    _winapi.ConnectNamedPipe(pipe, False)
+                except OSError as e:
+                    if e.winerror != 535:  # ERROR_PIPE_CONNECTED: the client came first
+                        raise
+                data = b""
+                while True:
+                    try:
+                        data += _winapi.ReadFile(pipe, 65536, False)[0]
+                    except OSError:  # the client closed its end
+                        break
+                _winapi.CloseHandle(pipe)
+                posted.append(data)
+    else:
+        path = str(Path(TMP, "inbox.sock"))
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(path)
+        server.listen()
+
+        def serve():
+            while True:
+                conn, _ = server.accept()
+                with conn:
+                    data = b""
+                    while chunk := conn.recv(65536):
+                        data += chunk
+                posted.append(data)
+    threading.Thread(target=serve, daemon=True).start()
+    return path, posted
+
+
+inbox_path, posted = inbox_server()
+session_app = Agent("claude", client="claude-code", env=dict(
+    os.environ, CLAUDE_CODE_MESSAGING_SOCKET=inbox_path, CLAUDE_CODE_MESSAGING_TOKEN="a-token-for-the-test"))
+until(lambda: agon.apps("claude", time.time()))
+assert [row[1:] for row in agon.apps("claude", time.time())] == [(inbox_path, 0, 0)]
+agon.post("human", "claude", "Check the build, please.")
+newest = agon.newest_id()
+assert step() == [] and last_run("claude")["status"] == "pushed" and told[-1] == (
+    f"asked claude's open Claude Code session to take its messages (#{newest} human -> claude)"), told[-1]
+until(lambda: posted)
+auth, wake = [json.loads(row) for row in posted[0].decode().splitlines()]
+assert auth == {"type": "auth", "token": "a-token-for-the-test"} and wake["priority"] == "next", posted
+assert wake["type"] == "user" and wake["message"]["role"] == "user", wake
+pushed = wake["message"]["content"]
+assert pushed.startswith(agon.WAKE_HEAD + ' ("claude")') and f"\n#{newest} human -> claude: Check the build, please.\n" \
+       in pushed and "anew" not in pushed, pushed
+assert agon.cursor_of("claude") < newest and step() == [] and len(posted) == 1  # asked once, until it comes
+with settings(CLAUDE_CODE_MESSAGING_SOCKET=inbox_path):  # the session's hooks
+    assert hook("claude", {"hook_event_name": "UserPromptSubmit", "prompt": pushed}) == (None, b"")
+    assert agon.cursor_of("claude") == newest and agon.apps("claude", time.time())[0][2] > 0  # read, and working
+    assert hook("claude", {"hook_event_name": "UserPromptSubmit", "prompt": pushed})[0] == {
+        "decision": "block", "reason": "Agon: the messages in this wake reached you already, so it is dropped."}
+    assert agon.apps("claude", time.time())[0][2] == 0
+    forged = f"{agon.WAKE_HEAD}\n#{newest + 50} human -> claude: never sent\n#1 gpt -> claude: {agon.newest_id()}"
+    assert hook("claude", {"hook_event_name": "UserPromptSubmit", "prompt": forged}) == (None, b"")
+    assert agon.cursor_of("claude") == newest  # only messages to claude that agon.db has, as the prompt shows them
+    hook("claude", {"hook_event_name": "UserPromptSubmit", "prompt": "Refactor the menu."})  # the human types
+    agon.post("human", "claude", "Also the menu.")
+    assert step() == [] and len(posted) == 1  # a working session: its Stop hook hands the message over
+    decision, _ = hook("claude", {"hook_event_name": "Stop"})
+    assert "Also the menu." in decision["reason"] and agon.apps("claude", time.time())[0][2] > 0  # it goes on
+    assert hook("claude", {"hook_event_name": "Stop"}) == (None, b"") and agon.apps("claude", time.time())[0][2] == 0
+agon.post("human", "claude", "Last one.")  # idle again: a new wake
+assert step() == []
+until(lambda: len(posted) == 2)
+assert "Last one." in json.loads(posted[1].decode().splitlines()[1])["message"]["content"]
+session_app.close()
+assert agon.apps("claude", time.time()) == []
+agon.advance("claude", agon.newest_id())
+
+# Phase 5: every wake is in `runs`, and `python agon.py stats` sums them up: per agent, and per completed task (the wakes
+# of its owner while it had the task)
+board("claude", action="claim", id=1)
+agon.post("human", "claude", "Finish the lexer.")
+assert step() == ["claude"] and last_run("claude")["task"] == 1
+board("claude", action="done", id=1, note="Lexer done.")
+board("gpt", action="review", id=1, verdict="approve", evidence="Read lexer.py.")
+for name in ("claude", "gpt", "gemini"):
+    agon.advance(name, agon.newest_id())
+out = io.StringIO()
+agon.stats(out)
+report = out.getvalue()
+lines = report.splitlines()
+assert lines[0].startswith("Autopilot's wakes since ") and lines[1].split() == [
+    "agent", "wakes", "pushed", "done", "failed", "limit", "stopped", "tokens", "in", "cached", "out", "~USD", "time"]
+for line_, name in zip(lines[2:5], ("claude", "gemini", "gpt")):
+    counts = agon.db().execute("SELECT COUNT(*), SUM(status = 'pushed'), SUM(status = 'done'), SUM(status IN ('failed',"
+                               " 'timeout')), SUM(status = 'limit'), SUM(status = 'stopped') FROM runs WHERE agent = ?",
+                               (name,)).fetchone()
+    assert line_.split()[:7] == [name, *map(str, counts)], (line_, counts)
+task_wakes = agon.db().execute("SELECT COUNT(*) FROM runs WHERE task = 1").fetchone()[0]  # gpt's, before its limit
+assert task_wakes == 2
+assert f"\n#1 Lexer (claude): {task_wakes} wake{'s' * (task_wakes != 1)}, " in report, report
+assert report.rstrip().endswith("Codex and agy report no cost."), report
+code = subprocess.run([sys.executable, SERVER, "stats"], env=dict(os.environ, AGON_DB=str(Path(TMP, "none.db"))),
+                      capture_output=True, text=True, timeout=60)
+assert code.returncode == 0 and code.stdout == "Autopilot hasn't woken anyone yet: python agon.py autopilot.\n", code
+
+# Phase 5: autopilot's tables are new SCHEMA steps, so a database made by v0.4 (its 7 steps) gets them too
+v04 = sqlite3.connect(Path(TMP, "v04.db"), isolation_level=None)
+for sql in agon.SCHEMA[:7]:
+    v04.execute(sql)
+v04.execute("PRAGMA user_version = 7")
+agon.migrate(v04)
+assert v04.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 11
+for table, columns in (("runs", "id agent trigger session started ended status tokens_in tokens_cached tokens_out usd"
+                                " task note"),
+                       ("pilot", "agent session turns context started used usd tokens_in tokens_cached tokens_out"
+                                 " parked why failures"),
+                       ("live", "pid agent client socket busy beat wake pushed"), ("state", "key value")):
+    assert [row[1] for row in v04.execute(f"PRAGMA table_info({table})")] == columns.split(), table
+v04.close()
+
+# Phase 5: the command. One autopilot at a time; SIGTERM ends it like Ctrl+C (running turns end and are recorded), and
+# the human hears it in the arena. Bad settings stop it before anything runs
+command = [sys.executable, SERVER, "autopilot", "--agents", "claude,gpt", "--lead", "gpt", "--project", str(project)]
+cli = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+until(lambda: heard()[0].startswith("Autopilot started"), 30)
+assert heard()[0] == (f"Autopilot started: it wakes claude, gpt in {project} when messages come for them (lead: gpt)."
+                      " STOP pauses it."), heard()
+second = subprocess.run(command, capture_output=True, text=True, timeout=60)
+assert second.returncode == 1 and f"agon autopilot: Autopilot already runs (process {cli.pid}, in {project}): stop it" \
+       in second.stdout, second
+agon.post("human", "all", "Hello from the arena.")  # wakes the lead, gpt
+until(lambda: "Hello from the arena." in (wake_runs()[-1:] or [{}])[0].get("prompt", ""), 30)
+until(lambda: last_run("gpt")["status"] != "running", 30)
+assert wake_runs()[-1]["app"] == "codex" and last_run("gpt")["status"] == "done"
+if os.name == "nt":  # no SIGTERM there: Ctrl+C or Ctrl+Break in its console
+    cli.terminate()
+    cli.communicate(timeout=60)
+    agon.db().execute("DELETE FROM state WHERE key = 'autopilot'")
+else:
+    cli.send_signal(signal.SIGTERM)
+    printed, _ = cli.communicate(timeout=60)
+    assert cli.returncode == 0 and heard()[0] == "Autopilot stopped." and not agon.db().execute(
+        "SELECT value FROM state WHERE key = 'autopilot'").fetchone(), (cli.returncode, printed, heard())
+    assert "Agon autopilot: wakes claude, gpt in " in printed and " woke gpt (#" in printed, printed
+for args, error in ((["--agents", "claude,bard"], "--agents must list agents autopilot can wake, such as"
+                                                  " claude,gpt,gemini."),
+                    (["--agents", "claude", "--lead", "gemini"], "The lead (gemini) must be one of the agents autopilot"
+                                                                 " wakes: claude."),
+                    (["--project", "relative"], "The project folder must be an absolute path to a folder: relative."),
+                    ([], "Run autopilot in your project folder, or pass --project (or set AGON_PROJECT): this is Agon's"
+                         " own folder.")):
+    bad = subprocess.run([sys.executable, SERVER, "autopilot", *args], cwd=HERE, capture_output=True, text=True,
+                         timeout=60)
+    assert bad.returncode == 1 and bad.stdout.strip().endswith(f"agon autopilot: {error}"), (args, bad)
+bad = subprocess.run(command, env=dict(os.environ, AGON_MAX_WORKERS="0"), capture_output=True, text=True, timeout=60)
+assert bad.returncode == 1 and "agon autopilot: AGON_MAX_WORKERS must be a whole number above 0, such as 3." in \
+       bad.stdout, bad
+for key, value in saved_env.items():
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+agon.close_db()
+agon.DB = test_db
+
 # 19. The tools/list reply stays small (every agent reads it into its context)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
@@ -2323,7 +3277,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.4)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.5)"):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -2368,7 +3322,7 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
                    "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
-                   "`mcp(agon/*)`", "(v0.4)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   "`mcp(agon/*)`", "(v0.5)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
                    ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
                    '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
                    ' gpt", "timeout": 10 }] }]'):
@@ -2378,6 +3332,44 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 assert "- [x] Phase 4 — Task board (no downtime)" in roadmap and "Codex app" not in roadmap
 assert "`board(action, ...)`" in roadmap and "`AGON_LEASE` seconds (7200)" in roadmap
+# Phase 5: both READMEs explain autopilot: how to start it, who wakes, the commands it runs (as the code has them), open
+# apps, fresh sessions, the brakes, permissions, how to stop it, the accounting, and the vendors' rules; the roadmap has
+# the phase ticked and the facts recorded
+wake_lines = {"claude": ["claude", *agon.WAKE_COMMANDS["claude"], *agon.WAKE_PERMISSIONS["claude"][0], agon.AGON_TOOLS,
+                         "--max-turns", str(agon.MAX_TURNS)],
+              "gpt": ["codex", *agon.WAKE_COMMANDS["gpt"], *agon.WAKE_PERMISSIONS["gpt"][0]],
+              "gemini": ["agy", *agon.WAKE_COMMANDS["gemini"], *agon.WAKE_PERMISSIONS["gemini"][0]]}
+for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)", "#autopilot-python-agonpy-autopilot",
+                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.5)")),
+                      ("README.ru.md", ("## Автопилот (`python agon.py autopilot`)",
+                                        "#автопилот-python-agonpy-autopilot",
+                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.5)"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in (*words, "`python agon.py stats`", "--agents claude,gpt --lead gpt", "`AGON_LEAD`", "`AGON_PROJECT`",
+                   "`AGON_WAKE_ON_BROADCAST`", "`AGON_ACK_PATTERNS`", "`AGON_DEBOUNCE_SECONDS`", "`AGON_MAX_WORKERS`",
+                   "`AGON_ROTATE_TURNS`", "`AGON_ROTATE_TOKENS`", "`AGON_ROTATE_HOURS`", "`AGON_HANDOFF_NOTE=1`",
+                   "`AGON_MAX_WAKES_PER_HOUR`", "`AGON_MAX_AUTORUNS`", "`AGON_DAILY_USD`", "`AGON_DAILY_TOKENS`",
+                   "`--max-budget-usd`", "`AGON_TURN_TIMEOUT`", "`AGON_UNSAFE=1`", "`AGON_AUTOPILOT`",
+                   "`AGON_CLAUDE_MODEL`", "`AGON_GPT_EFFORT`", "`AGON_GEMINI_ARGS`", "`UserPromptSubmit`", "Ctrl+C",
+                   "`AGON_EXTRA_USAGE=1`", "(https://openai.com/policies/row-terms-of-use/)", "Gemini Enterprise",
+                   # what the vendors' own pages say about scripted runs on your plan (the maintainer's decision)
+                   "(https://code.claude.com/docs/en/authentication)",
+                   "(https://code.claude.com/docs/en/github-actions)",
+                   "(https://code.claude.com/docs/en/legal-and-compliance)",
+                   "(https://developers.openai.com/codex/auth/ci-cd-auth)", "`claude setup-token`",
+                   "`STOP`", "`runs`", "`AGON_GEMINI_PLAN=1`", "`GEMINI_API_KEY`", '`"modelProvider": "gemini"`',
+                   '`"permissions": {"allow": ["mcp(agon/*)"]}`', "(`--resume <id>`)", "(`resume <id> -`)",
+                   "(`--conversation <id>`)", *(f"`{' '.join(argv)}`" for argv in wake_lines.values())):
+        assert needed in text, (readme, needed)
+    assert "No vendor's terms clearly" not in text and "явно не разрешают" not in text, readme
+assert "- [x] Phase 5 — Autopilot (Agon wakes the agents itself)" in roadmap and "Phase 5 additions" in roadmap
+for fact in ("CLAUDE_CODE_MESSAGING_SOCKET", "`claude_code_version`", "`--skip-git-repo-check`", "**no `-p`**",
+             '["mcp(agon/*)"]', "30 MB RSS", "`modelUsage`", "`isUsingOverage`", "`CLAUDE_CODE_HOST_SCHEDULED_RUN=1`",
+             '"a Gemini Enterprise API Key"', "anthropics/claude-code#96163",
+             "(https://code.claude.com/docs/en/authentication)", "(https://code.claude.com/docs/en/github-actions)",
+             "(https://code.claude.com/docs/en/legal-and-compliance)",
+             "(https://developers.openai.com/codex/auth/ci-cd-auth)"):
+    assert fact in roadmap, fact
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

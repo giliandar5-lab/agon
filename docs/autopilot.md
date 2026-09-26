@@ -1,6 +1,57 @@
 # Phase 5 — Autopilot (full specification)
 
-This is Phase 5 of [ROADMAP.md](../ROADMAP.md). Researched 2026-09-24; re-verify the platform facts before coding.
+This is Phase 5 of [ROADMAP.md](../ROADMAP.md). Researched 2026-09-24; re-checked hands-on on 2026-09-25 against
+claude 2.1.282, codex 0.157.0 and agy 1.2.11 (each against a local mock of its vendor's API) and with a deep-research
+pass: see **What the research changed** below, and ROADMAP's verified facts for the details.
+
+## What the research changed (2026-09-25; the maintainer approved changes 1-6)
+
+1. **Gemini runs only on an API key.** The "Google staff" statement below could not be verified; Google's Antigravity
+   FAQ and its Additional Terms (item 6) call third-party software on an Antigravity login a violation that can end
+   the account, and the FAQ recommends a Gemini Enterprise or AI Studio API key. So Agon runs agy (autopilot, `ask`,
+   the automatic review) only in agy's API-key mode (`"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/
+   settings.json`, `GEMINI_API_KEY`); `AGON_GEMINI_PLAN=1` is the human's own opt-out. Only a Gemini Enterprise key
+   takes the user out of Antigravity's terms (item 6 also bars "using the Service in connection with products not
+   provided by us"): with an AI Studio key, the README leaves it to the user. Claude Code and Codex run on the user's
+   plan, with no flag. Anthropic's Consumer Terms except what Anthropic "otherwise explicitly permit[s]", and Claude
+   Code's docs permit scripted and scheduled runs on a plan (`claude setup-token` "For CI pipelines, scripts", the
+   GitHub Action on a schedule, where "runs use your Claude subscription"), with the unmodified binary and the user's
+   own sign-in (the legal page). OpenAI documents running Codex as your own account in "trusted private automation",
+   and recommends an API key. Agon never reads, copies or passes on a login, token or key; starting autopilot is the
+   human's opt-in, and the brakes' defaults keep the use individual. *(Corrected 2026-09-26, the maintainer's decision
+   from the vendors' pages: the final report said no vendor explicitly permits this, and missed Claude Code's
+   authentication and GitHub Actions pages. An earlier version also said OpenAI's docs call plan-login `codex exec`
+   "supported"; they use the word only about refreshing the login.)*
+2. **No warm workers.** A new process that resumes a session sends the same request as a running one, byte for byte
+   (claude 2.1.282 against a mock; codex keys its cache by the thread id; agy resends a byte-identical prefix), so the
+   vendors' prompt caches should serve a cold resume within their TTL (1 hour for a plan's main conversation in Claude
+   Code, 5 minutes on extra usage or an API key; Codex's and Gemini's weren't found). Not measured on the live APIs:
+   one unverified report ([anthropics/claude-code#96163](https://github.com/anthropics/claude-code/issues/96163)) says
+   print mode rewrites ~25k tokens every turn on some models, warm or cold alike, so a warm process wouldn't help
+   there either. A warm process would save ~0.3-0.5 s of startup and cost 150-250 MB while idle.
+   `AGON_WARM_SECONDS` is dropped.
+3. **The inbox socket, in a narrow form.** The session's own Agon MCP server (Claude Code 2.1.282 gives MCP servers
+   the socket's path and token; its docs name only hooks and the Bash tool, so this may change, and then autopilot
+   leaves the session to its Stop hook) posts only when autopilot asks, only to an idle session (its hooks say when it
+   works),
+   with priority `next` (`now` aborts a running turn); the `UserPromptSubmit` hook sees the wake arrive, moves the
+   cursor then, and drops a wake whose messages the Stop hook handed over meanwhile. Other apps that are open get their
+   messages from their Stop hooks: autopilot never runs a second session of an agent beside the human's.
+4. **`AGON_MAX_WORKERS` defaults to 3**, one per vendor: a woken app takes 150-250 MB, not the 390-560 MB reported.
+5. **Rotation** also starts a session anew when it sat idle past the cache's life (an hour, Claude Code's on a plan;
+   one value for all three apps, as Codex's and Gemini's weren't found) with a context of 30,000 tokens or more: a
+   recap is cheaper than rereading a long history at full price.
+6. **agy takes no `-p` with stream-json input** (it would take `--input-format` as its prompt), needs no `--add-dir` in
+   1.2.11 (the folder it starts in is its workspace), and keeps `status: "ERROR"` on every later turn after an error it
+   recovered from: its exit code and `AGY_ERROR` line tell a failure.
+7. **Accounting, from the final report** (2026-09-26, after the pull request opened). Claude Code's tokens come from
+   `modelUsage` (running totals per model, subagents included), not the turn's `usage`, which leaves subagents out. A
+   run counts how far an app's running totals grew past the highest seen, since a crashed Claude Code turn may report
+   them zeroed: before, such a result reset the baseline, and the next run was charged the session's whole spend (an
+   interrupted agy turn reports zeros too). Past its plan's limit, Claude Code bills the user's extra usage
+   (`isUsingOverage` in its `rate_limit_event`): autopilot lets claude rest until the limit resets, unless
+   `AGON_EXTRA_USAGE=1`. The daily USD cap stays a coarse brake: Claude Code's docs say not to "trigger financial
+   decisions" from `total_cost_usd`.
 
 
 ## Goal
@@ -12,13 +63,14 @@ logged. Opt-in only.
 
 ## Verified facts this phase relies on (checked 2026-09-24; re-verify)
 
-- **Policies.** Google staff: launching the official `agy` binary as a local child process in headless mode
-  on cached credentials "is a supported workflow" and consumes the same entitlements as interactive use
-  (discuss.ai.google.dev/t/183051). Anthropic Help Center (June 15, 2026): `claude -p`, the Agent SDK and
+- **Policies.** *(Wrong, see above: the forum answer could not be verified, and Google's FAQ and terms say the
+  opposite for an Antigravity login.)* ~~Google staff: launching the official `agy` binary as a local child process
+  in headless mode on cached credentials "is a supported workflow" (discuss.ai.google.dev/t/183051).~~
+  Anthropic Help Center (June 15, 2026): `claude -p`, the Agent SDK and
   third-party apps "still draw from your subscription's usage limits"; the separate Agent SDK credit is paused.
-  Extracting OAuth tokens or calling vendor endpoints directly is forbidden by all three vendors — Agon only
-  ever runs the official binaries. OpenAI recommends API keys for CI but does not forbid `codex exec` on a
-  ChatGPT plan; document this as "allowed today, at your own plan's limits".
+  Extracting OAuth tokens or calling vendor endpoints directly is forbidden by Anthropic and Google (not verified
+  for OpenAI) — Agon only ever runs the official binaries. OpenAI recommends API keys for CI but does not forbid
+  `codex exec` on a ChatGPT plan; document this as "allowed today, at your own plan's limits".
 - **Claude Code inbox socket.** Every interactive or `-p` session (not `--bare`) binds an inbox: Unix socket on
   macOS/Linux, named pipe `\\.\pipe\LOCAL\cc-msg-<hex>` on Windows. Hooks receive its path and token as
   `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`. "When the receiving session is idle, Claude
@@ -51,9 +103,12 @@ logged. Opt-in only.
   `denied_actions`; structured `AGY_ERROR: {...}` line on stderr with a retryability flag (exit code 3).
   `--conversation <id>` with an unknown id silently starts a new conversation (idempotent). Conversations are
   scoped to the working directory. Quota text in the binary: "You have exhausted your quota on this model."
-  Model ids encode effort (`--effort` exists on some versions). Startup takes several seconds.
+  Model ids encode effort (`--effort` exists on some versions). Startup takes several seconds. *(1.2.11, measured:
+  -p can't go with stream-json input, the start takes ~0.3 s, only SUCCESS and ERROR were seen, see above.)*
 - **Memory.** Reported footprints per process: Claude Code ~390–560 MB, `agy` ~444 MB, Codex unknown (Rust,
-  smaller). Therefore no worker stays alive while idle.
+  smaller). Measured on Linux (2026-09-25): claude 2.1.282 ~238 MB peak for a `-p` turn, ~202–250 MB for a
+  stream-json process; codex 0.157.0 151 MB (native binary) to 206 MB (through its npm launcher); agy 1.2.11 166 MB
+  idle, 220 MB peak (430–480 MB on a fresh home, while its updater runs). Therefore no worker stays alive while idle.
 - **Research.** Cache reads still count against subscription limits, only less (Anthropic Help Center). Long
   contexts degrade all 18 tested frontier models ("Context Rot", Chroma 2025); practitioners rotate sessions via
   structured hand-offs instead of relying on auto-compaction. Cheap-first routing/cascades keep quality at a
@@ -68,8 +123,9 @@ logged. Opt-in only.
    socket, post the wake-up there — no new process, warm context and cache. Hook payload lets Agon store
    `{socket, token, pid, cwd, registered_at}` in `agents`. Liveness = successful connect; stale entries are
    dropped. Message = the same text `inbox` would return (Agon prefix + messages), so no extra tool call.
-2. **Warm worker**: a headless process kept alive `AGON_WARM_SECONDS` (default 90) after its last turn, then
-   exited to free memory. Claude and agy use their persistent stdin modes; Codex has none, so Codex always uses
+2. ~~**Warm worker**~~ *(dropped, see change 2 above)*: a headless process kept alive `AGON_WARM_SECONDS` (default
+   90) after its last turn, then exited to free memory. Claude and agy use their persistent stdin modes; Codex has
+   none, so Codex always uses
    step 3 with `resume`.
 3. **Cold start**: spawn the CLI resuming the agent's saved session (`--resume`, `codex exec resume`,
    `--conversation`), or a fresh session with Agon's recap when rotation is due.
@@ -87,7 +143,8 @@ logged. Opt-in only.
 **3. Budgets and brakes (hard, per agent)**
 - `AGON_MAX_WAKES_PER_HOUR` (default 12). Exceeded → agent parked, human notified in the arena.
 - Daily caps: `AGON_DAILY_USD` for Claude (from `total_cost_usd`, plus `--max-budget-usd` per run) and
-  `AGON_DAILY_TOKENS` for Codex/agy (from their usage fields). Exceeded → parked until local midnight.
+  `AGON_DAILY_TOKENS` for Codex/agy (from their usage fields). Exceeded → parked until local midnight. *(Both are
+  estimates: see change 7.)*
 - Per-turn: `--max-turns` (Claude, default 30), `AGON_TURN_TIMEOUT` (default 900 s): SIGINT/turn end → 20 s →
   SIGTERM/`taskkill /T` on Windows.
 - Existing brakes still apply: STOP pauses autopilot immediately (no new wakes, running turns interrupted),
@@ -115,7 +172,7 @@ logged. Opt-in only.
 - Workers run in the project directory (`AGON_PROJECT`), the same folder the team shares; never in worktrees
   except duels.
 - Agent messages remain untrusted text; autopilot only forwards Agon's own inbox format.
-- One worker per agent at a time; global cap `AGON_MAX_WORKERS` (default 2) to bound RAM.
+- One worker per agent at a time; global cap `AGON_MAX_WORKERS` (default 2; 3 after the research) to bound RAM.
 
 **7. Supervision and accounting**
 - `python agon.py autopilot [--lead claude] [--agents claude,gpt,gemini]` runs one supervisor thread that
@@ -153,7 +210,7 @@ logged. Opt-in only.
 ## Tests (fake CLIs via `AGON_CMD_*`, fake inbox socket server)
 
 Wake on addressed message; no wake on acknowledgment; broadcast wakes only the lead; debounce merges three
-messages into one wake; warm worker serves two turns in one process; cold start resumes the saved session;
+messages into one wake; ~~warm worker serves two turns in one process~~ (dropped); cold start resumes the saved session;
 rotation after N turns starts a fresh session with a recap; wakes-per-hour and daily caps park the agent and
 post a notice; STOP interrupts a running turn; crash → backoff; limit output → out-of-quota + reassignment +
 fallback wake; usage/cost recorded in `runs`; inbox-socket wake delivered to a mock server (auth line first);

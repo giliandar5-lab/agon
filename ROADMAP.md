@@ -22,7 +22,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 3 — Cross-vendor second opinion (`ask`)
 - [x] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
 - [x] Phase 4 — Task board (no downtime)
-- [ ] Phase 5 — Autopilot (Agon wakes the agents itself)
+- [x] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [ ] Phase 6 — The arena
 - [ ] Phase 7 — Packaging
 
@@ -252,6 +252,12 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
 - Every wake is recorded (trigger, tokens, cost, duration, status); `python agon.py stats` reports cost per task.
 - Research first, before coding: the inbox-socket wire format on Windows and Linux, exact limit errors of each
   CLI, memory and latency measurements, and cache lifetimes; record the results in this file.
+- Done in v0.5.0, with what the research changed (docs/autopilot.md, "What the research changed"): no warm workers
+  (a cold resume sends the same request, so the prompt cache should serve it); agy runs only in its API-key mode; the
+  inbox socket only for an idle Claude Code session, posted by its own Agon server when autopilot asks;
+  `AGON_MAX_WORKERS` 3; a session idle past the cache's life with a large context starts anew; Claude Code's tokens
+  from `modelUsage`, a run's share from the highest totals seen, and claude rests on extra usage
+  (`AGON_EXTRA_USAGE=1`). Measured facts: see Phase 5 additions below.
 
 ## Phase 6 — The arena
 
@@ -286,7 +292,7 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
 - The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
   (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.
 
-## Verified platform facts (checked 2026-09-24; Phase 4 additions 2026-09-25)
+## Verified platform facts (checked 2026-09-24; Phase 4 and 5 additions 2026-09-25)
 
 Sources are official docs unless marked *(secondary)*. Re-check when you can; these change often.
 
@@ -534,6 +540,120 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   1 µs ([What's New in 3.13](https://docs.python.org/3/whatsnew/3.13.html)). So two quick events can get the same time:
   a task's `version`, not its time, tells its changes apart, and `last_seen` only grows across agents. The tests run
   every Python process of theirs on such a clock, on every system (found by CI on windows-latest, Python 3.10).
+
+**Phase 5 additions (checked 2026-09-25, hands-on against local mocks of each vendor's API; no real model calls)**
+
+*Claude Code 2.1.282* (the public npm build, `env -i`, its own HOME, a mock of the Messages API)
+- Every session, `-p` stream-json and interactive alike, binds an inbox for cross-session messaging: a Unix socket
+  `/tmp/cc-socks-<uid>/<pid>.sock` (folder 0700; `system/init` shows `messaging_socket_path`); on Windows a named pipe
+  ([docs](https://code.claude.com/docs/en/cross-session-messaging): v2.1.224+, Windows v2.1.234+). Hooks (not
+  SessionEnd), the Bash tool and **MCP servers** get `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`,
+  `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` (MCP servers as seen here: the docs name only hooks and the Bash
+  tool).
+- Wire format: newline-terminated JSON, `{"type":"auth","token":"…"}` then
+  `{"type":"user","message":{"role":"user","content":"…"},"priority":"next"}`. No reply. Linux and macOS know the
+  session's own children by the process (the auth line is optional for them); on Windows the token is the proof.
+  `now` aborts a running turn (`error_during_execution`, `aborted_streaming`); `next` waits for it, and queued `next`
+  messages merge into one turn; `later` runs after them. An idle interactive session starts a turn; its
+  `UserPromptSubmit` hook gets the raw text as `prompt`. The model sees "Another Claude session sent a message: …".
+  Delivered messages count toward usage like typed ones; repeats are throttled, at most 50 queue.
+- stream-json: input `{"type":"user","message":{"role":"user","content":"…"}}`, one turn per line; each turn prints
+  `system/init` (with `claude_code_version`), `assistant` events (`message.usage`: the context of that call) and a
+  `result` whose `usage` sums the turn's calls (the main loop's, without subagents), `total_cost_usd` and `modelUsage`
+  (tokens per model, subagents included) the process's running totals (since 2.1.277 with a resumed session's
+  earlier spend, restored from the transcript on a normal exit, which a kill skips; a crash result may carry them
+  zeroed; "Do not bill end users or trigger financial decisions from these fields":
+  [docs](https://code.claude.com/docs/en/agent-sdk/cost-tracking)), `num_turns`, `permission_denials`,
+  `terminal_reason`. `{"type":"control_request","request_id":"…","request":{"subtype":"interrupt"}}` on stdin ends
+  the turn with a result, and the process stays. SIGINT exits 0 with no
+  result, SIGTERM 143; every case resumes. `claude -p` with stdin left open waits 3 s for it.
+- **A cold `--resume` sends what a warm process would:** the request of `-p --resume <id>` in a new process equals the
+  next request of a running stream-json process (same system, tools, messages and cache marks), so the prompt cache
+  should serve both. Not measured on the live API; one user's unverified report
+  ([anthropics/claude-code#96163](https://github.com/anthropics/claude-code/issues/96163)) says print mode rewrites
+  ~25k tokens every turn on some models, warm or cold alike. A plan's main conversation, `-p` included, gets a 1-hour
+  cache TTL, 5 minutes on usage credits (extra usage) or an API key
+  ([docs](https://code.claude.com/docs/en/prompt-caching)); Codex's and Gemini's weren't found.
+  Start → first request 0.54 s, a trivial turn 0.66 s, peak RSS 238 MB; a stream-json process 202-250 MB.
+- `-p` denies MCP tools in every permission mode (`default`, `acceptEdits`, `auto`, `dontAsk`, `plan`) unless
+  `--allowedTools` names them (`mcp__agon`, or `mcp__plugin_agon_agon` for the plugin's server). `acceptEdits` writes
+  files and runs `echo > file`, not `python3 …`. `--permission-prompts none` denies what would prompt. `--max-turns`
+  works (not in `--help`), `--max-budget-usd` ends a run with `error_max_budget_usd`, `--session-id <uuid>` names a
+  new session, `--resume <unknown>` fails with "No conversation found with session ID". `--bare` never uses the plan
+  login. SessionStart, UserPromptSubmit, Stop and SessionEnd hooks run in `-p`.
+- A rejected 429 (`anthropic-ratelimit-unified-status: rejected`) is not retried; the stream-json process exits 1. A
+  plan's limit comes as `rate_limit_event` with `rate_limit_info.status: "rejected"` and `resetsAt`
+  ([SDK types](https://code.claude.com/docs/en/agent-sdk/typescript); `errorCode: "credits_required"` when the included
+  usage is gone and no credits are left). Live events also carry `rateLimitType` and `isUsingOverage`, which the types
+  don't list: past the limit, a user with extra usage is billed instead of rejected (and the cache TTL drops to 5
+  minutes).
+
+*Codex 0.157.0* (npm; source at `rust-v0.157.0`; a mock Responses API provider)
+- `codex exec --json -s workspace-write [-m M] [-c model_reasoning_effort=E] [resume <id>] -`: the prompt on stdin
+  (read to its end first; closing stdin can't interrupt). `-s` and `-C` must come before `resume`. Outside a git
+  repository `--skip-git-repo-check` is required. Events: `thread.started{thread_id}`, `turn.started`,
+  `item.completed` (`agent_message`, `command_execution`, ...; type `error` items are warnings), `turn.completed{usage}`
+  or `turn.failed`, and non-fatal `error` events ("Reconnecting... 1/5"). `usage` (`input_tokens` with
+  `cached_input_tokens` among them, `output_tokens`, `reasoning_output_tokens`) is **the thread's running total, across
+  processes**. The prompt prefix is byte-stable across processes and `prompt_cache_key` is the thread id.
+- A usage limit: one request, `error` then `turn.failed`, exit 1, nothing on stderr; the texts are "You’ve hit your
+  usage limit…", "Your workspace is out of credits", "You hit your spend cap", "To use Codex with your ChatGPT plan,
+  upgrade…", "Quota exceeded…" and, mid-stream, "The usage limit has been reached". Rate limits never reach stdout
+  (only the session file). An unknown thread id: exit 1 "no rollout found for thread id …"; two resumes of one thread
+  at once: "already has an active writer". SIGINT: exit 1; kill the process group (the npm launcher's SIGKILL orphans
+  the native binary). `codex app-server` exists but is labelled experimental.
+- MCP per run works through `-c mcp_servers…`; `board` runs unasked, `ask` needs an approval rule. `exec` runs hooks
+  only when trusted. Startup: 0.29-0.37 s, 151-206 MiB.
+
+*agy 1.2.11* (the official manifest; API-key mode against a mock; no Google login)
+- `agy --input-format stream-json --output-format stream-json --disable-slash-commands --mode accept-edits
+  [--conversation <id>]`; **no `-p`** (it would take the next argument as its prompt, exit 2). Input
+  `{"event":"user","message":{"content":"…"}}`, one turn per line; `init{conversation_id}`, `step_update`s, then
+  `result{status, response, usage, num_turns, denied_actions}`. `usage` is the conversation's running total, across
+  processes (`input_tokens` excludes the cached ones). `--conversation <unknown>` starts a new conversation with a
+  warning. Two processes on one conversation corrupt it (no lock). The working folder is the workspace (no
+  `--add-dir` needed).
+- A 429 or dropped connection is retried ~150 s; `QUOTA_EXHAUSTED` or a long RetryInfo once; then exit 3,
+  `status: "ERROR"` and an `AGY_ERROR: {…}` line on stderr ("Your quota will reset after 2h3m4s."). After an error it
+  recovered from, **every later turn reports `status: "ERROR"`** with exit 0 and a good response. SIGINT/SIGTERM end
+  the turn at once (`error: "interrupted"`, exit 1); every case resumes.
+- Headless, an MCP tool without a rule is refused (`denied_actions: [{"action":"mcp"}]`, SUCCESS, empty response):
+  `"permissions": {"allow": ["mcp(agon/*)"]}` in `~/.gemini/antigravity-cli/settings.json` allows Agon's tools. The
+  Stop hook runs after every turn, before its `result`. Idle 166 MB, peak 220 MB, start → first request 0.26 s; a
+  fresh home adds a background updater (`AGY_CLI_DISABLE_AUTO_UPDATE=true` stops it).
+
+*Policies* (read 2026-09-25; Anthropic's and OpenAI's pages again 2026-09-26)
+- Anthropic: the Consumer Terms forbid access "through automated or non-human means" except with an API key "or where
+  we otherwise explicitly permit it", and Claude Code's docs explicitly permit scripted and scheduled runs on a plan:
+  "For CI pipelines, scripts, or other environments where interactive browser login isn't available, generate a
+  one-year OAuth token with `claude setup-token`", which "authenticates with your Claude subscription"
+  ([Authentication](https://code.claude.com/docs/en/authentication)); the GitHub Action runs in automation mode on
+  any event, a cron schedule included, and "If you authenticate with an OAuth token, runs use your Claude
+  subscription instead of API billing" ([GitHub Actions](https://code.claude.com/docs/en/github-actions)). The
+  [legal page](https://code.claude.com/docs/en/legal-and-compliance) lets "an end user" sign in "to the unmodified
+  Claude Code binary with their own Claude subscription"; it forbids third parties to "route requests through Free,
+  Pro, or Max plan credentials on behalf of their users" and to "collect, store, or intermediate Claude.ai credentials
+  or session tokens", and says Pro and Max limits "assume ordinary, individual usage of Claude Code and the Agent
+  SDK". The Help Center (updated June 16, 2026) says `claude -p`, the Agent SDK and third-party apps "still draw from
+  your subscription's usage limits". (The research concluded that no vendor explicitly permits unattended runs on a
+  plan: it missed the authentication and GitHub Actions pages.) The Agent SDK reference documents how an app that
+  "runs prompts on its own schedule" declares each run (`CLAUDE_CODE_HOST_SCHEDULED_RUN=1`, a `scheduled-trigger`
+  origin); Agon doesn't, for now.
+- OpenAI: the pricing page lists "Codex SDK, codex exec, and scriptable workflows" for Plus and Pro, and OpenAI
+  documents running Codex as your own account in automation
+  ([Maintain Codex account auth in CI/CD](https://developers.openai.com/codex/auth/ci-cd-auth)): "an advanced workflow
+  for enterprise and other trusted private automation", while "The right way to authenticate automation is with an
+  API key" ("Do not use this workflow for public or open-source repositories", about runners that hold `auth.json`).
+  The [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid circumventing "any rate limits or
+  restrictions".
+- Google: the Antigravity FAQ and Additional Terms (item 6) call third-party software on an Antigravity login a
+  violation that can end the account, and the FAQ recommends a Gemini Enterprise or AI Studio API key; agy's API-key
+  mode (`"modelProvider": "gemini"`, `GEMINI_API_KEY`) never creates an account session. The terms stop applying only
+  with "a Gemini Enterprise API Key" (or an Enterprise or Workspace account), and item 6 also bars "using the Service
+  in connection with products not provided by us".
+
+*Agon's autopilot* (Linux, Python 3.11): idle 30 MB RSS and ~0.1% of a core (it polls `PRAGMA data_version` every
+0.2 s).
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,
