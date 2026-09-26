@@ -2333,7 +2333,8 @@ settings.unlink()
 # Phase 5, autopilot: `python agon.py autopilot` wakes each agent when messages come for it: an idle Claude Code session
 # through its inbox socket, else the agent's app, headless, for one turn that resumes the agent's own session. The fake
 # apps below take a turn the way claude 2.1.282, codex 0.157.0 and agy 1.2.11 do (seen against mocks of their APIs)
-FAKE_WAKE, WAKE_LOG, WAKE_STATE = Path(TMP, "fake_wake.py"), Path(TMP, "wake.log"), Path(TMP, "wake-state")
+FAKE_WAKE, WAKE_LOG, WAKE_STATE = Path(TMP, "fake_wake.py"), Path(TMP, "wake-log"), Path(TMP, "wake-state")
+WAKE_LOG.mkdir()  # a file for each run: on Windows, two processes that append to one file at once can lose a line
 WAKE_STATE.mkdir()
 FAKE_WAKE.write_text(r'''"""A fake Claude Code, Codex or agy for autopilot: python fake_wake.py claude|codex|agy ARGS...
 It takes a turn the way its app does (Claude Code and agy: one stream-json line, and its stdin stays open; Codex: all of
@@ -2379,9 +2380,11 @@ else:
     prompt = json.loads(sys.stdin.buffer.readline())["message"]["content"]  # UTF-8, whatever the console uses
     asked = value("--resume") if app == "claude" else value("--conversation")
 sid = asked or value("--session-id") or str(uuid.uuid4())
-with open(os.environ["FAKE_WAKE_LOG"], "a", encoding="utf-8") as log:
-    log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "cwd": os.getcwd(), "session": sid,
-                          "autopilot": os.environ.get("AGON_AUTOPILOT")}) + "\n")
+record = os.path.join(os.environ["FAKE_WAKE_LOG"], f"{time.time_ns():020d}-{os.getpid()}")
+with open(record + ".tmp", "w", encoding="utf-8") as log:  # complete, then renamed: a reader never sees half of it
+    json.dump({"app": app, "args": args, "prompt": prompt, "cwd": os.getcwd(), "session": sid,
+               "autopilot": os.environ.get("AGON_AUTOPILOT")}, log)
+os.replace(record + ".tmp", record + ".json")
 path = os.path.join(os.environ["FAKE_STATE"], f"{app}-{sid}.json")
 if asked and not os.path.exists(path):
     if app == "claude":
@@ -2494,7 +2497,7 @@ else:
 
 
 def wake_runs():  # what the fake apps autopilot started got, oldest first
-    return [json.loads(row) for row in WAKE_LOG.read_text(encoding="utf-8").splitlines()] if WAKE_LOG.exists() else []
+    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(WAKE_LOG.glob("*.json"))]
 
 
 @contextlib.contextmanager
@@ -2697,7 +2700,8 @@ for name, app in APPS.items():
 
 # Phase 5, the supervisor, in this process on a team of its own: it sees the messages, waits the debounce, and wakes each
 # agent with all that waits for it, in a thread of its own; the fake apps send messages through agon.db as the agents
-WAKE_LOG.unlink()
+for path in WAKE_LOG.glob("*.json"):
+    path.unlink()
 agon.close_db()
 agon.DB, test_db = str(Path(TMP, "pilot.db")), agon.DB
 pilot_env = {"AGON_DB": agon.DB, "FAKE_AGON": str(HERE), "FAKE_STATE": str(WAKE_STATE), "FAKE_WAKE_LOG": str(WAKE_LOG),
@@ -2767,7 +2771,8 @@ assert (pilot.pilot("gpt")["session"], last_run("gpt")["tokens_in"], last_run("g
 # The next wake resumes the session: no recap, and the run's share of the running totals
 agon.post("human", "claude", "Now the tests.")
 agon.post("human", "gpt", "And the docs.")
-assert sorted(step()) == ["claude", "codex"]
+woke = step()  # both at once
+assert sorted(woke) == ["claude", "codex"], (woke, told[-6:])
 runs = {run["app"]: run for run in wake_runs()[-2:]}
 assert runs["claude"]["args"][runs["claude"]["args"].index("--resume") + 1] == sid, runs["claude"]["args"]
 assert "--session-id" not in runs["claude"]["args"] and "anew" not in runs["claude"]["prompt"]
@@ -2786,7 +2791,8 @@ with settings(AGON_WAKE_ON_BROADCAST="none"):
     agon.post("human", "all", "Lunch break soon.")
     assert step() == []
 with settings(AGON_WAKE_ON_BROADCAST="all"):  # now it wakes everyone else, the one who wrote it aside
-    assert sorted(step()) == ["agy", "claude", "codex"]
+    woke = step()
+    assert sorted(woke) == ["agy", "claude", "codex"], (woke, told[-9:])
 assert "I'll write the docs." in next(run for run in wake_runs()[-3:] if run["app"] == "codex")["prompt"]
 # Three messages within the debounce: one wake with all three
 for i in range(3):
