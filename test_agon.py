@@ -20,7 +20,7 @@ import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-faulthandler.dump_traceback_later(240, exit=True)  # a test that hangs shows where, long before CI gives up
+faulthandler.dump_traceback_later(420, exit=True)  # a test that hangs shows where, before CI gives up at 600 s
 TMP = tempfile.mkdtemp()
 # Before Python 3.13, time.time() on Windows moves in 15.625 ms steps (time.get_clock_info("time").resolution), so two
 # quick events get the same time. Every Python process of these tests runs on such a clock, whatever the system: this
@@ -2666,6 +2666,14 @@ got = agon.outcome("gemini", 0, steps[:1] + [{"event": "result", "result": {
 assert got["denied"] and got["answer"] is None, got
 day = agon.midnight(time.time())
 assert datetime.datetime.fromtimestamp(day).time() == datetime.time(0) and day <= time.time() < agon.midnight(day, 1)
+# Found by CI: every MCP server now has a watch thread, and one that napped 1 s kept its closing app waiting that long.
+# Its naps end as soon as the app is gone
+t0 = time.monotonic()
+agon.nap(5, lambda: True)
+assert time.monotonic() - t0 < 0.5
+t0 = time.monotonic()
+agon.nap(0.3, lambda: False)
+assert 0.25 <= time.monotonic() - t0 < 2
 
 # Phase 5, a turn that runs too long, or that STOP ends: Claude Code gets an interrupt on stdin and gives its result;
 # Codex and agy get SIGINT (Windows: Agon ends them at once). GRACE seconds later, or at once, the whole tree goes

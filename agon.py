@@ -1978,13 +1978,20 @@ def watch(session):
                     if session.called and session.client == "claude-code":  # not before the client is set up
                         rung = doorbell(session, rung)
                 if wait_for_change(version, max(0.05, beat + LIVE / 5 - time.time()), lambda: session.closed):
-                    time.sleep(RING_DELAY)  # a message that comes in now may be delivered right away
+                    nap(RING_DELAY, lambda: session.closed)  # a message that comes in now may be delivered right away
             except sqlite3.Error:  # e.g. agon.db stayed locked for 5 s: try again in a moment
-                time.sleep(RING_DELAY)
+                nap(RING_DELAY, lambda: session.closed)
     except (OSError, ValueError):  # the client is gone
         pass
     finally:
         close_db()
+
+
+def nap(seconds, stop):
+    """Sleep `seconds`, or less once stop() is true: a closing app doesn't wait for the server's naps."""
+    end = time.monotonic() + seconds
+    while not stop() and (left := end - time.monotonic()) > 0:
+        time.sleep(min(0.05, left))
 
 
 def register(session, now):
