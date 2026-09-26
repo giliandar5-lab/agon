@@ -381,20 +381,28 @@ python agon.py stats                                      # во что обош
   учтутся: Claude Code сохраняет итоги, только когда завершается штатно. `python agon.py stats` подводит итоги по
   агентам и по завершённым задачам.
 
-**Твои подписки, твои лимиты; только официальные CLI.** Автопилот запускает собственные программы вендоров, в
-которые ты вошёл сам: он никогда не читает, не копирует и не пересылает твой логин и никогда не обходит лимит
-повторными попытками. Условия ни одного вендора явно не разрешают запуск без человека на потребительском тарифе; с
-API-ключом это явно разрешено. Что говорят вендоры:
+**Твои подписки, твои лимиты; только официальные CLI.** Автопилот запускает собственные программы вендоров без
+изменений, и ты входишь в них сам, через их собственный вход: Agon никогда не читает, не копирует и не передаёт
+дальше логин, токен или ключ и никогда не обходит лимит повторными попытками. Тормоза по умолчанию скромные, чтобы
+использование оставалось индивидуальным: 12 пробуждений агента в час, 25 автоматических ходов подряд без тебя,
+3 программы одновременно. Запуск `python agon.py autopilot` — это твоё решение его включить. Что говорят вендоры:
 
-- **Claude Code:** справочный центр Anthropic пишет, что `claude -p` и сторонние приложения расходуют лимиты твоего
-  тарифа, а участник команды Claude Code написал, что Anthropic хочет «поощрять локальную разработку и эксперименты с
-  Agent SDK и claude -p». При этом Consumer Terms Anthropic запрещают доступ «автоматизированными или нечеловеческими
-  средствами», кроме как по API-ключу «или там, где мы явно это разрешаем»: решай сам или используй API-ключ.
-- **Codex:** OpenAI указывает `codex exec` и скриптовые сценарии для Plus и Pro, но документация говорит «The right
-  way to authenticate automation is with an API key», а автоматизацию на входе через ChatGPT называет «an advanced
-  workflow for enterprise and other trusted private automation» (не для публичных и open-source репозиториев: речь о
-  CI-раннерах, на которых лежит твой логин). Её [Terms of Use](https://openai.com/policies/row-terms-of-use/)
-  запрещают обходить ограничения частоты.
+- **Claude Code** работает на твоём тарифе. Consumer Terms Anthropic запрещают автоматизированный доступ, «except ...
+  where we otherwise explicitly permit it», а документация Claude Code разрешает скриптовые и запланированные запуски
+  на тарифе Pro или Max: «For CI pipelines, scripts, or other environments where interactive browser login isn't
+  available» команда `claude setup-token` создаёт токен, который «authenticates with your Claude subscription»
+  ([Authentication](https://code.claude.com/docs/en/authentication)); GitHub Action запускается по расписанию, и «If
+  you authenticate with an OAuth token, runs use your Claude subscription instead of API billing»
+  ([GitHub Actions](https://code.claude.com/docs/en/github-actions)).
+  [Юридическая страница](https://code.claude.com/docs/en/legal-and-compliance) разрешает входить в неизменённый
+  Claude Code со своей подпиской; она запрещает собирать, хранить и передавать через посредников учётные данные
+  Claude.ai и направлять запросы через учётные данные тарифа от имени других, а про лимиты Pro и Max говорит, что они
+  «assume ordinary, individual usage».
+- **Codex** работает на твоём входе через ChatGPT. OpenAI описывает запуск Codex от твоего аккаунта в автоматизации,
+  «an advanced workflow for enterprise and other trusted private automation», как на твоей собственной машине, и
+  рекомендует API-ключ: «The right way to authenticate automation is with an API key»
+  ([CI/CD auth](https://developers.openai.com/codex/auth/ci-cd-auth)). Её
+  [Terms of Use](https://openai.com/policies/row-terms-of-use/) запрещают обходить ограничения частоты.
 - **Antigravity:** условия Google запрещают стороннее ПО при входе через Antigravity (аккаунт Google), а FAQ
   рекомендует для сторонних агентов API-ключ Gemini Enterprise или AI Studio. Поэтому Agon запускает agy (автопилот,
   `ask`, автоматическое ревью) только в его режиме API-ключа: пропиши `"modelProvider": "gemini"` в

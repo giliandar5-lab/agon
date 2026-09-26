@@ -872,6 +872,15 @@ def readable(data):
         return data.decode("mbcs" if os.name == "nt" else "utf-8", "replace")
 
 
+def environment(drop=(), **add):
+    """The environment of a program Agon starts (an app, the tests, git): Agon's own, with `add`, without the variables
+    that start with `drop`, and never with the inbox of the Claude Code session Agon's server runs in: its socket and
+    the token Claude Code gives the server (CLAUDE_CODE_MESSAGING_*), which only that server uses, to post its own
+    session a wake (see push())."""
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith(("CLAUDE_CODE_MESSAGING_", *drop))} | add
+
+
 def run_cli(argv, stdin, cwd, env, end, stopped, tests=False):
     """Run a headless app until it exits: (its exit code, or None when Agon killed its process tree; its stdout; its
     stderr; why Agon killed it: the reason stopped() gave then, or None when time.monotonic() passed `end`). The
@@ -995,7 +1004,7 @@ def run_tests(tests, folder, end, stopped):
             f"{head} could not start: {program} is a batch file, so cmd.exe would read &, |, <, >, ^, % and quotes in"
             " its arguments as its own. Put the command in a script, or call the program it starts (such as node)"
             " directly."), None
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_"))}
+    env = environment(("AGON_", "CLAUDE_PLUGIN_OPTION_"))
     try:
         code, out, _, reason = run_cli([program, *argv[1:]], None, folder, env, min(started + limit, end), stopped,
                                        tests=True)
@@ -1025,8 +1034,9 @@ def run_tests(tests, folder, end, stopped):
 def git(cwd, *args, feed=None):
     """Run git in folder `cwd`, with `feed` on its stdin, and return what it printed; ToolError with git's own words
     when it fails."""
-    p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                       creationflags=NO_WINDOW, **({"stdin": subprocess.DEVNULL} if feed is None else {"input": feed}))
+    p = subprocess.run(["git", *args], cwd=cwd, env=environment(), capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", creationflags=NO_WINDOW,
+                       **({"stdin": subprocess.DEVNULL} if feed is None else {"input": feed}))
     if p.returncode:
         command = next(a for a in args if not a.startswith("-") and "=" not in a)  # commit, not the -c before it
         raise ToolError(f"git {command} failed: {(p.stderr or p.stdout).strip() or f'exit code {p.returncode}'}")
@@ -1170,7 +1180,7 @@ def ask_run(asker, name, mode, prompt, cwd, end, stopped):
     show a usage limit or None)."""
     argv, stdin = ask_command(name, mode, prompt, cwd)
     started = time.monotonic()
-    env = dict(os.environ, AGON_ASKED_BY=asker)
+    env = environment(AGON_ASKED_BY=asker)
     try:
         code, out, err, reason = run_cli(argv, stdin, cwd, env, end, stopped)
     except OSError as e:  # not a program, no permission...
@@ -3029,9 +3039,7 @@ class Autopilot:
                             note)).lastrowid
         self.say(f"woke {me} ({trigger}){': ' + note if note else ''}")
         touch(me)  # a sign of life: its claims on the board last while autopilot keeps it working
-        # never the inbox of a Claude Code session that started autopilot, nor ask's mark
-        env = {key: value for key, value in os.environ.items() if key != "AGON_ASKED_BY" and not key.startswith(
-            "CLAUDE_CODE_MESSAGING_")} | {"AGON_AUTOPILOT": "1"}
+        env = environment(("AGON_ASKED_BY",), AGON_AUTOPILOT="1")  # not ask's mark: it is autopilot's run
         code, events, err, why = drive(argv, feed, keep, self.project, env, time.monotonic() + self.timeout,
                                        self.stopped, lambda event: last_event(me, event),
                                        lambda p: interrupt_turn(me, p))

@@ -375,19 +375,28 @@ python agon.py stats                                      # what the wakes took
   Claude Code (it ignored the interrupt), that turn's spend goes uncounted: Claude Code saves its totals only when it
   exits normally. `python agon.py stats` sums them up per agent and per completed task.
 
-**Your own subscriptions at your own limits; official CLIs only.** Autopilot runs the vendors' own apps, logged in as
-you: it never reads, copies or relays your login, and never retries around a usage limit. No vendor's terms clearly
-allow unattended runs on a consumer plan; an API key is clearly allowed. What the vendors say:
+**Your own subscriptions at your own limits; official CLIs only.** Autopilot runs the vendors' own apps, unmodified,
+and you sign in to them yourself, through their own sign-in: Agon never reads, copies or passes on a login, token or
+key, and never retries around a usage limit. The brakes' defaults are modest, so the use stays individual: 12 wakes of
+an agent an hour, 25 automatic turns in a row without you, 3 apps at once. Starting `python agon.py autopilot` is your
+opt-in. What the vendors say:
 
-- **Claude Code:** Anthropic's Help Center says `claude -p` and third-party apps draw from your plan's usage limits,
-  and a Claude Code team member wrote that Anthropic wants "to encourage local development and experimentation with
-  the Agent SDK and claude -p". Anthropic's Consumer Terms still forbid access "through automated or non-human means"
-  except with an API key "or where we otherwise explicitly permit it": decide for yourself, or use an API key.
-- **Codex:** OpenAI lists `codex exec` and scriptable workflows for Plus and Pro, but its docs say "The right way to
-  authenticate automation is with an API key" and call automation on a ChatGPT login "an advanced workflow for
-  enterprise and other trusted private automation" (not for public or open-source repositories: the page is about CI
-  runners that hold your login). Its [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid
-  circumventing rate limits.
+- **Claude Code** runs on your plan. Anthropic's Consumer Terms forbid automated access "except ... where we otherwise
+  explicitly permit it", and Claude Code's docs permit scripted and scheduled runs on a Pro or Max plan: "For CI
+  pipelines, scripts, or other environments where interactive browser login isn't available", `claude setup-token`
+  makes a token that "authenticates with your Claude subscription"
+  ([Authentication](https://code.claude.com/docs/en/authentication)); the GitHub Action runs on a schedule, and "If
+  you authenticate with an OAuth token, runs use your Claude subscription instead of API billing"
+  ([GitHub Actions](https://code.claude.com/docs/en/github-actions)). The
+  [legal page](https://code.claude.com/docs/en/legal-and-compliance) lets you sign in to the unmodified Claude Code
+  with your own subscription; it forbids collecting, storing or intermediating Claude.ai credentials and routing
+  requests through plan credentials on behalf of others, and says Pro and Max limits "assume ordinary, individual
+  usage".
+- **Codex** runs on your ChatGPT login. OpenAI documents running Codex as your own account in automation, "an advanced
+  workflow for enterprise and other trusted private automation", as on your own machine, and recommends an API key:
+  "The right way to authenticate automation is with an API key"
+  ([CI/CD auth](https://developers.openai.com/codex/auth/ci-cd-auth)). Its
+  [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid circumventing rate limits.
 - **Antigravity:** Google's terms forbid third-party software on an Antigravity (Google) login, and its FAQ recommends
   a Gemini Enterprise or AI Studio API key for third-party agents. So Agon runs agy (autopilot, `ask`, the automatic
   review) only in agy's API-key mode: put `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and

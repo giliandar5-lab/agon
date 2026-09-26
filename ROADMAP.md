@@ -622,23 +622,30 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   Stop hook runs after every turn, before its `result`. Idle 166 MB, peak 220 MB, start → first request 0.26 s; a
   fresh home adds a background updater (`AGY_CLI_DISABLE_AUTO_UPDATE=true` stops it).
 
-*Policies* (read 2026-09-25)
-- Anthropic: the Help Center (updated June 16, 2026) says `claude -p`, the Agent SDK and third-party apps "still draw
-  from your subscription's usage limits"; the Consumer Terms forbid access "through automated or non-human means"
-  except with an API key "or where we otherwise explicitly permit it"; the legal page forbids third parties to route
-  requests through plan credentials or handle Claude.ai tokens, and lets an end user sign in to the unmodified Claude
-  Code binary. A Claude Code team member (Feb 18, 2026): "We want to encourage local development and experimentation
-  with the Agent SDK and claude -p." Secondary: an Anthropic support reply relayed in another project's GitHub issue
-  says a third-party tool that runs the CLI on Pro/Max credentials "would not be permitted", scheduled runs included.
-  The Agent SDK reference tells an app that "runs prompts on its own schedule" how to declare each run
-  (`CLAUDE_CODE_HOST_SCHEDULED_RUN=1` and a `scheduled-trigger` origin): framing for the model, not a permission; Agon
-  doesn't use it yet.
-- OpenAI: the pricing page lists "Codex SDK, codex exec, and scriptable workflows" for Plus and Pro; the
-  [CI/CD page](https://learn.chatgpt.com/docs/auth/ci-cd-auth) says "The right way to authenticate automation is with
-  an API key" and calls running it as your Codex account "an advanced workflow for enterprise and other trusted
-  private automation" ("Do not use this workflow for public or open-source repositories", about runners that hold
-  `auth.json`). The [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid circumventing "any rate limits
-  or restrictions".
+*Policies* (read 2026-09-25; Anthropic's and OpenAI's pages again 2026-09-26)
+- Anthropic: the Consumer Terms forbid access "through automated or non-human means" except with an API key "or where
+  we otherwise explicitly permit it", and Claude Code's docs explicitly permit scripted and scheduled runs on a plan:
+  "For CI pipelines, scripts, or other environments where interactive browser login isn't available, generate a
+  one-year OAuth token with `claude setup-token`", which "authenticates with your Claude subscription"
+  ([Authentication](https://code.claude.com/docs/en/authentication)); the GitHub Action runs in automation mode on
+  any event, a cron schedule included, and "If you authenticate with an OAuth token, runs use your Claude
+  subscription instead of API billing" ([GitHub Actions](https://code.claude.com/docs/en/github-actions)). The
+  [legal page](https://code.claude.com/docs/en/legal-and-compliance) lets "an end user" sign in "to the unmodified
+  Claude Code binary with their own Claude subscription"; it forbids third parties to "route requests through Free,
+  Pro, or Max plan credentials on behalf of their users" and to "collect, store, or intermediate Claude.ai credentials
+  or session tokens", and says Pro and Max limits "assume ordinary, individual usage of Claude Code and the Agent
+  SDK". The Help Center (updated June 16, 2026) says `claude -p`, the Agent SDK and third-party apps "still draw from
+  your subscription's usage limits". (The research concluded that no vendor explicitly permits unattended runs on a
+  plan: it missed the authentication and GitHub Actions pages.) The Agent SDK reference documents how an app that
+  "runs prompts on its own schedule" declares each run (`CLAUDE_CODE_HOST_SCHEDULED_RUN=1`, a `scheduled-trigger`
+  origin); Agon doesn't, for now.
+- OpenAI: the pricing page lists "Codex SDK, codex exec, and scriptable workflows" for Plus and Pro, and OpenAI
+  documents running Codex as your own account in automation
+  ([Maintain Codex account auth in CI/CD](https://developers.openai.com/codex/auth/ci-cd-auth)): "an advanced workflow
+  for enterprise and other trusted private automation", while "The right way to authenticate automation is with an
+  API key" ("Do not use this workflow for public or open-source repositories", about runners that hold `auth.json`).
+  The [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid circumventing "any rate limits or
+  restrictions".
 - Google: the Antigravity FAQ and Additional Terms (item 6) call third-party software on an Antigravity login a
   violation that can end the account, and the FAQ recommends a Gemini Enterprise or AI Studio API key; agy's API-key
   mode (`"modelProvider": "gemini"`, `GEMINI_API_KEY`) never creates an account session. The terms stop applying only

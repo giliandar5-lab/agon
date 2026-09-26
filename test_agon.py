@@ -867,7 +867,8 @@ if prompt is None:
     prompt = sys.stdin.buffer.read().decode("utf-8")
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
-                          "asked_by": os.environ.get("AGON_ASKED_BY")}) + "\n")
+                          "asked_by": os.environ.get("AGON_ASKED_BY"),
+                          "inbox": sorted(k for k in os.environ if k.startswith("CLAUDE_CODE_MESSAGING_"))}) + "\n")
 if "EDIT " in prompt:  # a task's work: "EDIT notes.txt" writes that file where the app runs
     with open(prompt.split("EDIT ", 1)[1].split()[0].strip(",."), "w", encoding="utf-8") as f:
         f.write(f"written by {app}\n")
@@ -1472,7 +1473,8 @@ import json, os, subprocess, sys, time
 mode, args = sys.argv[1], sys.argv[2:]
 with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps({"app": "tests", "mode": mode, "args": args, "cwd": os.getcwd(), "stdin": sys.stdin.read(),
-                          "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_"))),
+                          "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_",
+                                                                                     "CLAUDE_CODE_MESSAGING_"))),
                           "files": sorted(os.listdir("."))}) + "\n")
 def beat():  # a child that keeps writing, to see whether it is stopped
     subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
@@ -1643,12 +1645,16 @@ def since(runs):  # which fakes ran after the first `runs`: tests, claude, codex
     return [run["app"] for run in fake_runs()[runs:]]
 
 
-checker = Agent("checker", env=with_tests("pass"))
+# The server runs in a Claude Code session, which gives it its inbox (a socket and a token): no program Agon starts gets
+# them, so neither the tests nor another company's app can post into the session
+checker = Agent("checker", env=with_tests("pass", CLAUDE_CODE_MESSAGING_SOCKET=str(Path(TMP, "no.sock")),
+                                          CLAUDE_CODE_MESSAGING_TOKEN="the-session's-token"))
 runs = len(fake_runs())
 res, text = asked(checker, agent="claude", prompt="Please review", cwd=str(project))
 tested, reviewed = fake_runs()[runs:]
 assert since(runs) == ["tests", "claude"] and Path(tested["cwd"]).resolve() == project.resolve(), fake_runs()[runs:]
 assert tested["settings"] == [] and tested["stdin"] == "", tested  # without Agon's settings, with stdin of its own
+assert reviewed["inbox"] == [] and reviewed["asked_by"] == "checker", reviewed
 assert "Test results, run by Agon: `" in reviewed["prompt"] and "passed (exit code 0)" in reviewed["prompt"]
 assert "\n    3 passed in 0.01s\n\nWhat checker asks:\nPlease review" in reviewed["prompt"], reviewed["prompt"]
 assert "Approve only if the tests Agon ran passed: tests that failed or didn't finish mean" in reviewed["prompt"]
@@ -2536,6 +2542,12 @@ def settings(**changes):  # environment variables for a while (None: unset), as 
                 os.environ[key] = value
 
 
+# The programs Agon starts (an app, the tests, git) never get the inbox of the Claude Code session its server runs in
+with settings(CLAUDE_CODE_MESSAGING_SOCKET="/tmp/x.sock", CLAUDE_CODE_MESSAGING_TOKEN="t", AGON_TEST_CMD="make"):
+    env = agon.environment(("AGON_",), AGON_ASKED_BY="claude")
+    assert not [k for k in env if k.startswith("CLAUDE_CODE_MESSAGING_")] and "AGON_TEST_CMD" not in env, env
+    assert env["AGON_ASKED_BY"] == "claude" and env["PATH"] == os.environ["PATH"]
+
 # Phase 5, triage: a message wakes the agent it is addressed to; one to all only the lead (AGON_WAKE_ON_BROADCAST: lead,
 # all or none); never its own message, nor an acknowledgment of under 40 characters (AGON_ACK_PATTERNS replaces them)
 rows = [(1, "human", "claude", "Fix the parser"), (2, "gpt", "claude", "ok"), (3, "gpt", "all", "Plan: the lexer first"),
@@ -3340,14 +3352,23 @@ for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)"
                    "`--max-budget-usd`", "`AGON_TURN_TIMEOUT`", "`AGON_UNSAFE=1`", "`AGON_AUTOPILOT`",
                    "`AGON_CLAUDE_MODEL`", "`AGON_GPT_EFFORT`", "`AGON_GEMINI_ARGS`", "`UserPromptSubmit`", "Ctrl+C",
                    "`AGON_EXTRA_USAGE=1`", "(https://openai.com/policies/row-terms-of-use/)", "Gemini Enterprise",
+                   # what the vendors' own pages say about scripted runs on your plan (the maintainer's decision)
+                   "(https://code.claude.com/docs/en/authentication)",
+                   "(https://code.claude.com/docs/en/github-actions)",
+                   "(https://code.claude.com/docs/en/legal-and-compliance)",
+                   "(https://developers.openai.com/codex/auth/ci-cd-auth)", "`claude setup-token`",
                    "`STOP`", "`runs`", "`AGON_GEMINI_PLAN=1`", "`GEMINI_API_KEY`", '`"modelProvider": "gemini"`',
                    '`"permissions": {"allow": ["mcp(agon/*)"]}`', "(`--resume <id>`)", "(`resume <id> -`)",
                    "(`--conversation <id>`)", *(f"`{' '.join(argv)}`" for argv in wake_lines.values())):
         assert needed in text, (readme, needed)
+    assert "No vendor's terms clearly" not in text and "явно не разрешают" not in text, readme
 assert "- [x] Phase 5 — Autopilot (Agon wakes the agents itself)" in roadmap and "Phase 5 additions" in roadmap
 for fact in ("CLAUDE_CODE_MESSAGING_SOCKET", "`claude_code_version`", "`--skip-git-repo-check`", "**no `-p`**",
              '["mcp(agon/*)"]', "30 MB RSS", "`modelUsage`", "`isUsingOverage`", "`CLAUDE_CODE_HOST_SCHEDULED_RUN=1`",
-             '"a Gemini Enterprise API Key"', "anthropics/claude-code#96163"):
+             '"a Gemini Enterprise API Key"', "anthropics/claude-code#96163",
+             "(https://code.claude.com/docs/en/authentication)", "(https://code.claude.com/docs/en/github-actions)",
+             "(https://code.claude.com/docs/en/legal-and-compliance)",
+             "(https://developers.openai.com/codex/auth/ci-cd-auth)"):
     assert fact in roadmap, fact
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):

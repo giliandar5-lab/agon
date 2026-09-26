@@ -13,11 +13,14 @@ pass: see **What the research changed** below, and ROADMAP's verified facts for 
    settings.json`, `GEMINI_API_KEY`); `AGON_GEMINI_PLAN=1` is the human's own opt-out. Only a Gemini Enterprise key
    takes the user out of Antigravity's terms (item 6 also bars "using the Service in connection with products not
    provided by us"): with an AI Studio key, the README leaves it to the user. Claude Code and Codex run on the user's
-   plan: Anthropic's Help Center says `claude -p` and third-party apps draw from the plan's limits; OpenAI lists
-   `codex exec` for Plus and Pro, but its docs say "The right way to authenticate automation is with an API key" and
-   call plan-login automation "an advanced workflow for enterprise and other trusted private automation". Anthropic's
-   Consumer Terms still forbid "automated or non-human means" unless "explicitly permitted": the README says so and
-   lets the user decide. *(Corrected after the final report: this said OpenAI's docs call plan-login `codex exec`
+   plan, with no flag. Anthropic's Consumer Terms except what Anthropic "otherwise explicitly permit[s]", and Claude
+   Code's docs permit scripted and scheduled runs on a plan (`claude setup-token` "For CI pipelines, scripts", the
+   GitHub Action on a schedule, where "runs use your Claude subscription"), with the unmodified binary and the user's
+   own sign-in (the legal page). OpenAI documents running Codex as your own account in "trusted private automation",
+   and recommends an API key. Agon never reads, copies or passes on a login, token or key; starting autopilot is the
+   human's opt-in, and the brakes' defaults keep the use individual. *(Corrected 2026-09-26, the maintainer's decision
+   from the vendors' pages: the final report said no vendor explicitly permits this, and missed Claude Code's
+   authentication and GitHub Actions pages. An earlier version also said OpenAI's docs call plan-login `codex exec`
    "supported"; they use the word only about refreshing the login.)*
 2. **No warm workers.** A new process that resumes a session sends the same request as a running one, byte for byte
    (claude 2.1.282 against a mock; codex keys its cache by the thread id; agy resends a byte-identical prefix), so the
@@ -67,8 +70,7 @@ logged. Opt-in only.
   third-party apps "still draw from your subscription's usage limits"; the separate Agent SDK credit is paused.
   Extracting OAuth tokens or calling vendor endpoints directly is forbidden by Anthropic and Google (not verified
   for OpenAI) — Agon only ever runs the official binaries. OpenAI recommends API keys for CI but does not forbid
-  `codex exec` on a ChatGPT plan; document this as "allowed today, at your own plan's limits". *(Too strong, see
-  change 1: no vendor's text clearly allows unattended runs on a consumer plan.)*
+  `codex exec` on a ChatGPT plan; document this as "allowed today, at your own plan's limits".
 - **Claude Code inbox socket.** Every interactive or `-p` session (not `--bare`) binds an inbox: Unix socket on
   macOS/Linux, named pipe `\\.\pipe\LOCAL\cc-msg-<hex>` on Windows. Hooks receive its path and token as
   `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`. "When the receiving session is idle, Claude
