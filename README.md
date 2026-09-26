@@ -13,11 +13,11 @@ while you watch and steer from a live arena in your browser.
 *Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
 each other better.*
 
-> **Status: early preview (v0.4).** Agon gives your agents a shared chat and a task board, and you a live arena.
+> **Status: early preview (v0.5).** Agon gives your agents a shared chat and a task board, and you a live arena.
 > Agents wake up on their own, install with one command, and ask each other for a second opinion across vendors, with
 > a verdict that rests on your tests, which Agon runs itself. When one agent hits its usage limit, its tasks go to the
-> others. Coming next: Agon waking the agents itself, and duels that show which AI is best on *your* code. See
-> [ROADMAP.md](ROADMAP.md).
+> others. With autopilot on, Agon wakes the agents itself, with no app open. Coming next: duels that show which AI is
+> best on *your* code. See [ROADMAP.md](ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
@@ -31,7 +31,8 @@ Antigravity (gemini) ─┘
   on Windows, macOS and Linux.
 - **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
   55 s; `board` is the team's task board; `ask` gets a second opinion from another company's agent.
-- **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages.
+- **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages; with
+  [autopilot](#autopilot-python-agonpy-autopilot), Agon wakes them even with no app open.
 - **No downtime:** when an agent hits its usage limit, its tasks go back to the board for the others.
 - **Live arena:** follow every message and give the team tasks at http://127.0.0.1:8765.
 
@@ -305,6 +306,85 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
   that can edit the tests decides what they do. Keep that in mind before you let Codex run `ask` without asking. The
   board's `done` runs it without asking in every app (see [Task board](#task-board-board)).
 
+## Autopilot (`python agon.py autopilot`)
+
+With autopilot running, the team keeps working while no app is open: when a message comes for an agent, Agon wakes
+that agent through its app's official command-line tool, on your own plan. It runs only while you run it.
+
+```
+cd your-project
+python agon.py autopilot                                  # wakes claude, gpt and gemini; claude leads
+python agon.py autopilot --agents claude,gpt --lead gpt   # or AGON_LEAD, and --project (AGON_PROJECT) for the folder
+python agon.py stats                                      # what the wakes took
+```
+
+- **Who wakes, with no model involved:** a message to an agent wakes that agent. A message to `all` wakes only the lead
+  (`--lead` or `AGON_LEAD`; by default the first of `--agents`), who addresses the others by name
+  (`AGON_WAKE_ON_BROADCAST`: `lead`, the default, `all` or `none`); when the lead can't be woken, the next agent leads.
+  Acknowledgments of under 40 characters ("ok", "thanks", "got it", 👍...) and your `STOP` wake nobody
+  (`AGON_ACK_PATTERNS`, a JSON list of regular expressions, replaces the list); they come along with the agent's next
+  wake. Autopilot waits 5 seconds (`AGON_DEBOUNCE_SECONDS`) and wakes an agent once for everything that came meanwhile.
+- **How:** for one turn, in your project folder (`--project` or `AGON_PROJECT`; by default the folder autopilot starts
+  in), resuming the agent's own session by its id (never your latest session), with the new messages, the agent's tasks
+  and one line of rules on stdin:
+
+  | Agent | Command (then the session to resume) |
+  |---|---|
+  | claude | `claude -p --input-format stream-json --output-format stream-json --verbose --permission-mode acceptEdits --permission-prompts none --allowedTools=mcp__agon,mcp__plugin_agon_agon --max-turns 30` (`--resume <id>`) |
+  | gpt | `codex exec --json --skip-git-repo-check -s workspace-write` (`resume <id> -`) |
+  | gemini | `agy --input-format stream-json --output-format stream-json --disable-slash-commands --mode accept-edits` (`--conversation <id>`) |
+
+  No app stays running between wakes: a resumed session sends the vendor what a running app would, so the prompt cache
+  still serves it, and an app starts in about half a second. Each takes 150-250 MB while it runs, and at most
+  `AGON_MAX_WORKERS` (3) run at once. The program is the one in `AGON_CMD_*` (see [Second
+  opinion](#second-opinion-ask)); `AGON_CLAUDE_MODEL`, `AGON_GPT_MODEL`, `AGON_GEMINI_MODEL` and `AGON_CLAUDE_EFFORT`,
+  `AGON_GPT_EFFORT`, `AGON_GEMINI_EFFORT` pick a model and an effort, and `AGON_CLAUDE_ARGS`, `AGON_GPT_ARGS`,
+  `AGON_GEMINI_ARGS` add arguments. A cheap model suits reviews of small diffs and reports.
+- **Your open apps come first:** while an agent's app is open, autopilot starts no second session of that agent. An
+  idle Claude Code session takes its messages from its inbox (Claude Code's cross-session messaging, 2.1.224+, on
+  Windows 2.1.234+): Agon's MCP server in that session posts them as its next prompt, and its `UserPromptSubmit` hook
+  marks them read. A working session gets them from its Stop hook when its turn ends, and so do Codex and
+  Antigravity: the arena says once that autopilot leaves the agent to its app.
+- **Fresh sessions:** a session starts anew after 30 turns (`AGON_ROTATE_TURNS`), a context of 120,000 tokens
+  (`AGON_ROTATE_TOKENS`) or 24 hours (`AGON_ROTATE_HOURS`), or when it sat idle for an hour, past the prompt cache's
+  life, with a context of 30,000 tokens or more. The new session starts with a recap: the last 20 messages the agent
+  knew, the board and its last report. With `AGON_HANDOFF_NOTE=1` the old session first writes a hand-off for it (one
+  more turn).
+- **Brakes:** at most `AGON_MAX_WAKES_PER_HOUR` (12) wakes of one agent an hour, and 25 automatic turns in a row
+  without a message from you (`AGON_MAX_AUTORUNS`, as for the hooks). `AGON_DAILY_USD` caps what Claude Code
+  estimates one agent spent since midnight (and goes to `--max-budget-usd`), `AGON_DAILY_TOKENS` the tokens of each
+  agent (uncached input and output); both are off until you set them. A turn takes at most `AGON_TURN_TIMEOUT` seconds
+  (900): then Agon interrupts it, and 20 seconds later ends the app and everything it started. An agent that hits a
+  brake rests, and the arena says why and until when. A crashed app rests a minute, twice as long after each crash in a
+  row, 30 minutes at most. A usage limit marks the agent out of quota until the reset time it printed, gives its tasks
+  to the others and wakes the lead.
+- **Permissions:** Claude may edit files and run the commands your settings allow, and anything that would ask is
+  denied; Codex works in its `workspace-write` sandbox; agy in its `accept-edits` mode. `AGON_UNSAFE=1` gives all three
+  every permission (`bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`,
+  `--dangerously-skip-permissions`): only on a machine you can throw away. A hand-made Codex setup must pass
+  `AGON_AUTOPILOT` to Agon (`env_vars`: `setup` prints the line).
+- **Stop it:** `STOP` in the arena pauses the team: autopilot interrupts running turns at once and wakes nobody until
+  your next message. Ctrl+C (or SIGTERM) ends autopilot; the turns it runs are interrupted and recorded. One autopilot
+  runs at a time.
+- **Accounting:** every wake is a row in `agon.db` (`runs`): what woke the agent, its session, how the turn ended, the
+  tokens its app reported and, for Claude Code, its own cost estimate (at API prices, not what your plan charges).
+  `python agon.py stats` sums them up per agent and per completed task.
+
+**Your own subscriptions at your own limits; official CLIs only.** Autopilot runs the vendors' own apps, logged in as
+you: it never reads, copies or relays your login, and never retries around a usage limit. What the vendors say:
+
+- **Claude Code:** Anthropic's Help Center says `claude -p` and third-party apps draw from your plan's usage limits,
+  and a Claude Code team member wrote that Anthropic wants "to encourage local development and experimentation with
+  the Agent SDK and claude -p". Anthropic's Consumer Terms still forbid access "through automated or non-human means"
+  except with an API key "or where we otherwise explicitly permit it": decide for yourself, or use an API key.
+- **Codex:** OpenAI's docs call `codex exec` on a ChatGPT plan supported for trusted private automation, with an API key
+  the recommended default; its terms forbid circumventing rate limits.
+- **Antigravity:** Google's terms forbid third-party software on an Antigravity (Google) login, and its FAQ recommends
+  an API key. So Agon runs agy (autopilot, `ask`, the automatic review) only in agy's API-key mode: put
+  `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and set `GEMINI_API_KEY`.
+  `AGON_GEMINI_PLAN=1` runs it on your Google login at your own risk. Add `"permissions": {"allow": ["mcp(agon/*)"]}`
+  there too: headless, agy refuses a tool it would ask about.
+
 ## How it works
 
 - Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db`, with the chat and the board
@@ -321,10 +401,16 @@ Agon runs your tests itself, so that every verdict rests on what they printed, n
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
   instructions to your agents.
 
-## Limitations (v0.4)
+## Limitations (v0.5)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
-  for a channel). Claude Code also ends a chain of automatic turns after 8 continuations in a row.
+  for a channel), unless autopilot runs. Claude Code also ends a chain of automatic turns after 8 continuations in a
+  row.
+- Autopilot wakes an agent whose app is open only in Claude Code (through its inbox); an open Codex or Antigravity
+  waits for its Stop hook, or for you. Claude Code's cost estimate is at API prices, and no app reports what a turn
+  took of a plan's limits, so the daily caps are estimates. A woken Codex can't call `ask`, which asks for approval,
+  unless you allow it (see [Second opinion](#second-opinion-ask)). Windows gets no SIGINT to end a Codex or agy turn:
+  Agon ends the app instead (the session survives).
 - Codex runs the hooks only after you trust them, and doesn't tell hooks about usage limits: its tasks go back to the
   board after `AGON_LEASE`.
 - Each agent runs on its own app's plan and usage limits; an `ask` spends the plan of the agent it asks.

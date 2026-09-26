@@ -3190,7 +3190,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.4)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.5)"):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -3235,7 +3235,7 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
                    "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
-                   "`mcp(agon/*)`", "(v0.4)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   "`mcp(agon/*)`", "(v0.5)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
                    ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
                    '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
                    ' gpt", "timeout": 10 }] }]'):
@@ -3245,6 +3245,33 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
 assert "- [x] Phase 4 — Task board (no downtime)" in roadmap and "Codex app" not in roadmap
 assert "`board(action, ...)`" in roadmap and "`AGON_LEASE` seconds (7200)" in roadmap
+# Phase 5: both READMEs explain autopilot: how to start it, who wakes, the commands it runs (as the code has them), open
+# apps, fresh sessions, the brakes, permissions, how to stop it, the accounting, and the vendors' rules; the roadmap has
+# the phase ticked and the facts recorded
+wake_lines = {"claude": ["claude", *agon.WAKE_COMMANDS["claude"], *agon.WAKE_PERMISSIONS["claude"][0], agon.AGON_TOOLS,
+                         "--max-turns", str(agon.MAX_TURNS)],
+              "gpt": ["codex", *agon.WAKE_COMMANDS["gpt"], *agon.WAKE_PERMISSIONS["gpt"][0]],
+              "gemini": ["agy", *agon.WAKE_COMMANDS["gemini"], *agon.WAKE_PERMISSIONS["gemini"][0]]}
+for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)", "#autopilot-python-agonpy-autopilot",
+                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.5)")),
+                      ("README.ru.md", ("## Автопилот (`python agon.py autopilot`)",
+                                        "#автопилот-python-agonpy-autopilot",
+                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.5)"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in (*words, "`python agon.py stats`", "--agents claude,gpt --lead gpt", "`AGON_LEAD`", "`AGON_PROJECT`",
+                   "`AGON_WAKE_ON_BROADCAST`", "`AGON_ACK_PATTERNS`", "`AGON_DEBOUNCE_SECONDS`", "`AGON_MAX_WORKERS`",
+                   "`AGON_ROTATE_TURNS`", "`AGON_ROTATE_TOKENS`", "`AGON_ROTATE_HOURS`", "`AGON_HANDOFF_NOTE=1`",
+                   "`AGON_MAX_WAKES_PER_HOUR`", "`AGON_MAX_AUTORUNS`", "`AGON_DAILY_USD`", "`AGON_DAILY_TOKENS`",
+                   "`--max-budget-usd`", "`AGON_TURN_TIMEOUT`", "`AGON_UNSAFE=1`", "`AGON_AUTOPILOT`",
+                   "`AGON_CLAUDE_MODEL`", "`AGON_GPT_EFFORT`", "`AGON_GEMINI_ARGS`", "`UserPromptSubmit`", "Ctrl+C",
+                   "`STOP`", "`runs`", "`AGON_GEMINI_PLAN=1`", "`GEMINI_API_KEY`", '`"modelProvider": "gemini"`',
+                   '`"permissions": {"allow": ["mcp(agon/*)"]}`', "(`--resume <id>`)", "(`resume <id> -`)",
+                   "(`--conversation <id>`)", *(f"`{' '.join(argv)}`" for argv in wake_lines.values())):
+        assert needed in text, (readme, needed)
+assert "- [x] Phase 5 — Autopilot (Agon wakes the agents itself)" in roadmap and "Phase 5 additions" in roadmap
+for fact in ("CLAUDE_CODE_MESSAGING_SOCKET", "`claude_code_version`", "`--skip-git-repo-check`", "**no `-p`**",
+             '["mcp(agon/*)"]', "30 MB RSS"):
+    assert fact in roadmap, fact
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
