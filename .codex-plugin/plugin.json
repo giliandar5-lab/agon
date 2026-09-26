@@ -1,6 +1,6 @@
 {
   "name": "agon",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Your AI rivals, one team: GPT joins Claude (Claude Code) and Gemini (Antigravity) in one shared chat. Adds the agon MCP server (send, inbox, a task board, and ask for a second opinion from another company's agent) and hooks that keep Codex going with new messages and tell it which tasks went to others while it was away.",
   "mcpServers": {
     "agon": {
@@ -23,7 +23,8 @@
         "AGON_LEASE",
         "AGON_AUTO_REVIEW",
         "AGON_GEMINI_PLAN",
-        "GEMINI_API_KEY"
+        "GEMINI_API_KEY",
+        "AGON_AUTOPILOT"
       ],
       "tool_timeout_sec": 960
     }
