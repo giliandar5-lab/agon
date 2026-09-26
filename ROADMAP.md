@@ -253,9 +253,11 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
 - Research first, before coding: the inbox-socket wire format on Windows and Linux, exact limit errors of each
   CLI, memory and latency measurements, and cache lifetimes; record the results in this file.
 - Done in v0.5.0, with what the research changed (docs/autopilot.md, "What the research changed"): no warm workers
-  (a cold resume is byte-identical, so the prompt cache serves it); agy runs only in its API-key mode; the inbox socket
-  only for an idle Claude Code session, posted by its own Agon server when autopilot asks; `AGON_MAX_WORKERS` 3; a
-  session idle past the cache's life with a large context starts anew. Measured facts: see Phase 5 additions below.
+  (a cold resume sends the same request, so the prompt cache should serve it); agy runs only in its API-key mode; the
+  inbox socket only for an idle Claude Code session, posted by its own Agon server when autopilot asks;
+  `AGON_MAX_WORKERS` 3; a session idle past the cache's life with a large context starts anew; Claude Code's tokens
+  from `modelUsage`, a run's share from the highest totals seen, and claude rests on extra usage
+  (`AGON_EXTRA_USAGE=1`). Measured facts: see Phase 5 additions below.
 
 ## Phase 6 — The arena
 
@@ -546,7 +548,8 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   `/tmp/cc-socks-<uid>/<pid>.sock` (folder 0700; `system/init` shows `messaging_socket_path`); on Windows a named pipe
   ([docs](https://code.claude.com/docs/en/cross-session-messaging): v2.1.224+, Windows v2.1.234+). Hooks (not
   SessionEnd), the Bash tool and **MCP servers** get `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`,
-  `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR`.
+  `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PROJECT_DIR` (MCP servers as seen here: the docs name only hooks and the Bash
+  tool).
 - Wire format: newline-terminated JSON, `{"type":"auth","token":"…"}` then
   `{"type":"user","message":{"role":"user","content":"…"},"priority":"next"}`. No reply. Linux and macOS know the
   session's own children by the process (the auth line is optional for them); on Windows the token is the proof.
@@ -556,15 +559,21 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   Delivered messages count toward usage like typed ones; repeats are throttled, at most 50 queue.
 - stream-json: input `{"type":"user","message":{"role":"user","content":"…"}}`, one turn per line; each turn prints
   `system/init` (with `claude_code_version`), `assistant` events (`message.usage`: the context of that call) and a
-  `result` whose `usage` sums the turn's calls, `total_cost_usd` the process's running total (since 2.1.277 with a
-  resumed session's earlier spend, restored from the transcript on a normal exit;
+  `result` whose `usage` sums the turn's calls (the main loop's, without subagents), `total_cost_usd` and `modelUsage`
+  (tokens per model, subagents included) the process's running totals (since 2.1.277 with a resumed session's
+  earlier spend, restored from the transcript on a normal exit, which a kill skips; a crash result may carry them
+  zeroed; "Do not bill end users or trigger financial decisions from these fields":
   [docs](https://code.claude.com/docs/en/agent-sdk/cost-tracking)), `num_turns`, `permission_denials`,
   `terminal_reason`. `{"type":"control_request","request_id":"…","request":{"subtype":"interrupt"}}` on stdin ends
   the turn with a result, and the process stays. SIGINT exits 0 with no
   result, SIGTERM 143; every case resumes. `claude -p` with stdin left open waits 3 s for it.
-- **A cold `--resume` is warm:** the request of `-p --resume <id>` in a new process equals the next request of a
-  running stream-json process (same system, tools, messages and cache marks), so the prompt cache serves both; a plan's
-  main conversation, `-p` included, gets a 1-hour cache TTL ([docs](https://code.claude.com/docs/en/prompt-caching)).
+- **A cold `--resume` sends what a warm process would:** the request of `-p --resume <id>` in a new process equals the
+  next request of a running stream-json process (same system, tools, messages and cache marks), so the prompt cache
+  should serve both. Not measured on the live API; one user's unverified report
+  ([anthropics/claude-code#96163](https://github.com/anthropics/claude-code/issues/96163)) says print mode rewrites
+  ~25k tokens every turn on some models, warm or cold alike. A plan's main conversation, `-p` included, gets a 1-hour
+  cache TTL, 5 minutes on usage credits (extra usage) or an API key
+  ([docs](https://code.claude.com/docs/en/prompt-caching)); Codex's and Gemini's weren't found.
   Start → first request 0.54 s, a trivial turn 0.66 s, peak RSS 238 MB; a stream-json process 202-250 MB.
 - `-p` denies MCP tools in every permission mode (`default`, `acceptEdits`, `auto`, `dontAsk`, `plan`) unless
   `--allowedTools` names them (`mcp__agon`, or `mcp__plugin_agon_agon` for the plugin's server). `acceptEdits` writes
@@ -574,7 +583,10 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   login. SessionStart, UserPromptSubmit, Stop and SessionEnd hooks run in `-p`.
 - A rejected 429 (`anthropic-ratelimit-unified-status: rejected`) is not retried; the stream-json process exits 1. A
   plan's limit comes as `rate_limit_event` with `rate_limit_info.status: "rejected"` and `resetsAt`
-  ([SDK types](https://code.claude.com/docs/en/agent-sdk/typescript)).
+  ([SDK types](https://code.claude.com/docs/en/agent-sdk/typescript); `errorCode: "credits_required"` when the included
+  usage is gone and no credits are left). Live events also carry `rateLimitType` and `isUsingOverage`, which the types
+  don't list: past the limit, a user with extra usage is billed instead of rejected (and the cache TTL drops to 5
+  minutes).
 
 *Codex 0.157.0* (npm; source at `rust-v0.157.0`; a mock Responses API provider)
 - `codex exec --json -s workspace-write [-m M] [-c model_reasoning_effort=E] [resume <id>] -`: the prompt on stdin
@@ -616,13 +628,22 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   except with an API key "or where we otherwise explicitly permit it"; the legal page forbids third parties to route
   requests through plan credentials or handle Claude.ai tokens, and lets an end user sign in to the unmodified Claude
   Code binary. A Claude Code team member (Feb 18, 2026): "We want to encourage local development and experimentation
-  with the Agent SDK and claude -p."
-- OpenAI: the docs call `codex exec` on a ChatGPT login supported for trusted private automation (an "advanced" path;
-  API keys are the recommended default); the pricing page lists `codex exec` for Plus and Pro. The Terms forbid
-  circumventing rate limits.
+  with the Agent SDK and claude -p." Secondary: an Anthropic support reply relayed in another project's GitHub issue
+  says a third-party tool that runs the CLI on Pro/Max credentials "would not be permitted", scheduled runs included.
+  The Agent SDK reference tells an app that "runs prompts on its own schedule" how to declare each run
+  (`CLAUDE_CODE_HOST_SCHEDULED_RUN=1` and a `scheduled-trigger` origin): framing for the model, not a permission; Agon
+  doesn't use it yet.
+- OpenAI: the pricing page lists "Codex SDK, codex exec, and scriptable workflows" for Plus and Pro; the
+  [CI/CD page](https://learn.chatgpt.com/docs/auth/ci-cd-auth) says "The right way to authenticate automation is with
+  an API key" and calls running it as your Codex account "an advanced workflow for enterprise and other trusted
+  private automation" ("Do not use this workflow for public or open-source repositories", about runners that hold
+  `auth.json`). The [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid circumventing "any rate limits
+  or restrictions".
 - Google: the Antigravity FAQ and Additional Terms (item 6) call third-party software on an Antigravity login a
-  violation that can end the account, and recommend a Gemini Enterprise or AI Studio API key; agy's API-key mode
-  (`"modelProvider": "gemini"`, `GEMINI_API_KEY`) never creates an account session.
+  violation that can end the account, and the FAQ recommends a Gemini Enterprise or AI Studio API key; agy's API-key
+  mode (`"modelProvider": "gemini"`, `GEMINI_API_KEY`) never creates an account session. The terms stop applying only
+  with "a Gemini Enterprise API Key" (or an Enterprise or Workspace account), and item 6 also bars "using the Service
+  in connection with products not provided by us".
 
 *Agon's autopilot* (Linux, Python 3.11): idle 30 MB RSS and ~0.1% of a core (it polls `PRAGMA data_version` every
 0.2 s).

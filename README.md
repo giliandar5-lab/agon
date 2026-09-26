@@ -334,30 +334,33 @@ python agon.py stats                                      # what the wakes took
   | gpt | `codex exec --json --skip-git-repo-check -s workspace-write` (`resume <id> -`) |
   | gemini | `agy --input-format stream-json --output-format stream-json --disable-slash-commands --mode accept-edits` (`--conversation <id>`) |
 
-  No app stays running between wakes: a resumed session sends the vendor what a running app would, so the prompt cache
-  still serves it, and an app starts in about half a second. Each takes 150-250 MB while it runs, and at most
-  `AGON_MAX_WORKERS` (3) run at once. The program is the one in `AGON_CMD_*` (see [Second
-  opinion](#second-opinion-ask)); `AGON_CLAUDE_MODEL`, `AGON_GPT_MODEL`, `AGON_GEMINI_MODEL` and `AGON_CLAUDE_EFFORT`,
-  `AGON_GPT_EFFORT`, `AGON_GEMINI_EFFORT` pick a model and an effort, and `AGON_CLAUDE_ARGS`, `AGON_GPT_ARGS`,
-  `AGON_GEMINI_ARGS` add arguments. A cheap model suits reviews of small diffs and reports.
+  No app stays running between wakes: a resumed session sends the vendor what a running app would (checked against a
+  mock of each API), so the prompt cache should serve it (not measured on the live APIs), and an app starts in about
+  half a second. Each takes 150-250 MB while it runs, and at most `AGON_MAX_WORKERS` (3) run at once. The program is
+  the one in `AGON_CMD_*` (see [Second opinion](#second-opinion-ask)); `AGON_CLAUDE_MODEL`, `AGON_GPT_MODEL`,
+  `AGON_GEMINI_MODEL` and `AGON_CLAUDE_EFFORT`, `AGON_GPT_EFFORT`, `AGON_GEMINI_EFFORT` pick a model and an effort,
+  and `AGON_CLAUDE_ARGS`, `AGON_GPT_ARGS`, `AGON_GEMINI_ARGS` add arguments. A cheap model suits reviews of small
+  diffs and reports.
 - **Your open apps come first:** while an agent's app is open, autopilot starts no second session of that agent. An
   idle Claude Code session takes its messages from its inbox (Claude Code's cross-session messaging, 2.1.224+, on
   Windows 2.1.234+): Agon's MCP server in that session posts them as its next prompt, and its `UserPromptSubmit` hook
   marks them read. A working session gets them from its Stop hook when its turn ends, and so do Codex and
   Antigravity: the arena says once that autopilot leaves the agent to its app.
 - **Fresh sessions:** a session starts anew after 30 turns (`AGON_ROTATE_TURNS`), a context of 120,000 tokens
-  (`AGON_ROTATE_TOKENS`) or 24 hours (`AGON_ROTATE_HOURS`), or when it sat idle for an hour, past the prompt cache's
-  life, with a context of 30,000 tokens or more. The new session starts with a recap: the last 20 messages the agent
-  knew, the board and its last report. With `AGON_HANDOFF_NOTE=1` the old session first writes a hand-off for it (one
-  more turn).
+  (`AGON_ROTATE_TOKENS`) or 24 hours (`AGON_ROTATE_HOURS`), or when it sat idle for an hour (as long as Claude Code's
+  prompt cache lives on a plan) with a context of 30,000 tokens or more. The new session starts with a recap: the last
+  20 messages the agent knew, the board and its last report. With `AGON_HANDOFF_NOTE=1` the old session first writes a
+  hand-off for it (one more turn).
 - **Brakes:** at most `AGON_MAX_WAKES_PER_HOUR` (12) wakes of one agent an hour, and 25 automatic turns in a row
   without a message from you (`AGON_MAX_AUTORUNS`, as for the hooks). `AGON_DAILY_USD` caps what Claude Code
   estimates one agent spent since midnight (and goes to `--max-budget-usd`), `AGON_DAILY_TOKENS` the tokens of each
-  agent (uncached input and output); both are off until you set them. A turn takes at most `AGON_TURN_TIMEOUT` seconds
-  (900): then Agon interrupts it, and 20 seconds later ends the app and everything it started. An agent that hits a
-  brake rests, and the arena says why and until when. A crashed app rests a minute, twice as long after each crash in a
-  row, 30 minutes at most. A usage limit marks the agent out of quota until the reset time it printed, gives its tasks
-  to the others and wakes the lead.
+  agent (uncached input and output); both are off until you set them (with agy on a paid API key, set
+  `AGON_DAILY_TOKENS`). A turn takes at most `AGON_TURN_TIMEOUT` seconds (900): then Agon interrupts it, and 20 seconds
+  later ends the app and everything it started. An agent that hits a brake rests, and the arena says why and until
+  when. A crashed app rests a minute, twice as long after each crash in a row, 30 minutes at most. A usage limit marks
+  the agent out of quota until the reset time it printed, gives its tasks to the others and wakes the lead. Past its
+  plan's limit, Claude Code goes on at your extra usage, which you pay for: then claude rests until the limit resets
+  (`AGON_EXTRA_USAGE=1` lets it go on).
 - **Permissions:** Claude may edit files and run the commands your settings allow, and anything that would ask is
   denied; Codex works in its `workspace-write` sandbox; agy in its `accept-edits` mode. `AGON_UNSAFE=1` gives all three
   every permission (`bypassPermissions`, `--dangerously-bypass-approvals-and-sandbox`,
@@ -367,21 +370,29 @@ python agon.py stats                                      # what the wakes took
   your next message. Ctrl+C (or SIGTERM) ends autopilot; the turns it runs are interrupted and recorded. One autopilot
   runs at a time.
 - **Accounting:** every wake is a row in `agon.db` (`runs`): what woke the agent, its session, how the turn ended, the
-  tokens its app reported and, for Claude Code, its own cost estimate (at API prices, not what your plan charges).
-  `python agon.py stats` sums them up per agent and per completed task.
+  tokens its app reported (Claude Code's with its subagents') and, for Claude Code, its own cost estimate (at API
+  prices, not what your plan charges; Anthropic says not to base financial decisions on it). If Agon has to kill
+  Claude Code (it ignored the interrupt), that turn's spend goes uncounted: Claude Code saves its totals only when it
+  exits normally. `python agon.py stats` sums them up per agent and per completed task.
 
 **Your own subscriptions at your own limits; official CLIs only.** Autopilot runs the vendors' own apps, logged in as
-you: it never reads, copies or relays your login, and never retries around a usage limit. What the vendors say:
+you: it never reads, copies or relays your login, and never retries around a usage limit. No vendor's terms clearly
+allow unattended runs on a consumer plan; an API key is clearly allowed. What the vendors say:
 
 - **Claude Code:** Anthropic's Help Center says `claude -p` and third-party apps draw from your plan's usage limits,
   and a Claude Code team member wrote that Anthropic wants "to encourage local development and experimentation with
   the Agent SDK and claude -p". Anthropic's Consumer Terms still forbid access "through automated or non-human means"
   except with an API key "or where we otherwise explicitly permit it": decide for yourself, or use an API key.
-- **Codex:** OpenAI's docs call `codex exec` on a ChatGPT plan supported for trusted private automation, with an API key
-  the recommended default; its terms forbid circumventing rate limits.
+- **Codex:** OpenAI lists `codex exec` and scriptable workflows for Plus and Pro, but its docs say "The right way to
+  authenticate automation is with an API key" and call automation on a ChatGPT login "an advanced workflow for
+  enterprise and other trusted private automation" (not for public or open-source repositories: the page is about CI
+  runners that hold your login). Its [Terms of Use](https://openai.com/policies/row-terms-of-use/) forbid
+  circumventing rate limits.
 - **Antigravity:** Google's terms forbid third-party software on an Antigravity (Google) login, and its FAQ recommends
-  an API key. So Agon runs agy (autopilot, `ask`, the automatic review) only in agy's API-key mode: put
-  `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and set `GEMINI_API_KEY`.
+  a Gemini Enterprise or AI Studio API key for third-party agents. So Agon runs agy (autopilot, `ask`, the automatic
+  review) only in agy's API-key mode: put `"modelProvider": "gemini"` in `~/.gemini/antigravity-cli/settings.json` and
+  set `GEMINI_API_KEY`. Only a Gemini Enterprise key takes you out of Antigravity's terms, which also bar using the
+  service "in connection with products not provided by us": with an AI Studio key, decide for yourself.
   `AGON_GEMINI_PLAN=1` runs it on your Google login at your own risk. Add `"permissions": {"allow": ["mcp(agon/*)"]}`
   there too: headless, agy refuses a tool it would ask about.
 

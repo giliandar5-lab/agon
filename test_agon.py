@@ -802,7 +802,8 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
                    "  " + agon.command_line([sys.executable, script, "autopilot", "--agents", "claude,gpt,gemini",
                                              "--lead", "claude"]) + "\n",
                    "AGON_MAX_WAKES_PER_HOUR (12) wakes of an agent an hour", "AGON_MAX_WORKERS (3) apps at once",
-                   "AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them.",
+                   "AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them. Past its plan's"
+                   " limit, claude rests rather than bill your extra usage (AGON_EXTRA_USAGE=1 lets it go on).",
                    f"Merge this into {setup_home.joinpath(*agon.GEMINI_SETTINGS)}:",
                    "Now: agy won't run (AGON_GEMINI_PLAN=1 runs it on your Google login, at your own risk)."):
         assert needed in out, (needed, out)
@@ -2340,8 +2341,9 @@ FAKE_WAKE.write_text(r'''"""A fake Claude Code, Codex or agy for autopilot: pyth
 It takes a turn the way its app does (Claude Code and agy: one stream-json line, and its stdin stays open; Codex: all of
 stdin), writes down what it got, keeps each session's running totals in a file (the apps restore them on resume), and
 acts on words in the new messages: @SEND name:text| sends a message as the agent, @HANG waits to be stopped, @SLOW takes
-a second, @CRASH fails, @LIMIT hits a usage limit, @DENIED is agy refusing Agon's tools, @BUSY runs a turn that asks for
-Agon's tools and doesn't get them (Claude Code)."""
+a second, @CRASH fails, @LIMIT hits a usage limit, @DENIED is agy refusing Agon's tools; Claude Code only: @BUSY runs a
+turn that asks for Agon's tools and doesn't get them, @ZERO crashes with its totals zeroed, @EXTRA goes past the plan's
+limit on extra usage."""
 import json, os, signal, subprocess, sys, time, uuid
 sys.path.insert(0, os.environ["FAKE_AGON"])
 import agon
@@ -2358,13 +2360,19 @@ def value(flag):
     return args[args.index(flag) + 1] if flag in args else None
 
 
+def model_usage(zero=False):  # Claude Code's running totals per model, like its cost, with its subagents'
+    return {model: dict(zip(("inputTokens", "cacheCreationInputTokens", "cacheReadInputTokens", "outputTokens"),
+                            [0] * 4 if zero else counts)) for model, counts in state["models"].items()}
+
+
 def rest():  # Claude Code and agy take more lines until their stdin closes; an interrupt ends Claude Code's turn
     for raw in sys.stdin.buffer:
         request = json.loads(raw)
         if request.get("type") == "control_request":
             say({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}})
             say({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid,
-                 "terminal_reason": "aborted_streaming", "usage": {}, "total_cost_usd": state["usd"], "num_turns": 1})
+                 "terminal_reason": "aborted_streaming", "usage": {}, "total_cost_usd": state["usd"],
+                 "modelUsage": model_usage(), "num_turns": 1})
 
 
 def hang():  # waits to be stopped, with a child that keeps writing (the whole process tree must go)
@@ -2408,7 +2416,7 @@ if os.path.exists(path):
     with open(path, encoding="utf-8") as f:
         state = json.load(f)
 else:
-    state = {"turns": 0, "in": 0, "cached": 0, "out": 0, "usd": 0.0}
+    state = {"turns": 0, "in": 0, "cached": 0, "out": 0, "usd": 0.0, "models": {}}
 save()
 new = prompt.rsplit("New messages from your Agon team:", 1)[-1]  # not the recap of a new session
 if "@CRASH" in new:
@@ -2428,7 +2436,7 @@ if app == "claude":
                                                              "resetsAt": int(time.time()) + 7200}})
         say({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429, "session_id": sid,
              "result": "You've hit your limit · resets 3pm (Europe/Berlin)", "usage": {},
-             "total_cost_usd": state["usd"]})
+             "total_cost_usd": state["usd"], "modelUsage": model_usage()})
         rest()
         sys.exit(1)
     usage = {"input_tokens": 100, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 1000,
@@ -2437,11 +2445,21 @@ if app == "claude":
     if "@HANG" in new:  # it waits for the interrupt on stdin
         rest()
         sys.exit(0)
-    state["usd"] = round(state["usd"] + 0.05, 4)  # a session's running total: Claude Code restores it on resume
+    if "@ZERO" in new:  # a crash: its result may carry zeroed totals (Claude Code's docs), and it saves none
+        say({"type": "result", "subtype": "error_during_execution", "is_error": True, "session_id": sid, "usage": {},
+             "total_cost_usd": 0, "modelUsage": model_usage(zero=True), "num_turns": 1})
+        sys.exit(1)
+    if "@EXTRA" in new:  # past the plan's limit, on the human's extra usage: the turn goes on
+        say({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "rejected", "resetsAt": int(time.time()) + 3600, "rateLimitType": "five_hour",
+            "overageStatus": "allowed", "isUsingOverage": True}})
+    state["usd"] = round(state["usd"] + 0.05, 4)  # a session's running totals: Claude Code restores them on resume
+    for model, turn in (("model-a", (100, 50, 1000, 20)), ("model-b", (30, 0, 200, 10))):  # the main loop, a subagent
+        state["models"][model] = [a + b for a, b in zip(state["models"].get(model, [0] * 4), turn)]
     save()
     denied = [{"tool_name": "mcp__agon__send", "tool_use_id": "t1", "tool_input": {}}] if "@BUSY" in new else []
     say({"type": "result", "subtype": "success", "is_error": False, "result": answer, "session_id": sid, "usage": usage,
-         "total_cost_usd": state["usd"], "num_turns": 1, "permission_denials": denied})
+         "total_cost_usd": state["usd"], "modelUsage": model_usage(), "num_turns": 1, "permission_denials": denied})
     rest()
 elif app == "codex":
     say({"type": "thread.started", "thread_id": sid})
@@ -2602,8 +2620,9 @@ with settings(AGON_CMD_GPT='["no-such-codex-7"]'):
                           " full command (`python agon.py setup` prints it)."), e
 
 # Phase 5, what came of a turn, as each app prints it (the shapes seen against mocks of their APIs). Claude Code: the
-# session, the answer, the turn's tokens summed over its model calls, the session's cost so far (restored on resume
-# since 2.1.277), the context of the last call; a plan's limit comes as a rejected rate_limit_event with its reset time
+# session, the answer, the session's cost and tokens so far per model, its subagents' too (restored on resume since
+# 2.1.277), the turn's own tokens (its main loop only), the context of the last call; a plan's limit comes as a rejected
+# rate_limit_event with its reset time
 init = {"type": "system", "subtype": "init", "session_id": "s1"}
 calls = [{"type": "assistant", "message": {"usage": {"input_tokens": 3, "cache_read_input_tokens": 20000,
                                                      "cache_creation_input_tokens": 500, "output_tokens": 40}}},
@@ -2611,16 +2630,28 @@ calls = [{"type": "assistant", "message": {"usage": {"input_tokens": 3, "cache_r
                                                      "cache_creation_input_tokens": 300, "output_tokens": 60}}}]
 result = {"type": "result", "subtype": "success", "is_error": False, "result": "Done.", "session_id": "s1",
           "usage": {"input_tokens": 8, "cache_creation_input_tokens": 800, "cache_read_input_tokens": 40500,
-                    "output_tokens": 100}, "total_cost_usd": 0.1234, "num_turns": 2, "permission_denials": []}
+                    "output_tokens": 100}, "total_cost_usd": 0.1234, "num_turns": 2, "permission_denials": [],
+          "modelUsage": {"model-a": {"inputTokens": 1008, "outputTokens": 900, "cacheReadInputTokens": 90500,
+                                     "cacheCreationInputTokens": 1800, "costUSD": 0.1134},
+                         "model-b": {"inputTokens": 40, "outputTokens": 25, "cacheReadInputTokens": 3000,
+                                     "cacheCreationInputTokens": 0, "costUSD": 0.01}}}
 assert agon.outcome("claude", 0, [init, *calls, result], "") == {
     "session": "s1", "answer": "Done.", "ok": True, "heard": True, "error": None, "limit": None, "usd": 0.1234,
-    "totals": None, "turn": (808, 40500, 100), "context": 20805, "calls": 2, "denied": False,
-    "restores": True}
+    "totals": (2848, 93500, 925), "turn": (808, 40500, 100), "context": 20805, "calls": 2, "denied": False,
+    "restores": True, "overage": None}
+assert agon.outcome("claude", 0, [init, *calls, result | {"modelUsage": {}}], "")["totals"] is None
 rejected = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 1790380800000}}
 got = agon.outcome("claude", 1, [init, rejected, result | {"is_error": True, "usage": {}, "result":
                                                            "You've hit your limit · resets 3pm (Europe/Berlin)"}], "")
 assert not got["ok"] and not got["heard"] and got["error"] == "You've hit your limit · resets 3pm (Europe/Berlin)", got
 assert agon.reset_time(got["limit"], 1790366400) == 1790380800, got["limit"]  # the event's time wins (ms, or s)
+# Past the plan's limit, a turn goes on at the human's extra usage, which is paid: the event says so (seen at runtime)
+extra = {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 1790380800,
+                                                         "rateLimitType": "five_hour", "isUsingOverage": True}}
+got = agon.outcome("claude", 0, [init, extra, *calls, result], "")
+assert got["ok"] and got["limit"] is None and got["overage"] == "usage limit reached|1790380800", got
+extra["rate_limit_info"] |= {"status": "allowed", "isUsingOverage": False}
+assert agon.outcome("claude", 0, [init, extra, *calls, result], "")["overage"] is None
 got = agon.outcome("claude", 0, [init, *calls, result | {"permission_denials": [{"tool_name": "mcp__team__board"}]}], "")
 assert got["ok"] and got["denied"], got  # Agon's server under a name --allowedTools doesn't cover
 assert agon.outcome("claude", 1, [], "No conversation found with session ID: s9\n")["error"] == (
@@ -2639,7 +2670,7 @@ done = [{"type": "item.completed", "item": {"id": "i1", "type": "command_executi
 assert agon.outcome("gpt", 0, thread + done, "") == {
     "session": "t1", "answer": "Done.", "ok": True, "heard": True, "error": None, "limit": None, "usd": None,
     "totals": (3055, 12000, 300), "turn": None, "context": None, "calls": 2, "denied": False,
-    "restores": True}
+    "restores": True, "overage": None}
 limit_text = "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro) or try again at 9:39 PM."
 got = agon.outcome("gpt", 1, [*thread, {"type": "error", "message": limit_text}, {"type": "turn.failed", "error": {
     "message": limit_text}}], "")
@@ -2656,7 +2687,7 @@ answer = {"event": "result", "result": {"conversation_id": "c1", "status": "SUCC
 assert agon.outcome("gemini", 0, steps + [answer], "") == {
     "session": "c1", "answer": "Done.\n", "ok": True, "heard": True, "error": None, "limit": None, "usd": None,
     "totals": (1500, 1509, 123), "turn": None, "context": None, "calls": 2, "denied": False,
-    "restores": True}
+    "restores": True, "overage": None}
 answer["result"]["status"] = "ERROR"
 assert agon.outcome("gemini", 0, steps + [answer], "")["ok"]
 quota = ("error: agent executor error: Error 429, Message: You have exhausted your capacity on this model. Your quota"
@@ -2759,8 +2790,8 @@ p = pilot.pilot("claude")
 assert (p["session"], p["turns"], p["context"], p["usd"], p["failures"]) == (sid, 1, 1150, 0.05, 0), p
 r = last_run("claude")
 assert (r["trigger"], r["session"], r["status"], r["tokens_in"], r["tokens_cached"], r["tokens_out"], r["usd"]) == (
-    f"#{first} human -> claude", sid, "done", 150, 1000, 20, 0.05), r
-assert told[-1] == "claude: done (150 in / 1,000 cached / 20 out tokens, ~$0.05)", told
+    f"#{first} human -> claude", sid, "done", 180, 1200, 30, 0.05), r  # its subagent's tokens too (modelUsage)
+assert told[-1] == "claude: done (180 in / 1,200 cached / 30 out tokens, ~$0.05)", told
 assert step() == ["codex"]  # claude's message wakes gpt, in a Codex thread of its own
 run = wake_runs()[-1]
 thread_id = run["session"]
@@ -2778,6 +2809,7 @@ assert runs["claude"]["args"][runs["claude"]["args"].index("--resume") + 1] == s
 assert "--session-id" not in runs["claude"]["args"] and "anew" not in runs["claude"]["prompt"]
 assert runs["codex"]["args"][-3:] == ["resume", thread_id, "-"] and runs["codex"]["session"] == thread_id
 assert (last_run("claude")["usd"], pilot.pilot("claude")["usd"], pilot.pilot("claude")["turns"]) == (0.05, 0.1, 2)
+assert (last_run("claude")["tokens_in"], pilot.pilot("claude")["tokens_in"]) == (180, 360)
 r = last_run("gpt")
 assert (r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == (500, 1000, 30), r  # not the thread's 1,000 / 2,000
 assert (pilot.pilot("gpt")["tokens_in"], pilot.pilot("gpt")["tokens_cached"]) == (1000, 2000)
@@ -2946,6 +2978,36 @@ with settings(AGON_GEMINI_PLAN=None, **home_vars):
 # From here on, the hourly brake has room: the runs above count toward it
 with settings(AGON_MAX_WAKES_PER_HOUR="1000"):
     pilot = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
+# Found by the research: a crashed Claude Code turn may report its totals zeroed (its docs). The run counts nothing, and
+# the next one only what it added, not the session's whole spend
+before = pilot.pilot("claude")
+agon.post("human", "claude", "@ZERO this.")
+assert step() == ["claude"] and last_run("claude")["status"] == "failed", last_run("claude")
+r, p = last_run("claude"), pilot.pilot("claude")
+assert (r["usd"], r["tokens_in"], r["tokens_cached"], r["tokens_out"]) == (0, 0, 0, 0), r
+assert (p["session"], p["usd"], p["tokens_in"]) == (before["session"], before["usd"], before["tokens_in"]), (before, p)
+agon.db().execute("UPDATE pilot SET parked = NULL, failures = 0 WHERE agent = 'claude'")
+agon.post("human", "claude", "Again.")
+assert step() == ["claude"]
+r = last_run("claude")
+assert r["status"] == "done" and abs(r["usd"] - 0.05) < 1e-9 and (r["tokens_in"], r["tokens_cached"],
+                                                                   r["tokens_out"]) == (180, 1200, 30), r
+# Found by the research: past its plan's limit, Claude Code goes on at the human's extra usage, which is paid. Autopilot
+# runs on the plan: claude rests until the limit resets (AGON_EXTRA_USAGE=1 lets it go on)
+agon.post("human", "claude", "@EXTRA Go on.")
+now = time.time()
+assert step() == ["claude"] and last_run("claude")["status"] == "done"
+p = pilot.pilot("claude")
+assert abs(p["parked"] - now - 3600) < 60 and p["why"] == (
+    "its plan's usage limit is used up, and Claude Code now bills its turns to your extra usage (AGON_EXTRA_USAGE=1"
+    " lets it go on)"), p
+assert heard()[0] == f"Autopilot lets claude rest until ~{agon.reset_clock(p['parked'], now)}: {p['why']}.", heard()
+agon.post("human", "claude", "Still there?")
+assert step() == [] and pilot.resting("claude", time.time())[0] == p["why"]
+agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'claude'")
+with settings(AGON_EXTRA_USAGE="1"):
+    agon.post("human", "claude", "@EXTRA Then go on.")
+    assert step() == ["claude"] and "Still there?" in wake_runs()[-1]["prompt"] and not pilot.pilot("claude")["parked"]
 # An app the human has open for an agent: autopilot runs no second session of the agent beside it. Codex and agy get
 # their messages from their Stop hooks, and the human hears so once; when the app closes, autopilot runs the agent again
 codex_app = Agent("gpt", client="codex-mcp-client")
@@ -3277,13 +3339,15 @@ for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)"
                    "`AGON_MAX_WAKES_PER_HOUR`", "`AGON_MAX_AUTORUNS`", "`AGON_DAILY_USD`", "`AGON_DAILY_TOKENS`",
                    "`--max-budget-usd`", "`AGON_TURN_TIMEOUT`", "`AGON_UNSAFE=1`", "`AGON_AUTOPILOT`",
                    "`AGON_CLAUDE_MODEL`", "`AGON_GPT_EFFORT`", "`AGON_GEMINI_ARGS`", "`UserPromptSubmit`", "Ctrl+C",
+                   "`AGON_EXTRA_USAGE=1`", "(https://openai.com/policies/row-terms-of-use/)", "Gemini Enterprise",
                    "`STOP`", "`runs`", "`AGON_GEMINI_PLAN=1`", "`GEMINI_API_KEY`", '`"modelProvider": "gemini"`',
                    '`"permissions": {"allow": ["mcp(agon/*)"]}`', "(`--resume <id>`)", "(`resume <id> -`)",
                    "(`--conversation <id>`)", *(f"`{' '.join(argv)}`" for argv in wake_lines.values())):
         assert needed in text, (readme, needed)
 assert "- [x] Phase 5 — Autopilot (Agon wakes the agents itself)" in roadmap and "Phase 5 additions" in roadmap
 for fact in ("CLAUDE_CODE_MESSAGING_SOCKET", "`claude_code_version`", "`--skip-git-repo-check`", "**no `-p`**",
-             '["mcp(agon/*)"]', "30 MB RSS"):
+             '["mcp(agon/*)"]', "30 MB RSS", "`modelUsage`", "`isUsingOverage`", "`CLAUDE_CODE_HOST_SCHEDULED_RUN=1`",
+             '"a Gemini Enterprise API Key"', "anthropics/claude-code#96163"):
     assert fact in roadmap, fact
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):

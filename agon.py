@@ -129,8 +129,9 @@ The task from {asker}:
 # Autopilot (Phase 5): `python agon.py autopilot` keeps the team working with no app open. When messages come for an
 # agent, Agon wakes it: an open Claude Code session through its inbox socket, else the agent's app, headless, for one
 # turn that resumes the agent's own session, on the user's own plan. No app stays running between turns: a new process
-# that resumes a session sends what a running one would (checked byte for byte with claude 2.1.282), so the vendors'
-# prompt caches serve both, and an app starts in 0.3-0.5 s. Checked with claude 2.1.282, codex 0.157.0 and agy 1.2.11
+# that resumes a session sends what a running one would (checked byte for byte with claude 2.1.282 against a mock), so a
+# vendor's prompt cache should serve both (not measured on the live APIs), and an app starts in 0.3-0.5 s. Checked with
+# claude 2.1.282, codex 0.157.0 and agy 1.2.11
 WAKE_COMMANDS = {  # the arguments after the program (see wake_program()); the prompt goes on stdin
     "claude": ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
     "gpt": ["exec", "--json", "--skip-git-repo-check"],  # the human chose the folder: Codex needn't insist on git
@@ -154,8 +155,9 @@ MAX_TURNS = 30  # Claude Code's --max-turns for one wake (AGON_MAX_TURNS)
 TURN_TIMEOUT = 900  # seconds one wake may take (AGON_TURN_TIMEOUT); then Agon interrupts the turn, and...
 GRACE = 20  # ...kills the app's process tree this many seconds later
 ROTATE_TOKENS, ROTATE_TURNS, ROTATE_HOURS = 120_000, 30, 24  # sessions this big, long or old start anew (AGON_ROTATE_*)
-# The prompt cache of a plan's main conversation lives an hour (Claude Code's docs): a session idle for longer rereads
-# everything at full price, so one with a large context starts anew instead
+# Claude Code caches a plan's main conversation for an hour (its docs; five minutes on extra usage or an API key, and
+# Codex's and Gemini's cache lives weren't found): a session idle for longer rereads everything at full price, so one
+# with a large context starts anew instead
 CACHE_TTL = 3600
 BACKOFF = 60, 1800  # after a failed run, the agent rests a minute, twice as long after each failure, 30 minutes at most
 LIVE = 150  # seconds after its last heartbeat that an app's MCP server, or autopilot, counts as gone
@@ -2653,33 +2655,44 @@ def outcome(name, code, events, err):
     """What came of a wake, from what agent `name`'s app printed: a dict with its session id, its answer, whether the
     turn succeeded (ok) and whether the model got the prompt (heard), why it failed (error) and the texts that show a
     usage limit (limit); the app's running totals for its session (usd: Claude Code's estimate; totals: uncached input,
-    cached input and output tokens), Claude Code's tokens for the turn (turn), the context, the model's calls, and
-    whether the app refused Agon's tools (denied) and, for Claude Code, whether its total counts the resumed session's
-    spend before the run (restores, since 2.1.277)."""
+    cached input and output tokens), Claude Code's tokens for the turn without its subagents' (turn: when it reports no
+    totals), the context, the model's calls, and whether the app refused Agon's tools (denied); for Claude Code, whether
+    its totals count the resumed session's spend before the run (restores, since 2.1.277) and the text that shows it
+    went past its plan's limit on the human's extra usage (overage)."""
     got = {"session": None, "answer": None, "ok": False, "heard": False, "error": None, "limit": None, "usd": None,
-           "totals": None, "turn": None, "context": None, "calls": 1, "denied": False, "restores": True}
+           "totals": None, "turn": None, "context": None, "calls": 1, "denied": False, "restores": True,
+           "overage": None}
     texts = []
     if name == "claude":  # stream-json: init, assistant messages, rate_limit_event, result
         for event in events:
             kind = event.get("type")
             if kind == "system" and event.get("subtype") == "init":
                 got["session"] = event.get("session_id") or got["session"]
-                got["restores"] = at_least(event.get("claude_code_version"), (2, 1, 277))  # restores the cost so far
+                got["restores"] = at_least(event.get("claude_code_version"), (2, 1, 277))  # restores the totals so far
             elif kind == "assistant":  # a model call's usage: its input is the context
                 got["heard"] = True
                 usage = (event.get("message") or {}).get("usage") or {}
                 got["context"] = ints(usage, "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-            elif kind == "rate_limit_event" and (event.get("rate_limit_info") or {}).get("status") == "rejected":
-                reset = event["rate_limit_info"].get("resetsAt")  # a plan's limit (Agent SDK types): when it resets
-                if isinstance(reset, (int, float)) and not isinstance(reset, bool):
-                    texts.append(f"usage limit reached|{int(reset / 1000 if reset > 1e11 else reset)}")
-                else:
-                    texts.append("usage limit reached")
+            elif kind == "rate_limit_event":  # a plan's limit (Agent SDK types): its state, and when it resets
+                info, reset = event.get("rate_limit_info") or {}, None
+                if isinstance(at := info.get("resetsAt"), (int, float)) and not isinstance(at, bool):
+                    reset = int(at / 1000 if at > 1e11 else at)
+                said = "usage limit reached" + (f"|{reset}" if reset else "")
+                if info.get("status") == "rejected":
+                    texts.append(said)
+                if info.get("isUsingOverage") is True:  # past the limit, on extra usage the human pays for (seen at
+                    got["overage"] = said  # runtime; the SDK types don't list it)
             elif kind == "result":
                 usage = event.get("usage") or {}
                 got["session"] = event.get("session_id") or got["session"]
                 got["turn"] = (ints(usage, "input_tokens", "cache_creation_input_tokens"),
                                ints(usage, "cache_read_input_tokens"), ints(usage, "output_tokens"))
+                models = event.get("modelUsage")  # the running totals per model, like the cost, with the subagents'
+                models = [m for m in models.values() if isinstance(m, dict)] if isinstance(models, dict) else []
+                if models:
+                    got["totals"] = (sum(ints(m, "inputTokens", "cacheCreationInputTokens") for m in models),
+                                     sum(ints(m, "cacheReadInputTokens") for m in models),
+                                     sum(ints(m, "outputTokens") for m in models))
                 usd = event.get("total_cost_usd")
                 got["usd"] = float(usd) if isinstance(usd, (int, float)) and not isinstance(usd, bool) else None
                 got["calls"] = max(1, ints(event, "num_turns"))
@@ -3055,15 +3068,16 @@ class Autopilot:
         same = bool(session) and sid == session  # else the app started a session: its totals start from zero
         gone = bool(session) and not got["heard"] and any(
             text in (got["error"] or "") for text in ("No conversation found", "no rollout found"))
-        if me == "claude":  # tokens for the turn; the cost is the process's total, since 2.1.277 with the session's
-            tokens, total = got["turn"] or (0, 0, 0), got["usd"]  # spend before it (restored on resume): the run's
-            usd = 0.0 if total is None else max(0.0, total - p["usd"]) if same and got["restores"] else total  # share
-            totals = (0, 0, 0)
-        else:  # Codex and agy report their session's running totals
-            totals = got["totals"] or ((p["tokens_in"], p["tokens_cached"], p["tokens_out"]) if same else (0, 0, 0))
-            base = (p["tokens_in"], p["tokens_cached"], p["tokens_out"]) if same else (0, 0, 0)
-            tokens = tuple(a - b for a, b in zip(totals, base)) if all(map(int.__ge__, totals, base)) else totals
-            usd, total = 0.0, None
+        # The apps report running totals for the session: Claude Code its cost estimate and its tokens with its
+        # subagents' (with the spend before the run since 2.1.277), Codex and agy their tokens. The run's share is how
+        # far they grew past the highest seen: a crashed Claude Code turn may report zeros (its docs), and an
+        # interrupted agy turn does
+        seen = (p["usd"], p["tokens_in"], p["tokens_cached"], p["tokens_out"]) if same and got["restores"] else (0,) * 4
+        totals = [old if value is None else max(value, old)
+                  for value, old in zip((got["usd"], *(got["totals"] or (None,) * 3)), seen)]
+        usd, *tokens = (total - old for total, old in zip(totals, seen))
+        if got["totals"] is None and got["turn"]:  # a Claude Code result without modelUsage: the turn's own tokens
+            tokens = list(got["turn"])
         context = got["context"] if got["context"] is not None else (tokens[0] + tokens[1]) // max(1, got["calls"])
         status = ("stopped" if why and why != "timeout" else "timeout" if why else "done" if got["ok"] else
                   "limit" if got["limit"] else "failed")
@@ -3074,7 +3088,7 @@ class Autopilot:
                 con.execute("UPDATE pilot SET session = ?, turns = ?, context = ?, started = ?, used = ?, usd = ?,"
                             " tokens_in = ?, tokens_cached = ?, tokens_out = ? WHERE agent = ?",
                             (sid, (p["turns"] if same else 0) + 1, context, p["started"] if same else now, now,
-                             total if total is not None else (p["usd"] if same else 0), *totals, me))
+                             *totals, me))
             error = clip(got["error"] or "", 300)  # after the note the run began with (a new session: why)
             con.execute("UPDATE runs SET session = ?, ended = ?, status = ?, tokens_in = ?, tokens_cached = ?,"
                         " tokens_out = ?, usd = ?, note = note || CASE WHEN ? = '' THEN '' WHEN note = '' THEN ? ELSE"
@@ -3098,6 +3112,10 @@ class Autopilot:
                                               f" {took(self.timeout)} (AGON_TURN_TIMEOUT).")
         elif status == "failed" and not gone:
             self.fail(me, clip(got["error"], 500), now)
+        if got["overage"] and not enabled("AGON_EXTRA_USAGE"):  # autopilot runs on the plan: past its limit, you pay
+            until = reset_time(got["overage"], now) or 0
+            self.park(me, "its plan's usage limit is used up, and Claude Code now bills its turns to your extra usage"
+                          " (AGON_EXTRA_USAGE=1 lets it go on)", until if until > now else now + 3600)
 
     def fail(self, me, error, now):
         """Agent `me`'s app failed: it rests a minute, twice as long after each failure in a row, 30 minutes at most."""
@@ -3395,7 +3413,8 @@ def setup(out=None):
         "  " + command_line([py, script, "autopilot", "--agents", ",".join(COMMANDS), "--lead", "claude"]),
         f"Brakes: AGON_MAX_WAKES_PER_HOUR ({MAX_WAKES}) wakes of an agent an hour, AGON_MAX_AUTORUNS (25) in a row"
         f" without you, AGON_TURN_TIMEOUT ({TURN_TIMEOUT}) seconds a turn, AGON_MAX_WORKERS ({MAX_WORKERS}) apps at"
-        " once; AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them.",
+        " once; AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them. Past its plan's limit,"
+        " claude rests rather than bill your extra usage (AGON_EXTRA_USAGE=1 lets it go on).",
         "gemini: Google's terms forbid third-party software on a Google login, so Agon runs agy (autopilot, ask, the"
         " automatic review) only on a Gemini API key. Merge this into " + str(gemini) + ":",
         '  {"modelProvider": "gemini", "permissions": {"allow": ["mcp(agon/*)"]}}',
