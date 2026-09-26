@@ -2358,7 +2358,7 @@ def value(flag):
 
 
 def rest():  # Claude Code and agy take more lines until their stdin closes; an interrupt ends Claude Code's turn
-    for raw in sys.stdin:
+    for raw in sys.stdin.buffer:
         request = json.loads(raw)
         if request.get("type") == "control_request":
             say({"type": "control_response", "response": {"subtype": "success", "request_id": request["request_id"]}})
@@ -2376,7 +2376,7 @@ if app == "codex":  # codex exec reads its stdin to the end first
     prompt, asked = sys.stdin.buffer.read().decode("utf-8"), (args[args.index("resume") + 1] if "resume" in args
                                                                else None)
 else:
-    prompt = json.loads(sys.stdin.readline())["message"]["content"]
+    prompt = json.loads(sys.stdin.buffer.readline())["message"]["content"]  # UTF-8, whatever the console uses
     asked = value("--resume") if app == "claude" else value("--conversation")
 sid = asked or value("--session-id") or str(uuid.uuid4())
 with open(os.environ["FAKE_WAKE_LOG"], "a", encoding="utf-8") as log:
@@ -2594,10 +2594,9 @@ with settings(AGON_CMD_GPT='["no-such-codex-7"]'):
     try:
         agon.wake_command("gpt", "Hi", None, None, "")
         raise AssertionError("a missing app")
-    except agon.ToolError as e:
-        assert str(e).startswith("Can't wake gpt: no no-such-codex-7 in the folders on Agon's PATH: "), e
-        assert str(e).endswith("Install it, or set AGON_CMD_GPT to its full command (`python agon.py setup` prints"
-                               " it)."), e
+    except agon.ToolError as e:  # where Agon looked: PATH, and on Windows the endings in PATHEXT
+        assert str(e) == (f"Can't wake gpt: {agon.missing('no-such-codex-7')}. Install it, or set AGON_CMD_GPT to its"
+                          " full command (`python agon.py setup` prints it)."), e
 
 # Phase 5, what came of a turn, as each app prints it (the shapes seen against mocks of their APIs). Claude Code: the
 # session, the answer, the turn's tokens summed over its model calls, the session's cost so far (restored on resume
