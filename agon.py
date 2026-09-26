@@ -2863,7 +2863,8 @@ class Autopilot:
         hour = [started for (started,) in db().execute("SELECT started FROM runs WHERE agent = ? AND started > ? ORDER"
                                                         " BY started", (me, now - 3600))]
         if len(hour) >= self.max_wakes:
-            return f"it woke {len(hour)} times in the last hour (AGON_MAX_WAKES_PER_HOUR)", hour[0] + 3600
+            return (f"it woke {len(hour)} time{'s' * (len(hour) != 1)} in the last hour (AGON_MAX_WAKES_PER_HOUR)",
+                    hour[0] + 3600)
         usd, tokens = db().execute("SELECT COALESCE(SUM(usd), 0), COALESCE(SUM(tokens_in + tokens_out), 0) FROM runs"
                                    " WHERE agent = ? AND started >= ?", (me, midnight(now))).fetchone()
         if self.daily[0] and usd >= self.daily[0]:
