@@ -4863,8 +4863,8 @@ class Arena(ThreadingHTTPServer):
     daemon_threads = True
 
     def server_bind(self):
-        """Bind, without the name http.server looks up for the address (socket.getfqdn, a reverse DNS lookup that can
-        keep the arena from listening for a while): it answers at 127.0.0.1 and needs none."""
+        """Bind, without the name http.server looks up for the address (socket.getfqdn, a reverse DNS lookup: 35 s for
+        127.0.0.1 on GitHub's macOS runners, before the arena listens): it answers at 127.0.0.1 and needs none."""
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
 

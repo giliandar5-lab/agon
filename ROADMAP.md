@@ -701,6 +701,13 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
 - Terminals: Python enables no VT processing in a Windows console (Agon calls `SetConsoleMode`); printing an emoji to a
   redirected stdout fails without UTF-8; PowerShell 5.1 drops the double quotes inside an argument to a native program,
   and so does any call through `agon.cmd` in PowerShell 7 *(Windows facts from Microsoft's docs; not tried here)*.
+- `http.server.HTTPServer.server_bind` looks up the address's name (`socket.getfqdn`, a reverse DNS lookup). For
+  `127.0.0.1` it took 35 s in each new process on GitHub's macOS runners, 0.01 s on the Linux and Windows ones *(CI,
+  2026-09-30)*. The arena binds without it and listens within about 0.1 s.
+- Windows paths *(the maintainer on Windows 11, and CI)*: `%TEMP%` is inside the home folder, in the 8.3 short form of
+  a long user name (`C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub's runner); git spells the same folder long, with
+  `/`. Git Bash, and so Claude Code's Bash tool, writes the home folder as `/c/Users/me`. A child's `print()` into a
+  pipe ends its lines with `\r\n`.
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,
