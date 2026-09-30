@@ -3945,12 +3945,12 @@ def kind_of(path):
 
 def scoreboard(limit=10):
     """The scoreboard, per project (the top folder of its repository), the `limit` with the newest activity first (all:
-    None). For each agent: the duels it
-    won of the picked ones it worked in (not when the setup failed in its worktree); the runs of the human's tests on its work that passed (at board done, in task asks,
-    in duels); and its work that reviewers approved: board tasks (per task, its first verdict or after changes) and duel
-    entries. Hints: for each kind of file, the agents with at least HINT_MIN results in it, where a result is a board
-    task approved at its first review or not, or a picked duel won or not; the best one is named only when two or more
-    have enough results and it is ahead."""
+    None). For each agent: the duels it won of the picked ones it worked in (not when the setup failed in its worktree);
+    the runs of the human's tests on its work that passed (at board done, in task asks, in duels); and its work that
+    reviewers approved: board tasks (per task, its first verdict or after changes) and duel entries. Hints: for each
+    kind of file, the agents with at least HINT_MIN results in it, where a result is a board task approved at its first
+    review or not, or a picked duel won or not; the best one is named only when two or more have enough results and it
+    is ahead."""
     con, projects = db(), {}
 
     def scores(project, name, at):
@@ -4171,7 +4171,8 @@ code { font: 13px ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywh
   #team { display: block !important; border-right: 1px solid var(--line); }
   #chat { display: flex !important; }
   .side { display: none !important; border-left: 1px solid var(--line); }
-  body[data-side="board"] #board, body[data-side="duels"] #duels, body[data-side="score"] #score { display: block !important; }
+  body[data-side="board"] #board, body[data-side="duels"] #duels,
+  body[data-side="score"] #score { display: block !important; }
   nav button.main { display: none; }
   #detail { align-items: center; } #detail .sheet { border-radius: 14px; }
 }
@@ -4346,7 +4347,8 @@ function renderDuels(duels, box, act) {  // act(what, duel, label): the live pag
     const grid = el('div', 'entries');
     for (const e of d.entries) {
       const c = el('div', 'card entry' + (d.winner === e.label ? ' won' : '')), r = el('div', 'row');
-      r.append(el('b', e.agent ? who(e.agent) : '', e.label + (e.agent ? ' · ' + e.agent : '')), el('span', 'pill', e.state));
+      r.append(el('b', e.agent ? who(e.agent) : '', e.label + (e.agent ? ' · ' + e.agent : '')),
+        el('span', 'pill', e.state));
       c.append(r);
       for (const [text, cls] of entryLine(e)) c.append(el('div', 'small ' + cls, text));
       if (d.winner === e.label && e.branch) c.append(el('div', 'small', 'the winner: git merge ' + e.branch));
@@ -4501,7 +4503,11 @@ text.addEventListener('keydown', e => {
 $('#say').addEventListener('submit', async e => {
   e.preventDefault();
   if (!text.value.trim()) return;
-  if (await post('/msgs', {to: $('#to').value, text: text.value})) { text.value = ''; fit(); log.scrollTop = log.scrollHeight; }
+  if (await post('/msgs', {to: $('#to').value, text: text.value})) {
+    text.value = '';
+    fit();
+    log.scrollTop = log.scrollHeight;
+  }
 });
 $('#stop').addEventListener('click', () => post('/msgs', {to: 'all', text: paused ? 'RESUME' : 'STOP'}));
 async function openTask(id) {
