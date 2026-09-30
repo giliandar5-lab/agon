@@ -4074,19 +4074,6 @@ with duel_env(AGON_TEST_CMD=GREP, AGON_PROJECT=str(duelrepo)):
         assert needed in page, needed
 arena.shutdown()
 arena.server_close()
-# TEMPORARY DIAGNOSTIC for the macOS CI (to be removed): how long a fresh process takes for socket.getfqdn("127.0.0.1"),
-# which http.server's server_bind calls, and an arena bound that way (its stack is dumped if it takes a minute)
-for code_ in ("import socket, time\nfor i in (1, 2):\n    t = time.monotonic()\n    name = socket.getfqdn('127.0.0.1')\n"
-              "    print(f'getfqdn(127.0.0.1) #{i} = {name!r} in {time.monotonic() - t:.2f} s', flush=True)",
-              "import faulthandler, http.server, time, agon\nfaulthandler.dump_traceback_later(60)\n"
-              "agon.Arena.server_bind = http.server.HTTPServer.server_bind\nt = time.monotonic()\n"
-              "agon.Arena(('127.0.0.1', 0), agon.Web).server_close()\n"
-              "print(f'an arena bound as http.server binds: {time.monotonic() - t:.2f} s', flush=True)"):
-    try:
-        probe_ = subprocess.run([sys.executable, "-c", code_], cwd=HERE, capture_output=True, text=True, timeout=150)
-        print("DIAGNOSTIC:", probe_.returncode, probe_.stdout.strip(), probe_.stderr.strip()[-3000:], flush=True)
-    except subprocess.TimeoutExpired as e:
-        print("DIAGNOSTIC: still running after 150 s:", e.stdout, e.stderr, flush=True)
 for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHUP: its terminal closed) ends
     free = socket.socket()  # `python agon.py` like Ctrl+C: its running duel stops and leaves nothing behind
     free.bind(("127.0.0.1", 0))
@@ -4096,13 +4083,12 @@ for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHU
     server = subprocess.Popen([sys.executable, "-c", "import sys, agon\nagon.PORT = int(sys.argv[1])\n"
                                "sys.exit(agon.main([]))", str(agon.PORT)], cwd=HERE, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
-    printed, output, t_ = queue.Queue(), [], time.monotonic()
+    printed, output = queue.Queue(), []
     threading.Thread(target=lambda: [*map(printed.put, server.stdout), printed.put(None)], daemon=True).start()
     try:
         with contextlib.suppress(queue.Empty):
             first_line = None
             first_line = printed.get(timeout=120)  # it listens once it says so
-        print(f"DIAGNOSTIC: the arena said it listens after {time.monotonic() - t_:.2f} s", flush=True)  # TEMPORARY
         if not (first_line or "").startswith("Agon arena: "):  # show what it printed: kill it, and its output ends
             ended = server.poll()
             if ended is None:
