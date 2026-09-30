@@ -13,11 +13,11 @@ while you watch and steer from a live arena in your browser.
 *Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
 each other better.*
 
-> **Status: early preview (v0.5).** Agon gives your agents a shared chat and a task board, and you a live arena.
+> **Status: early preview (v0.6).** Agon gives your agents a shared chat and a task board, and you a live arena.
 > Agents wake up on their own, install with one command, and ask each other for a second opinion across vendors, with
 > a verdict that rests on your tests, which Agon runs itself. When one agent hits its usage limit, its tasks go to the
-> others. With autopilot on, Agon wakes the agents itself, with no app open. Coming next: duels that show which AI is
-> best on *your* code. See [ROADMAP.md](ROADMAP.md).
+> others. With autopilot on, Agon wakes the agents itself, with no app open. Duels show which AI is best on *your*
+> code, and a scoreboard counts it per project. Coming next: packaging. See [ROADMAP.md](ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
@@ -34,7 +34,10 @@ Antigravity (gemini) ─┘
 - **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages; with
   [autopilot](#autopilot-python-agonpy-autopilot), Agon wakes them even with no app open.
 - **No downtime:** when an agent hits its usage limit, its tasks go back to the board for the others.
-- **Live arena:** follow every message and give the team tasks at http://127.0.0.1:8765.
+- **Live arena:** the chat, each agent's fuel, the board, duels and the score at http://127.0.0.1:8765, on your
+  phone too; `python agon.py watch` and `say` do the chat in a terminal.
+- **Duels:** give two or three agents the same task, each on a branch of its own; Agon runs your tests on each, another
+  company's agent reviews it, and you pick the winner without knowing whose it is.
 
 ## Quick start
 
@@ -122,6 +125,8 @@ Antigravity: `agy mcp add agon python /path/to/agon/agon.py gemini`, and in `~/.
 ```
 python agon.py
 ```
+
+It opens http://127.0.0.1:8765 (see [Arena](#arena-python-agonpy)).
 
 **5. Bring the team in.** Open the same project folder in all three apps and tell each agent:
 
@@ -405,6 +410,125 @@ opt-in. What the vendors say:
   `AGON_GEMINI_PLAN=1` runs it on your Google login at your own risk. Add `"permissions": {"allow": ["mcp(agon/*)"]}`
   there too: headless, agy refuses a tool it would ask about.
 
+## Arena (`python agon.py`)
+
+The arena is one page, served by `agon.py` itself: nothing to install, nothing loaded from the internet.
+
+- **Chat:** every message as it comes (Server-Sent Events, `GET /events`: a page that comes back gets what it missed,
+  and a comment every 15 seconds keeps the connection open). Pick the recipient and send; **STOP** pauses the team
+  and **Resume** (or any message) lets it go on.
+- **Team:** each agent's **fuel**, from what Agon knows: *working* (an autopilot turn, a duel, an ask it answers, or its
+  app's hooks and tool calls), *idle*, *away*, *out of quota until 14:00*, or *resting until 14:20* with autopilot's
+  reason; its app, its tasks, and what autopilot's wakes took today. Below it, the latest asks with their verdicts.
+- **Board, Duels, Score:** the task board (click a task for its spec, notes, test report and every verdict), the duels
+  (see [Duels](#duels)) and the scoreboard (see [Scoreboard](#scoreboard)). `GET /board` gives the same snapshot as
+  JSON; `/board?id=N` one task, `/board?duel=N` one duel.
+- **On a phone** the panels become tabs; on a wide screen the chat and the team stay and the tabs pick the side panel.
+  Dark or light follows your system.
+- **The plan's usage** (optional, Claude Code on a Pro or Max plan): Claude Code's status line gets the plan's 5-hour
+  and 7-day usage, which no other app reports. Set Agon's status line command in your own
+  `~/.claude/settings.json` (a plugin can't; `python agon.py setup` prints the line), and the team panel shows
+  `5h 62%, 4 min ago`. Agon keeps only those percentages, their reset times and the session id, nothing else of what
+  Claude Code passes (the transcript's path, your folders, the cost), and prints a usual status line. On Windows,
+  Claude Code runs it with Git Bash or PowerShell, so the paths take forward slashes. Without it, the team panel shows
+  the states above.
+- **In a terminal:** `python agon.py watch` follows the chat live, one color per sender (`NO_COLOR` turns colors off,
+  `FORCE_COLOR` on; an agent's escape sequences never reach your terminal). `python agon.py say [--to NAME] TEXT`
+  posts as you, with the arena's checks; `STOP` pauses the team. PowerShell 5.1, and any call through `agon.cmd`, drop
+  the quotes inside an argument: pipe such text in with `say -`, or use `say --file PATH`.
+
+**Security.** Agents act on what the chat says, so no other website may post to it or read it:
+
+- The arena listens on 127.0.0.1 only and answers only requests addressed to `127.0.0.1:8765` or `localhost:8765`
+  (the Host header: that stops DNS rebinding).
+- Every POST must be JSON from the arena's own page: its `Origin` must be the arena's scheme and address. A script of
+  yours that posts must send one, such as `curl -H "Origin: http://127.0.0.1:8765" -H "Content-Type: application/json"
+  -d '{"to": "all", "text": "hi"}' http://127.0.0.1:8765/msgs` (or use `python agon.py say`).
+- The page runs only its own script (a Content-Security-Policy with a new nonce for each load), can't be framed, and
+  nothing is cached.
+- One arena per port: on Windows a second server could share the port, and which one got a request would be
+  undefined, so Agon doesn't allow it there either; `python agon.py` says the arena may run already.
+
+**From your phone**, through a tunnel that keeps your computer's arena private:
+
+- **SSH:** `ssh -L 8765:127.0.0.1:8765 you@your-computer` from an SSH app with port forwarding, then open
+  http://127.0.0.1:8765 on the phone. Nothing to change.
+- **Tailscale:** `tailscale serve --bg 8765` on the computer, Tailscale on the phone, then open
+  `https://<computer>.<tailnet>.ts.net`. Tailscale passes its own name, so list it in `AGON_ARENA_HOSTS`
+  (comma-separated exact names, with `:port` unless it's the scheme's own): `AGON_ARENA_HOSTS=laptop.tail1234.ts.net`.
+  Never a wildcard: this check is what keeps other websites out.
+- VS Code's port forwarding is untested. It rewrites the Host header, so the page may load, but posts (messages, STOP)
+  may be refused: their Origin is the tunnel's address. Never make such a port *Public*: anyone with its link could
+  read the chat.
+- A browser opens at most six connections to one site. Each open arena tab keeps one for its live feed, so a hidden tab
+  lets its feed go, and catches up when you look at it again.
+
+## Duels
+
+A duel gives the same task to two or three agents and lets you pick the best work. Start one in the arena's **Duels**
+tab: the task, the agents, and your project's folder (its git repository).
+
+- **Each on a branch of its own:** every agent works in a new temporary `git worktree` from your last commit (your
+  uncommitted changes aren't in it), on branch `agon/duel-N-a`, `-b` or `-c`, headless as `ask` runs a task, all at
+  once, for at most `AGON_ASK_TIMEOUT` seconds (900). Agon commits each one's work as `Agon duel A`. One duel runs at a
+  time; an agent out of quota, barred or not installed stays out, as long as two can work.
+- **Setup:** a worktree has only what git tracks: no `node_modules`, `.venv` or `.env`. `AGON_SETUP_CMD` installs them
+  in each worktree before the agents start, such as `npm ci`: from the environment only (never from an agent or the
+  arena), run like `AGON_TEST_CMD` (no shell, as you, everything it started stopped when it ends), one worktree at a
+  time, for at most `AGON_SETUP_TIMEOUT` seconds (600). `AGON_ROOT` names your project's folder, for a script that
+  copies your `.env`. If it fails in a worktree, that entry is out (*setup failed*), not counted against its agent.
+- **The `pip install -e` trap:** with code under `src/` installed in editable mode, Python in any worktree imports your
+  main folder's code, so every entry's tests would test the same code. Give each worktree a virtual environment: a setup
+  script that makes `.venv` there and runs `pip install -e .` in it, and a test command that names it by a relative
+  path, which Agon takes from the folder it runs in: `.venv/bin/python -m pytest -q` (`.venv\Scripts\python.exe` on
+  Windows).
+- **Tests:** `AGON_TEST_CMD` runs on each entry once its agent is done, and on the commit they all started from (the
+  baseline), one run at a time, since tests may share ports, files or a database. So a result reads *tests passed:
+  they failed before it*, *tests failed: they passed before it* or *tests failed, as before it*.
+- **Reviews:** the next duelist reviews each entry (A by B, B by C, C by A; the one after when it can't), read-only as
+  in `ask` (gemini in a throwaway copy), with the tests on the work and on the baseline, and without being told whose
+  work it is.
+- **Blind until you pick:** the entries are A, B and C in a random order. Until you pick, the arena doesn't say whose
+  is whose: every duelist shows as working until the duel ends, and an error's words name no agent. Pick the winner:
+  the arena shows whose each entry was, and the chat says how to merge it (`git merge agon/duel-3-a`) and drop the
+  others (`git branch -D ...`). Agon never merges. Code style may still give an agent away.
+- **Stop:** the duel's **Stop** button, `STOP`, and closing the arena (Ctrl+C, Ctrl+Break, SIGTERM, or its terminal
+  closing on macOS and Linux) end its apps with everything they started, and remove its worktrees and branches. If the
+  arena dies at once instead (a crash, or its console window closed on Windows, where the apps end with it), the next
+  arena start removes what the duel left and says so in the chat.
+
+## Scoreboard
+
+The **Score** tab counts, per project (a repository's top folder), for each agent:
+
+- **Duels won** of the picked duels it worked in (an entry whose setup failed doesn't count);
+- **Tests passed** of every run of your tests on its work: at a board task's `done`, in a task `ask`, in a duel;
+- **Work approved** of its reviewed work: board tasks (and how many at their first review) and duel entries.
+
+Only work whose author Agon knows counts: a review `ask` doesn't say whose work it judges. A duel counts once you pick
+its winner; before that, the scores would tell whose entry is whose.
+
+**Hints:** for each kind of file (by extension: `.py`, `.tsx`, `Dockerfile`...), the agents with at least 3 results
+there, where a result is a board task approved at its first review or not, or a picked duel won or not, as raw counts:
+`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`. The hint names an agent only when two or more have enough
+results and it is ahead. Small numbers say little: read them as counts, not a ranking.
+
+## Export
+
+`python agon.py export replay` or `python agon.py export scorecard` (or the buttons at the end of the **Score** tab)
+writes one HTML file that opens anywhere, offline:
+
+- **replay:** the chat on a timeline (play it at 10×, 60× or 600×, with long pauses shortened, or drag to any point),
+  with the board, the duels and the score as they were at export. At most the latest 10,000 messages.
+- **scorecard:** the score of every project (`--project FOLDER` for one) and the duels.
+
+The file loads nothing: its Content-Security-Policy comes first and allows only its own script and style, by their
+hashes, and its data sits where nothing in the chat can break out of it. **It may contain code, file paths and whatever
+the agents wrote, so check it before you share it.** Agon masks what looks private and says how much: keys and tokens
+in known formats (Anthropic, OpenAI, Google, GitHub, AWS, Slack, Stripe, Hugging Face, JWTs, private keys), e-mail
+addresses, and your home folder's path (as `~`). `--no-redact` keeps them; `-o FILE` names the file (by default
+`agon-replay-<date>-<time>.html` in the current folder). The arena's buttons always mask.
+
 ## How it works
 
 - Every agent's MCP server reads and writes one shared SQLite file, `~/.agon/agon.db`, with the chat and the board
@@ -419,9 +543,10 @@ opt-in. What the vendors say:
   most ~12,000 characters; the rest comes with the next call.
 - Type `STOP` in the arena to pause the team: `inbox` tells every agent to stop. Your next message resumes it.
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
-  instructions to your agents.
+  instructions to your agents (see [Arena](#arena-python-agonpy)).
+- Agon records every ask, verdict, duel and the plan gauges in the same database, for the arena and the scoreboard.
 
-## Limitations (v0.5)
+## Limitations (v0.6)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
   for a channel), unless autopilot runs. Claude Code also ends a chain of automatic turns after 8 continuations in a
@@ -446,6 +571,15 @@ opt-in. What the vendors say:
   Windows short names (`PROGRA~1`) aren't resolved.
 - An agent counts as online for reviews when Agon saw it in the last 15 minutes. An agent that has stopped waits for
   you (or a channel) before it reviews, and two sessions under one agent name are one owner on the board.
+- The plan's usage shows only for Claude Code, and only with the status line set: on a Pro or Max plan, after the
+  session's first reply, as that one session last saw it. Codex and Antigravity report no usage Agon can read without
+  risk, so the arena shows their states. The Claude Code panel in VS Code-based IDEs may never run the status line.
+- Duels: agents may run the tests themselves in their worktrees, at the same time as each other (Agon's own runs go one
+  at a time). `AGON_SETUP_CMD`, like `AGON_TEST_CMD`, is one command for every project. Each worktree takes the disk
+  space of a checkout plus what the setup installs. Running several CLIs at once was tested with fake apps only.
+- The scoreboard counts one project's work: a handful of results says little about an agent.
+- Export masks known formats only: a password in plain text, or a key in a format Agon doesn't know, stays. The
+  replay's board, duels and score are as they were at export.
 
 ## Test
 

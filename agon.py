@@ -6,20 +6,30 @@ python agon.py hook <name>   the agent's hook: Stop wakes it with new messages, 
 python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
 python agon.py autopilot     wakes the agents when messages come for them, with no app open (--help for options)
 python agon.py stats         what autopilot's wakes took: per agent and per completed task
+python agon.py statusline    Claude Code's status line: keeps the plan's usage for the arena, prints a usual line
+python agon.py watch         the team's chat in the terminal, live
+python agon.py say TEXT      post as the human from a terminal (--to NAME; - reads stdin, --file PATH a file)
+python agon.py export replay|scorecard   one HTML file to share, with what looks private masked (--help for options)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
+import base64
 import contextlib
 import datetime
+import functools
+import hashlib
 import json
 import os
 import posixpath
 import queue
+import random
 import re
+import secrets
 import shlex
 import shutil
 import signal
 import socket
+import socketserver
 import sqlite3
 import stat
 import subprocess
@@ -31,12 +41,13 @@ import unicodedata
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import parse_qs, urlsplit
 
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.5.0"  # also in the plugin manifests
+VERSION = "0.6.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -315,6 +326,29 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     "CREATE TABLE live(pid INTEGER PRIMARY KEY, agent TEXT NOT NULL, client TEXT, socket TEXT, busy REAL NOT NULL"
     " DEFAULT 0, beat REAL NOT NULL, wake INTEGER NOT NULL DEFAULT 0, pushed INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL)",  # autopilot's heartbeat: one autopilot at a time
+    # Phase 6, the arena. Every ask: who asked whom, for a review or a task (and the board task of an automatic review),
+    # in which project, when, who answered in the end, the verdict, what came of the tests, the branch, why it failed
+    "CREATE TABLE asks(id INTEGER PRIMARY KEY, asker TEXT NOT NULL, agent TEXT NOT NULL, mode TEXT NOT NULL, task"
+    " INTEGER, project TEXT, started REAL NOT NULL, ended REAL, answered TEXT, verdict TEXT, tests TEXT, branch TEXT,"
+    " problem TEXT)",
+    # every verdict on a board task, for the scoreboard: whose work, by whom, approve or changes, and what the tests Agon
+    # ran at done showed
+    "CREATE TABLE reviews(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, owner TEXT NOT NULL, reviewer TEXT NOT NULL,"
+    " verdict TEXT NOT NULL, tests TEXT, at REAL NOT NULL)",
+    "ALTER TABLE tasks ADD COLUMN project TEXT",  # where the task was done: its repository's top folder, when known
+    # duels: the same task for two or three agents, each on a branch of its own from one commit (base), blind (entries
+    # a, b, c) until the human picks the winner. baseline is what came of the tests at base, report their report
+    "CREATE TABLE duels(id INTEGER PRIMARY KEY, project TEXT NOT NULL, prompt TEXT NOT NULL, base TEXT NOT NULL, state"
+    " TEXT NOT NULL DEFAULT 'running', started REAL NOT NULL, ended REAL, winner TEXT, baseline TEXT, report TEXT, note"
+    " TEXT NOT NULL DEFAULT '')",
+    "CREATE TABLE entries(duel INTEGER NOT NULL, label TEXT NOT NULL, agent TEXT NOT NULL, branch TEXT, state TEXT NOT"
+    " NULL DEFAULT 'waiting', started REAL, ended REAL, tests TEXT, report TEXT, stat TEXT, files TEXT NOT NULL DEFAULT"
+    " '[]', answer TEXT, problem TEXT, reviewer TEXT, verdict TEXT, review TEXT, PRIMARY KEY(duel, label))",
+    # a plan's usage, from Claude Code's status line (python agon.py statusline): per window only the percentage used,
+    # when it resets, the session that reported it and when. Nothing else of the status line's input is kept
+    "CREATE TABLE gauges(agent TEXT NOT NULL, window TEXT NOT NULL, used REAL NOT NULL, resets REAL, session TEXT, seen"
+    " REAL NOT NULL, PRIMARY KEY(agent, window))",
+    "ALTER TABLE agents ADD COLUMN busy REAL NOT NULL DEFAULT 0",  # since when its app works, from its hooks; 0: idle
 ]
 _local = threading.local()
 
@@ -656,6 +690,28 @@ def project_folder(cwd):
     return cwd
 
 
+def toplevel(folder):
+    """The project that work in `folder` belongs to, for the scoreboard, which counts per project: the top folder of its
+    git repository, else the folder itself. Best effort: never an error."""
+    try:
+        p = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=folder, env=environment(), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+                           creationflags=NO_WINDOW)
+        top = p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        top = ""
+    return os.path.normpath(top or os.path.abspath(folder))
+
+
+def project_of(cwd):
+    """The project of a tool call with `cwd` (see project_folder() and toplevel()), or None when Agon can't tell: an app
+    that starts Agon in Agon's own folder and passed no cwd."""
+    try:
+        return toplevel(project_folder(cwd))
+    except ToolError:
+        return None
+
+
 def seconds(var, default):
     """How many seconds environment variable `var` allows, such as AGON_ASK_TIMEOUT (`default` when it isn't set)."""
     try:
@@ -981,46 +1037,52 @@ def verdict(answer):
     return found[-1].lower() if found else None
 
 
-def run_tests(tests, folder, end, stopped):
+CHECKS = {"tests": ("Test results, run by Agon", "AGON_TEST_TIMEOUT"),  # what Agon runs as the human: its title, its
+          "setup": ("Setup, run by Agon", "AGON_SETUP_TIMEOUT")}  # time limit
+
+
+def run_tests(tests, folder, end, stopped, kind="tests", add=None):
     """Run the human's test command, `tests` from test_command(), in `folder` the way ask runs an app: found with
     shutil.which, so that npm finds npm.cmd (a relative path is taken from `folder`), run without a shell, with its
     own stdin and no console window, and stopped with all it started at AGON_TEST_TIMEOUT, at the ask's `end`, when
     stopped() gives a reason, and when it exits. Agon's own settings stay out of its environment, so the tests run as
     in a terminal and never start an ask of their own. Returns (what came of it: tests passed, tests failed, tests
     timed out, tests could not start or NO_TESTS, only from what Agon saw itself; the report that the reviewer and the
-    asker read; why the ask must end now, or None)."""
+    asker read; why the ask must end now, or None). A duel's setup command runs the same way (`kind` setup: setup
+    passed, setup failed...), with `add` in its environment."""
     if tests is None:
         return NO_TESTS, "Test results, run by Agon: none, because the human hasn't set AGON_TEST_CMD.", None
     argv, limit = tests
-    started, head = time.monotonic(), f"Test results, run by Agon: `{command_line(argv)}`"
+    title, var = CHECKS[kind]
+    started, head = time.monotonic(), f"{title}: `{command_line(argv)}`"
     path = os.path.normpath(os.path.join(folder, argv[0])) if os.path.dirname(argv[0]) else argv[0]
     if (program := shutil.which(path)) is None:
-        return "tests could not start", f"{head} could not start: {missing(path)}.", None
+        return f"{kind} could not start", f"{head} could not start: {missing(path)}.", None
     if os.path.normcase(program) != os.path.normcase(argv[0]):  # which one ran: python may be the Microsoft Store stub
         head += f" ({program})"
     if os.name == "nt" and program.lower().endswith((".bat", ".cmd")) and any(set(a) & set('&|<>^%"\r\n')
                                                                                  for a in argv[1:]):
-        return "tests could not start", (  # Windows runs a batch file through cmd.exe, which parses its arguments
+        return f"{kind} could not start", (  # Windows runs a batch file through cmd.exe, which parses its arguments
             f"{head} could not start: {program} is a batch file, so cmd.exe would read &, |, <, >, ^, % and quotes in"
             " its arguments as its own. Put the command in a script, or call the program it starts (such as node)"
             " directly."), None
-    env = environment(("AGON_", "CLAUDE_PLUGIN_OPTION_"))
+    env = environment(("AGON_", "CLAUDE_PLUGIN_OPTION_"), **(add or {}))
     try:
         code, out, _, reason = run_cli([program, *argv[1:]], None, folder, env, min(started + limit, end), stopped,
                                        tests=True)
     except OSError as e:  # not a program this system can start, no permission...
-        return "tests could not start", f"{head} could not start: {e}.", None
+        return f"{kind} could not start", f"{head} could not start: {e}.", None
     spent = took(time.monotonic() - started)
     if code is None and reason:
-        return None, None, f"Agon stopped the tests after {spent}: {reason}."
+        return None, None, f"Agon stopped the {kind} after {spent}: {reason}."
     if code is None and started + limit < end:
-        outcome, how = "tests timed out", f"didn't finish in {took(limit)} (AGON_TEST_TIMEOUT), so Agon stopped it"
+        outcome, how = f"{kind} timed out", f"didn't finish in {took(limit)} ({var}), so Agon stopped it"
     elif code is None:
-        outcome, how = "tests timed out", f"ran {spent} until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it"
+        outcome, how = f"{kind} timed out", f"ran {spent} until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it"
     elif code:
-        outcome, how = "tests failed", f"failed with exit code {code} after {spent}"
+        outcome, how = f"{kind} failed", f"failed with exit code {code} after {spent}"
     else:
-        outcome, how = "tests passed", f"passed (exit code 0) in {spent}"
+        outcome, how = f"{kind} passed", f"passed (exit code 0) in {spent}"
     if not (output := "\n".join("    " + row for row in out.strip().splitlines())):
         return outcome, f"{head} {how}. It printed nothing.", None
     if len(output) > TEST_TAIL:  # its end, cut after the indents so that short lines can't make it longer
@@ -1123,11 +1185,11 @@ def repath(text, olds, new):
                   flags=re.I if os.name == "nt" else 0)
 
 
-def new_worktree(top, name):
-    """A new branch for agent `name`'s task at the last commit, checked out in a temporary git worktree: (the
-    worktree's folder, the branch, the commit it starts from)."""
-    base = git(top, "rev-parse", "HEAD")
-    branch = f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+def new_worktree(top, name, branch=None, base=None):
+    """A new branch for agent `name`'s task at the last commit (or at `base`), checked out in a temporary git worktree:
+    (the worktree's folder, the branch, the commit it starts from)."""
+    base = base or git(top, "rev-parse", "HEAD")
+    branch = branch or f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
     taken = git(top, "branch", "--list", "--format=%(refname:short)", f"{branch}*").splitlines()
     branch = next(b for b in (branch, *(f"{branch}-{i}" for i in range(2, 1000))) if b not in taken)
     path = tempfile.mkdtemp(prefix=f"agon-{name}-")
@@ -1270,6 +1332,21 @@ def ask_once(asker, name, mode, prompt, cwd, top, end, stopped, tests, tested):
     return answer, problem, limit, (branch if stat else None), stat, tested
 
 
+def begin_ask(asker, agent, mode, cwd, task=None):
+    """Record an ask as it starts, for the arena (which also shows who works on it) and the scoreboard: its row's id."""
+    return db().execute("INSERT INTO asks(asker, agent, mode, task, project, started) VALUES (?, ?, ?, ?, ?, ?)",
+                        (asker, agent, mode, task, toplevel(cwd), time.time())).lastrowid
+
+
+def end_ask(ask, answered=None, verdict=None, tests=None, branch=None, problem=None):
+    """Record how ask `ask` ended: who answered, the verdict, what came of the tests, the branch, or why it failed. Once:
+    a later call changes nothing. Best effort: the ask's own answer matters more than its record."""
+    with contextlib.suppress(sqlite3.Error):
+        db().execute("UPDATE asks SET ended = ?, answered = COALESCE(?, answered), verdict = ?, tests = ?, branch = ?,"
+                     " problem = ? WHERE id = ? AND ended IS NULL", (time.time(), answered, verdict, tests, branch,
+                                                                    problem and clip(problem, 1000), ask))
+
+
 def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
     if paused():
@@ -1279,6 +1356,17 @@ def tool_ask(session, args):
     except ToolError as e:
         raise ToolError(f"Nothing asked: a task works on a new branch from your last commit, and {e}.") from None
     tests = test_command()  # a bad setting stops the ask before anything runs
+    ask = begin_ask(session.me, agent, mode, cwd)
+    try:
+        return ask_rounds(session, ask, agent, prompt, mode, cwd, top, tests)
+    except BaseException as e:  # its end is recorded, unless it was already
+        end_ask(ask, problem=str(e) or type(e).__name__)
+        raise
+
+
+def ask_rounds(session, ask, agent, prompt, mode, cwd, top, tests):
+    """The rounds of ask `ask` (its row in asks): `agent` answers, or the next agent in AGON_FALLBACK while one is out of
+    quota. The row says who is trying, and how it ended."""
     me, started = session.me, time.monotonic()
     end, head, skipped = started + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT), f"{me} asked {agent} for a {mode}", []
     tested = None  # a review's tests: run once, in the project folder, before the first reviewer starts
@@ -1304,6 +1392,8 @@ def tool_ask(session, args):
                 branch = None
                 break
             tested = outcome, report
+        with contextlib.suppress(sqlite3.Error):  # the arena shows who works on it now
+            db().execute("UPDATE asks SET answered = ? WHERE id = ?", (name, ask))
         try:
             answer, problem, limit, branch, stat, tested = ask_once(me, name, mode, prompt, cwd, top, end, halt, tests,
                                                                     tested)
@@ -1323,29 +1413,33 @@ def tool_ask(session, args):
     if problem:
         if branch:
             problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
+        end_ask(ask, answered=name, branch=branch, problem=problem)
         post("agon", "human", f"{head}: {lead if name else ''}{problem}")  # every ask shows in the arena, wakes no one
         raise ToolError(f"{lead if name else ''}{problem}")
     outcome, report = tested  # what Agon's own run of the tests showed, whatever the agent says
     summary = clip(answer, max(2000, MAX_INBOX - 500 - len(report)))  # a long PATH in the report can't wipe it out
     if branch:
+        end_ask(ask, answered=name, tests=outcome, branch=branch)
         post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch} ({outcome}):"
                               f" {stat.splitlines()[-1].strip()}.")
         return (f"{lead}{name} finished the task in {spent} on branch {branch} ({outcome}):\n{stat}\nMerge it if you"
                 f" want it: git merge {branch} (or drop it: git branch -D {branch}).\n\n{report}\n\nIts summary:\n"
                 f"{summary}"), None
     if top:
+        end_ask(ask, answered=name, tests=outcome)
         post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file ({outcome}).")
         return (f"{lead}{name} finished the task in {spent} without changing any file ({outcome}).\n\n{report}\n\n"
                 f"Its summary:\n{summary}"), None
     seal = (f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict") + f" ({outcome})"
+    end_ask(ask, answered=name, verdict=verdict(answer), tests=outcome)
     post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
     return f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n{summary}", None
 
 
 # The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
 # an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
-BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version FROM"
-             " tasks")
+BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version,"
+             " project FROM tasks")
 FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
 STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
 
@@ -1734,6 +1828,7 @@ def board_done(session, args):
     outcome, report, problem = run_tests(tests, folder, time.monotonic() + (tests[1] + 60 if tests else 0), halt)
     if problem:
         raise ToolError(problem)
+    project = toplevel(folder) if folder else project_of(args.get("cwd"))  # the scoreboard counts per project
     now = time.time()
     with transaction() as con:
         t = board_task(tid)
@@ -1741,7 +1836,8 @@ def board_done(session, args):
         online = reviewers(t, now)  # after changes, the one who asked for them looks again
         reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
         con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?,"
-                    " version = version + 1 WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+                    " version = version + 1, project = COALESCE(?, project) WHERE id = ?",
+                    (reviewer, note, outcome, report, now, project, tid))
         version = t["version"] + 1  # what an automatic review must still find: nothing else wrote meanwhile
         said = f"\n{me}'s note:\n{indented(clip(note.strip(), 1000))}" if note.strip() else ""
         if reviewer:
@@ -1790,6 +1886,8 @@ def settle(t, reviewer, verdict, evidence, sender, by):
     tasks it frees (else only its owner hears); changes send it back to its owner, or to the board when the owner is
     away. `sender` posts the message, which quotes the `evidence` as `by`'s. Returns what the reviewer is told."""
     con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
+    con.execute("INSERT INTO reviews(task, owner, reviewer, verdict, tests, at) VALUES (?, ?, ?, ?, ?, ?)",
+                (tid, owner, reviewer, verdict, tests, now))  # the scoreboard's history: the task's own row changes
     said = f"\n{by}:\n{indented(clip(evidence.strip(), 1500))}"
     if verdict == "approve":
         con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
@@ -1831,6 +1929,7 @@ def auto_review(session, tid, owner, cwd, tested, version):
         if paused():
             return "the human paused the team"
 
+    ask = None
     try:
         started, end = time.monotonic(), time.monotonic() + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
         t, skipped, answer, problem = board_task(tid), [], None, None
@@ -1838,13 +1937,17 @@ def auto_review(session, tid, owner, cwd, tested, version):
                   f"What was asked:\n{indented(clip(t['spec'], 3000)) or '    (no spec)'}\n{owner}'s note:\n"
                   f"{indented(clip(t['note'], 3000)) or '    (none)'}\nThe work is in the project folder as it is now.")
         before = had_it(tid)
-        for name in sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before):  # the other companies
+        names = sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before)  # the other companies
+        ask = begin_ask("agon", names[0] if names else "nobody", "review", cwd, tid)  # the arena shows it as an ask
+        for name in names:
             if until := quota_until(name):
                 skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
                 continue
             if why := barred(name):
                 skipped.append(why)
                 continue
+            with contextlib.suppress(sqlite3.Error):
+                db().execute("UPDATE asks SET answered = ? WHERE id = ?", (name, ask))
             try:
                 answer, problem, limit, _, _, _ = ask_once(owner, name, "review", prompt, cwd, None, end, halt, None,
                                                            tested)
@@ -1859,9 +1962,11 @@ def auto_review(session, tid, owner, cwd, tested, version):
         else:
             name, problem = None, f"nobody could review it: {'; '.join(skipped) or 'AGON_FALLBACK names nobody else'}"
         if problem:
+            end_ask(ask, answered=name, problem=problem)
             return post("agon", "human", f"Agon's automatic review of task #{tid} failed: {problem.rstrip('.')}. It"
                                          " still waits for a review.")
         found = verdict(answer)
+        end_ask(ask, answered=name, verdict=found, tests=tested[0])
         by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
         with transaction():
             t = board_task(tid)
@@ -1871,6 +1976,8 @@ def auto_review(session, tid, owner, cwd, tested, version):
                                            f"{indented(clip(answer.strip(), 3000))}")
             settle(t, name, found, answer, "agon", by)
     except Exception as e:  # a bad setting, agon.db locked...: the human hears of it, the task still waits
+        if ask:
+            end_ask(ask, problem=str(e))
         post("agon", "human", f"Agon's automatic review of task #{tid} failed: {e}")
     finally:
         close_db()
@@ -1961,6 +2068,9 @@ def call_tool(session, params):
     try:  # its model called a tool, so it isn't out of quota (any more): it may review, and it is asked again
         db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = ? AND out_of_quota_until IS NOT NULL",
                      (session.me,))
+        if not session.headless:  # and it works: since now, unless a hook said so already (see mark())
+            now = time.time()
+            db().execute("UPDATE agents SET busy = ? WHERE name = ? AND busy <= ?", (now, session.me, now - BUSY))
     except sqlite3.Error:
         pass  # best effort, as for presence
     try:
@@ -2424,11 +2534,13 @@ def write_json(out, decision):
 
 
 def mark(me, busy):
-    """A hook of agent `me`'s Claude Code session says since when the session works (`busy`), or that it is idle (0). Its
-    MCP server's row in `live` has the same inbox socket path (see register()): the session's own, whatever /clear or
-    /resume did to its id. Best effort, like presence."""
-    if path := os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"):
-        with contextlib.suppress(sqlite3.Error):
+    """A hook of agent `me`'s app says since when the app works (`busy`), or that it is idle (0): the arena's roster shows
+    it. In Claude Code, the row in `live` of the session's MCP server too, found by its inbox socket path (see
+    register()): the session's own, whatever /clear or /resume did to its id; autopilot posts only to an idle session.
+    Best effort, like presence."""
+    with contextlib.suppress(sqlite3.Error):
+        db().execute("UPDATE agents SET busy = ? WHERE name = ?", (busy, me))
+        if path := os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"):
             db().execute("UPDATE live SET busy = ? WHERE agent = ? AND socket = ?", (busy, me, path))
 
 
@@ -3192,65 +3304,1602 @@ def stats(out=None):
             " at API prices, not what a plan charges; Codex and agy report no cost.")
 
 
-PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Agon</title>
-<style>
-  body { margin: 0; font: 15px system-ui, sans-serif; background: #16161a; color: #ddd; }
-  #log { padding: 16px 16px 90px; max-width: 900px; margin: auto; }
-  .m { margin: 10px 0; padding: 10px 14px; border-radius: 10px; background: #222228; border-left: 4px solid #888; }
-  .m b { margin-right: 8px; } .m i { color: #777; font-size: 12px; }
-  .m pre { margin: 6px 0 0; white-space: pre-wrap; font: inherit; }
-  .claude { border-color: #d97757; } .claude b { color: #d97757; }
-  .gemini { border-color: #4f8ff7; } .gemini b { color: #4f8ff7; }
-  .gpt { border-color: #10a37f; } .gpt b { color: #10a37f; }
-  .human { border-color: #eee; background: #2b2b33; }
-  form { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 8px; padding: 14px; background: #101013; }
-  input, select, button { font: inherit; padding: 10px; border-radius: 8px; border: 1px solid #333; background: #222228; color: #eee; }
-  input { flex: 1; min-width: 0; }
-</style>
-<div id="log"></div>
-<form id="f">
-  <select id="to"><option>all</option><option>claude</option><option>gemini</option><option>gpt</option></select>
-  <input id="t" placeholder="Task or message for the team..." autofocus autocomplete="off">
-  <button>Send</button>
-</form>
-<script>
-let last = 0;
-async function loop() {
-  try {
-    const rows = await (await fetch('/msgs?after=' + last)).json();
-    for (const [id, sender, rcpt, text, ts] of rows) {
-      last = id;
-      const d = document.createElement('div');
-      d.className = 'm ' + sender;
-      d.innerHTML = '<b></b><i></i><pre></pre>';
-      d.querySelector('b').textContent = sender + ' \\u2192 ' + rcpt;
-      d.querySelector('i').textContent = ts;
-      d.querySelector('pre').textContent = text;
-      log.append(d);
-    }
-    if (rows.length) scrollTo(0, document.body.scrollHeight);
-  } catch {}
-  setTimeout(loop, 1000);
+# The arena (Phase 6), where the human watches and steers: the page follows the chat and every change of the team and the
+# board through Server-Sent Events (GET /events), and reads the same snapshot at GET /board
+APPS = {"claude-code": "Claude Code", "codex-mcp-client": "Codex", "antigravity-client": "Antigravity"}  # by clientInfo
+TEAM = ("claude", "gpt", "gemini")  # on the roster from the start; another agent stays there for a week after its visit
+ASK_STALE = 7200  # an ask without an end this many seconds after its start lost its server: it is no work any more
+WINDOWS = {"five_hour": "5h", "seven_day": "7d", "spend_limit": "spend"}  # a plan's windows in Claude Code's status line
+
+
+def number_(value):
+    """Whether `value` from JSON is a finite number (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def autopilot_state(now):
+    """Autopilot's heartbeat as the arena shows it (its process, folder, agents and lead), or None when none runs."""
+    row = db().execute("SELECT value FROM state WHERE key = 'autopilot'").fetchone()
+    try:
+        info = json.loads(row[0]) if row else {}
+    except ValueError:
+        info = {}
+    if isinstance(info, dict) and number_(info.get("beat")) and info["beat"] > now - LIVE:
+        return {key: info.get(key) for key in ("pid", "project", "agents", "lead")}
+
+
+def team_state(now):
+    """The roster: each agent's fuel, from what Agon knows. `state` is limit (out of quota `until` the reset), resting
+    (until `until`, autopilot's brake: `why`), working (`since`: an autopilot turn, a duel, an ask, or its app's hooks and
+    tool calls; `why`), idle (seen within ONLINE seconds) or away. With its app, whether one of its apps is open, its
+    board tasks, what autopilot's wakes took today, and the plan's usage its status line reported (`gauge`: each window
+    with its percentage and when Agon heard it). Times that often move are rounded to the minute, so that the snapshot
+    only changes when something did."""
+    con, auto = db(), autopilot_state(now)
+    agents = {row[0]: row[1:] for row in con.execute("SELECT name, client, last_seen, out_of_quota_until, busy FROM"
+                                                     " agents")}
+    pilot = {agent: (parked, why) for agent, parked, why in con.execute("SELECT agent, parked, why FROM pilot")}
+    runs = dict(con.execute("SELECT agent, MAX(started) FROM runs WHERE status = 'running' GROUP BY agent")) if auto else {}
+    asks = {}
+    for worker, asker, mode, task, started in con.execute(
+            "SELECT COALESCE(answered, agent), asker, mode, task, started FROM asks WHERE ended IS NULL AND started > ?"
+            " ORDER BY id", (now - ASK_STALE,)):
+        asks.setdefault(worker, (asker, mode, task, started))
+    duels = {}  # a duelist works until the duel ends: when its entry is done would tell whose entry is whose
+    for duel, agent, since in con.execute("SELECT duel, agent, duels.started FROM entries JOIN duels ON duels.id ="
+                                          " entries.duel WHERE duels.state = 'running'"):
+        duels.setdefault(agent, (duel, since))
+    live = {}
+    for agent, busy in con.execute("SELECT agent, busy FROM live WHERE beat > ?", (now - LIVE,)):
+        live[agent] = max(live.get(agent, 0), busy)
+    today = {row[0]: row[1:] for row in con.execute(
+        "SELECT agent, COUNT(*), COALESCE(SUM(tokens_in + tokens_out), 0), COALESCE(SUM(usd), 0) FROM runs WHERE"
+        " started >= ? GROUP BY agent", (midnight(now),))}
+    gauges = {}
+    for agent, window, used, resets, seen in con.execute(
+            "SELECT agent, window, used, resets, seen FROM gauges WHERE resets IS NULL OR resets > ? ORDER BY agent,"
+            " window", (now,)):
+        gauges.setdefault(agent, []).append({"window": window, "label": WINDOWS.get(window, window), "used": used,
+                                             "resets": resets, "seen": seen})
+    tasks = {}
+    for t in board_tasks("WHERE state IN ('doing', 'review')"):
+        tasks.setdefault(t["owner"], []).append({"id": t["id"], "title": t["title"], "role": t["state"]})
+        if t["state"] == "review" and t["reviewer"]:
+            tasks.setdefault(t["reviewer"], []).append({"id": t["id"], "title": t["title"], "role": "reviewer"})
+    busy_ones = set(runs) | set(duels) | set(asks) | set(live) | set(tasks)
+    week = now - 7 * 86400
+    names = [*TEAM, *sorted(name for name, (_, seen, _, _) in agents.items()
+                            if name not in TEAM and ((seen or 0) > week or name in busy_ones))]
+    roster = []
+    for name in names:
+        client, seen, until, busy = agents.get(name, (None, None, None, 0))
+        parked, why = pilot.get(name, (None, None))
+        busy = max(busy or 0, live.get(name, 0))
+        entry = {"name": name, "app": APPS.get(client, client or ""), "open": name in live,
+                 "seen": seen and seen // 60 * 60, "tasks": tasks.get(name, []), "gauge": gauges.get(name, [])}
+        if name in today:
+            entry["today"] = dict(zip(("wakes", "tokens", "usd"), today[name]))
+        if until and until > now:
+            entry |= {"state": "limit", "until": until}
+        elif parked and parked > now:
+            entry |= {"state": "resting", "until": parked, "why": why}
+        elif name in runs:
+            entry |= {"state": "working", "since": runs[name], "why": "autopilot woke it"}
+        elif name in duels:
+            entry |= {"state": "working", "since": duels[name][1], "why": f"duel #{duels[name][0]}"}
+        elif name in asks:
+            asker, mode, task, started = asks[name]
+            what = f"a review of task #{task}" if task else "a review" if mode == "review" else "a task"
+            entry |= {"state": "working", "since": started, "why": f"{what} for {asker}"}
+        elif busy > now - BUSY:
+            entry |= {"state": "working", "since": busy, "why": ""}
+        elif seen and seen > now - ONLINE:
+            entry |= {"state": "idle"}
+        else:
+            entry |= {"state": "away"}
+        roster.append(entry)
+    return roster
+
+
+def arena_state(now=None):
+    """What the arena shows, as JSON: whether the team is paused, autopilot, the roster (see team_state()), the open
+    tasks and the latest done ones (without their long texts: GET /board?id=N has one in full), the latest asks, the
+    latest duels (GET /board?duel=N has one in full), the commands a duel runs, the folder its form starts with, and
+    the scoreboard."""
+    now = now or time.time()
+    everything = board_tasks()
+    states = {t["id"]: t["state"] for t in everything}
+    done = [t for t in everything if t["state"] == "done"]
+    tasks = [{"id": t["id"], "title": t["title"], "state": t["state"], "owner": t["owner"], "reviewer": t["reviewer"],
+              "author": t["author"], "files": t["files"], "after": [[i, states.get(i, "gone")] for i in t["after"]],
+              "tests": t["tests"], "project": t["project"]} for t in everything if t["state"] != "done"] + [
+        {"id": t["id"], "title": t["title"], "state": "done", "owner": t["owner"], "reviewer": t["reviewer"],
+         "author": t["author"], "files": t["files"], "after": [], "tests": t["tests"], "project": t["project"]}
+        for t in done[-10:]]
+    cur = db().execute("SELECT id, asker, agent, answered, mode, task, started, ended, verdict, tests, branch, problem"
+                       " FROM asks ORDER BY id DESC LIMIT 20")
+    names = [column[0] for column in cur.description]
+    asks = [dict(zip(names, row)) | {"problem": row[-1] and clip(row[-1], 300)} for row in cur]
+    auto = autopilot_state(now)
+    return {"now": now, "paused": paused(), "autopilot": auto, "team": team_state(now), "tasks": tasks,
+            "done": len(done), "asks": asks, "duels": duels_state(), "checks": checks_state(),
+            "project": default_project(auto), "score": scoreboard()}
+
+
+def task_state(tid):
+    """One task in full for the arena: its fields, spec, notes, the report of the tests at done, and every verdict."""
+    t = board_task(tid)
+    t["reviews"] = [dict(zip(("reviewer", "verdict", "tests", "at"), row)) for row in db().execute(
+        "SELECT reviewer, verdict, tests, at FROM reviews WHERE task = ? ORDER BY id", (tid,))]
+    return t
+
+
+# Duels: the same task for two or three agents, each on a branch of its own from one commit, in a temporary git worktree
+# (the project's own folder and its test runs stay untouched). Agon runs the human's setup command in each worktree and
+# the tests on each entry and on the commit they all start from (the baseline), one run at a time; then another
+# duelist's company reviews each entry, read-only. The entries are A, B and C, in a random order, and whose is whose
+# stays hidden until the human picks the winner. Agon shows how to merge it, and never merges
+SETUP_TIMEOUT = 600  # seconds a duel's setup command may take in each worktree (AGON_SETUP_TIMEOUT)
+DUEL = """The human asks you to do a task through Agon, where AI agents from different companies build one project.
+You work in a git worktree of your own. When you finish, Agon {tests}commits what you changed to branch {branch}, and
+the human decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, board, ask).
+End with a short summary of what you changed.
+
+The task:
+{prompt}"""
+DUEL_REVIEW = """The human asks you for a code review through Agon, where AI agents from different companies build one project.
+Review only: don't change any files.{copy} An agent did the task below in this folder, a git worktree: its work is the
+commit on top of {base} (git diff {base} HEAD shows it). Don't run the tests: Agon ran them on the work and on {base},
+before it, and their results are below. Approve only if the work does the task well: tests that fail or don't finish
+mean changes, unless they failed on {base} too and the task didn't ask to fix them. If no tests ran (they couldn't
+start, or the human hasn't set a test command), or their output shows that none ran, say so and review by reading the
+code. The tests can be changed too: look at changes to tests and their settings with extra care. Your final message is
+the answer; don't use Agon's tools (send, inbox, board, ask).
+End it with one line: VERDICT: approve, or VERDICT: changes.
+
+{tests}
+
+The task:
+{prompt}"""
+LABELS = "abc"
+IDENTITY = {"claude": ("claude code", "claude", "anthropic"), "gpt": ("gpt", "codex", "openai"),  # what names an
+            "gemini": ("gemini", "antigravity", "agy", "google")}  # entry's agent in its errors while the duel is blind
+DUELS = {}  # duel id -> the thread that runs it, in this arena: the only one (it holds the port)
+DUEL_STOPS = {}  # duel id -> why the human stopped it
+CHECKS_LOCK = threading.Lock()  # a duel's setup and test runs go one at a time: they may share ports, files, a database
+SETTLED = ("done", "failed", "setup failed")  # an entry that ended on its own
+
+
+class Stopped(Exception):
+    """A duel that must stop now: STOP, the human's stop, the arena closing."""
+
+
+def setup_command():
+    """The human's setup command for a duel's worktrees, which have only what git tracks (no node_modules, .venv or
+    .env): AGON_SETUP_CMD, as (its arguments, the seconds it may take: AGON_SETUP_TIMEOUT, 600), or None. Like
+    AGON_TEST_CMD, from the environment only, never from a tool's arguments or the arena, and run the same way (see
+    run_tests()), with AGON_ROOT, the project's own folder, to copy an .env from."""
+    raw = os.environ.get("AGON_SETUP_CMD", "").strip()
+    return (split_command(raw, "AGON_SETUP_CMD", ["npm", "ci"]), seconds("AGON_SETUP_TIMEOUT", SETUP_TIMEOUT)) if raw \
+        else None
+
+
+def listed(words):
+    """claude, gpt and gemini."""
+    return " and ".join(filter(None, [", ".join(words[:-1]), words[-1]]))
+
+
+def cannot_run(agent, now):
+    """Why agent `agent`'s app can't work for a duel now, or None: out of quota, not found, or barred (see barred())."""
+    if until := quota_until(agent):
+        return f"Can't run {agent} now: it is out of quota until ~{reset_clock(until, now)}"
+    try:
+        ask_command(agent, "task", "", "")
+    except ToolError as e:
+        return str(e).rstrip(".")
+    return barred(agent)
+
+
+def compared(baseline, tests):
+    """What an entry's tests showed, next to the same tests on the commit the duel started from."""
+    both = baseline, tests
+    if both == ("tests passed", "tests failed"):
+        return "tests failed: they passed before it"
+    if both == ("tests failed", "tests passed"):
+        return "tests passed: they failed before it"
+    if both == ("tests failed", "tests failed"):
+        return "tests failed, as before it"
+    return tests or ""
+
+
+def entries_of(duel):
+    """A duel's entries, as dicts, in label order."""
+    cur = db().execute("SELECT * FROM entries WHERE duel = ? ORDER BY label", (duel,))
+    names = [column[0] for column in cur.description]
+    return [dict(zip(names, row)) for row in cur]
+
+
+def enter(duel, label, **fields):
+    """Record what happened to entry `label` of duel `duel`."""
+    db().execute(f"UPDATE entries SET {', '.join(f'{key} = ?' for key in fields)} WHERE duel = ? AND label = ?",
+                 (*fields.values(), duel, label))
+
+
+def end_duel(duel, state, note=""):
+    db().execute("UPDATE duels SET state = ?, ended = ?, note = ? WHERE id = ?", (state, time.time(), note, duel))
+
+
+def start_duel(prompt, agents, folder):
+    """A duel the human starts in the arena: `prompt` for `agents` (two or three of claude, gpt and gemini), in the git
+    repository of `folder`, from its last commit; one duel at a time. An agent that can't work now stays out, if two
+    can. Checked here, then run in a thread of its own (see run_duel()); returns its id. The agents' tools can't start
+    one: they stay four."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ToolError("Nothing started: give the task.")
+    if problem := too_long(prompt, "task"):
+        raise ToolError(f"Nothing started: {problem}")
+    if not isinstance(agents, list) or not all(isinstance(agent, str) for agent in agents):
+        agents = []
+    agents = list(dict.fromkeys(agent.strip() for agent in agents))
+    if not 2 <= len(agents) <= 3 or any(agent not in COMMANDS for agent in agents):
+        raise ToolError("Nothing started: a duel is between two or three of claude, gpt and gemini.")
+    folder = folder.strip() if isinstance(folder, str) else ""
+    if not os.path.isabs(folder) or not os.path.isdir(folder):
+        raise ToolError("Nothing started: the project folder must be the full path of a folder.")
+    if paused():
+        raise ToolError(f"Nothing started: {PAUSED}")
+    try:
+        top = os.path.normpath(repository(folder))
+    except ToolError as e:
+        raise ToolError(f"Nothing started: the entries start from your last commit, and {e}.") from None
+    test_command(), setup_command()  # a bad setting stops it before anything runs
+    now = time.time()
+    out = {agent: why for agent in agents if (why := cannot_run(agent, now))}
+    agents = [agent for agent in agents if agent not in out]
+    if len(agents) < 2:
+        raise ToolError(f"Nothing started: a duel needs two agents that can work now. {'. '.join(out.values())}.")
+    base = git(top, "rev-parse", "HEAD")
+    labels = random.sample(LABELS[:len(agents)], len(agents))  # A isn't the first one ticked: the order tells nothing
+    with transaction() as con:
+        if row := con.execute("SELECT id FROM duels WHERE state = 'running'").fetchone():
+            raise ToolError(f"Nothing started: duel #{row[0]} still runs, and duels go one at a time.")
+        duel = con.execute("INSERT INTO duels(project, prompt, base, started) VALUES (?, ?, ?, ?)",
+                           (top, prompt, base, now)).lastrowid
+        con.executemany("INSERT INTO entries(duel, label, agent) VALUES (?, ?, ?)",
+                        [(duel, label, agent) for label, agent in zip(labels, agents)])
+    post("agon", "human", f"Duel #{duel} started: {listed(agents)} do the same task, each on a branch of its own from"
+                          f" {base[:7]}" + (" (without your uncommitted changes)" if git(top, "status", "--porcelain")
+                                            else "") + f", as entries {listed(sorted(LABELS[:len(agents)].upper()))};"
+                          " whose is whose stays hidden until you pick the winner."
+                          + (f" Left out: {'. '.join(out.values())}." if out else ""))
+    DUELS[duel] = threading.Thread(target=run_duel, args=(duel,), name=f"duel-{duel}", daemon=True)
+    DUELS[duel].start()
+    return duel
+
+
+def together(threads):
+    """Start `threads` and wait for them all."""
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def run_duel(duel):
+    """A duel's thread, from start_duel(). One at a time: each entry's worktree (git locks the repository's shared files)
+    and the baseline's, then the setup command in each. Then the agents, all at once, headless as ask runs a task, while
+    the tests run on the baseline; each entry's tests once its agent is done, one run at a time, and its commit, by
+    "Agon duel A". Then the reviews, all at once. The worktrees go; the branches with work wait for the human's pick.
+    STOP, the human's stop and the arena closing stop it with its apps, and a stopped duel leaves nothing behind."""
+    trees, top = {}, None  # trees: an entry's label, or base -> its worktree
+    try:
+        top, prompt, base = db().execute("SELECT project, prompt, base FROM duels WHERE id = ?", (duel,)).fetchone()
+        tests, setup, limit = test_command(), setup_command(), seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
+
+        def halt():  # why the duel's apps must stop now, if they must
+            if ARENA_CLOSING.is_set():
+                return "the arena closed"
+            if why := DUEL_STOPS.get(duel):
+                return why
+            if paused():
+                return "the human paused the team"
+
+        labels = [e["label"] for e in entries_of(duel)]
+        for label in labels:
+            trees[label], branch, _ = new_worktree(top, f"duel-{duel}{label}", f"agon/duel-{duel}-{label}", base)
+            enter(duel, label, branch=branch)
+        if tests:  # the commit they all start from, for the baseline's run
+            trees["base"] = tempfile.mkdtemp(prefix=f"agon-duel-{duel}-base-")
+            git(top, "worktree", "add", "-q", "--detach", trees["base"], base)
+        for label in [*(["base"] if tests else []), *labels] if setup else []:
+            if why := halt():
+                raise Stopped(why)
+            if label != "base":
+                enter(duel, label, state="setup")
+            with CHECKS_LOCK:
+                outcome, report, problem = run_tests(setup, trees[label], time.monotonic() + setup[1] + 60, halt,
+                                                     "setup", {"AGON_ROOT": top})
+            if problem:
+                raise Stopped(problem)
+            if label == "base":
+                if outcome != "setup passed":  # then no tests run there: the setup's report says why
+                    db().execute("UPDATE duels SET baseline = ?, report = ? WHERE id = ?", (outcome, report, duel))
+            elif outcome == "setup passed":
+                enter(duel, label, state="waiting")
+            else:
+                enter(duel, label, state="setup failed", tests=outcome, report=report)
+        ready = [e for e in entries_of(duel) if e["state"] == "waiting"]
+        if not ready:
+            raise ToolError("the setup command (AGON_SETUP_CMD) failed in every worktree: each entry shows how")
+        workers = [threading.Thread(target=duel_entry, args=(duel, e, trees[e["label"]], base, prompt, tests, limit,
+                                                              halt)) for e in ready]
+        if tests and not db().execute("SELECT baseline FROM duels WHERE id = ?", (duel,)).fetchone()[0]:
+            workers.append(threading.Thread(target=duel_baseline, args=(duel, trees["base"], tests, halt)))
+        together(workers)
+        if why := halt():
+            raise Stopped(why)
+        baseline, entries, reviews = db().execute("SELECT baseline, report FROM duels WHERE id = ?",
+                                                  (duel,)).fetchone(), entries_of(duel), []
+        for i, e in enumerate(entries):
+            if e["state"] != "done" or not e["stat"]:
+                continue
+            # the next duelist reviews it, in label order (A by B, B by C, C by A), or the one after when it can't
+            others = [entries[(i + k) % len(entries)]["agent"] for k in range(1, len(entries))]
+            if reviewer := next((agent for agent in others if not cannot_run(agent, time.time())), None):
+                reviews.append(threading.Thread(target=duel_review, args=(duel, e, reviewer, trees[e["label"]], base,
+                                                                           prompt, baseline, tests, limit, halt)))
+            else:
+                enter(duel, e["label"], problem="No other duelist could review it: out of quota, or unable to run.")
+        together(reviews)
+        if why := halt():
+            raise Stopped(why)
+        entries = entries_of(duel)
+        if not any(e["stat"] for e in entries):
+            raise ToolError("no entry changed any file")
+        end_duel(duel, "ready")
+        post("agon", "human", f"Duel #{duel} is ready. " + " ".join(entry_line(e, baseline[0]) for e in entries)
+             + ("" if tests else " No tests ran: AGON_TEST_CMD isn't set.") + " Pick the winner in the arena.")
+    except Stopped as e:
+        why = str(e).rstrip(".")
+        with contextlib.suppress(sqlite3.Error):
+            for entry in entries_of(duel):
+                if entry["state"] not in SETTLED:
+                    enter(duel, entry["label"], state="stopped")
+            end_duel(duel, "stopped", why)
+            post("agon", "human", f"Duel #{duel} stopped: {why}. It leaves nothing behind.")
+    except Exception as e:  # git failed, a bad setting, agon.db locked...: the human hears of it
+        why = str(e).rstrip(".")
+        with contextlib.suppress(sqlite3.Error):
+            for entry in entries_of(duel):
+                if entry["state"] not in SETTLED:
+                    enter(duel, entry["label"], state="failed")
+            end_duel(duel, "failed", why)
+            post("agon", "human", f"Duel #{duel} failed: {why}.")
+    finally:
+        if top is not None:
+            clean_duel(duel, top, trees.values())
+        DUELS.pop(duel, None)
+        DUEL_STOPS.pop(duel, None)
+        close_db()
+
+
+def entry_line(e, baseline):
+    """How entry `e` ended, for the chat: A: tests passed, review: approve (2 files changed, 10 insertions(+))."""
+    parts = [] if e["state"] == "done" else [e["state"]]
+    if e["tests"] and e["tests"] != NO_TESTS and e["state"] != "setup failed":
+        parts.append(compared(baseline, e["tests"]))
+    if e["reviewer"]:
+        parts.append(f"review: {e['verdict'] or 'no verdict'}")
+    change = e["stat"].splitlines()[-1].strip() if e["stat"] else "no changes"
+    return f"{e['label'].upper()}: " + (f"{', '.join(parts)} ({change})." if parts else f"{change}.")
+
+
+def clean_duel(duel, top, trees):
+    """Remove duel `duel`'s worktrees `trees` from the repository at `top`, then the branches that hold nothing to pick:
+    all of them when the duel stopped, else those without work. Best effort."""
+    for path in trees:
+        for wait in (0, 1, 2):  # Windows may keep a folder a moment after the processes that worked in it were killed
+            time.sleep(wait)
+            try:
+                git(top, "worktree", "remove", "--force", path)
+                break
+            except (ToolError, OSError):
+                if not os.path.exists(path):
+                    break
+        rmtree(path)
+    with contextlib.suppress(ToolError, OSError):
+        git(top, "worktree", "prune")  # a folder Windows kept longer: git lets its branch go once it's forgotten
+    with contextlib.suppress(sqlite3.Error):
+        state = db().execute("SELECT state FROM duels WHERE id = ?", (duel,)).fetchone()[0]
+        for e in entries_of(duel):
+            if e["branch"] and (state in ("stopped", "interrupted") or not e["stat"]):
+                with contextlib.suppress(ToolError, OSError):
+                    git(top, "branch", "-D", e["branch"])
+                    enter(duel, e["label"], branch=None)
+
+
+def duel_entry(duel, e, path, base, prompt, tests, limit, halt):
+    """One entry's turn, in a thread of its own: its agent does the task headless in worktree `path`, as ask runs a task,
+    then Agon runs the tests on its work (staged first, so that what the tests leave isn't committed) and commits it
+    as "Agon duel A"."""
+    label, agent = e["label"], e["agent"]
+    try:
+        enter(duel, label, state="working", started=time.time())
+        runs = f"runs the project's tests (`{command_line(tests[0])}`) there, " if tests else ""
+        answer, problem, hit = ask_run("human", agent, "task", DUEL.format(tests=runs, branch=e["branch"], prompt=prompt),
+                                       path, time.monotonic() + limit, halt)
+        if hit:
+            out_of_quota(agent, hit, own=False)  # marked until it resets, and the team is told
+        git(path, "add", "-A")
+        outcome = report = None
+        if not problem and tests:
+            enter(duel, label, state="testing")
+            with CHECKS_LOCK:  # with a time limit of their own: the wait for the lock takes nothing from them
+                outcome, report, problem = run_tests(tests, path, time.monotonic() + tests[1] + 60, halt)
+        elif not problem:
+            outcome, report, _ = run_tests(None, path, 0, halt)
+        if git(path, "diff", "--cached", "--name-only"):
+            git(path, "-c", f"user.name=Agon duel {label.upper()}", "-c", "user.email=agon@localhost", "-c",
+                "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m",
+                f"Duel #{duel}, entry {label.upper()}: {' '.join(prompt.split())[:60]}")
+        stat = git(path, "-c", "core.quotepath=off", "diff", "--stat", base, "HEAD").splitlines()
+        files = git(path, "-c", "core.quotepath=off", "diff", "--name-only", base, "HEAD").splitlines()
+        enter(duel, label, state="stopped" if halt() else "failed" if problem else "done", ended=time.time(),
+              tests=outcome, report=report, answer=answer and clip(answer, 3000), files=json.dumps(files),
+              stat="\n".join(stat if len(stat) <= 41 else [*stat[:40], " …", stat[-1]]) or None,
+              problem=problem and clip(problem, 1000))
+    except Exception as e2:  # its app isn't there, git failed, agon.db locked...
+        with contextlib.suppress(Exception):
+            enter(duel, label, state="failed", ended=time.time(), problem=clip(str(e2), 1000))
+    finally:
+        close_db()
+
+
+def duel_baseline(duel, path, tests, halt):
+    """The tests on the commit the duel started from, in a thread of its own while the agents work: what an entry's
+    tests show means something only next to them."""
+    try:
+        with CHECKS_LOCK:
+            outcome, report, problem = run_tests(tests, path, time.monotonic() + tests[1] + 60, halt)
+        if not problem:
+            with contextlib.suppress(sqlite3.Error):
+                db().execute("UPDATE duels SET baseline = ?, report = ? WHERE id = ?", (outcome, report, duel))
+    finally:
+        close_db()
+
+
+def duel_review(duel, e, reviewer, path, base, prompt, baseline, tests, limit, halt):
+    """Entry `e`'s review by agent `reviewer`, another duelist's company, in a thread of its own: read-only, in the
+    entry's worktree (gemini, whose app can't be held to read-only, in a throwaway copy of it), with Agon's test runs on
+    the work and on the baseline, and nothing about who wrote it."""
+    label = e["label"]
+    try:
+        enter(duel, label, state="reviewing", reviewer=reviewer)
+        tested = (f"On the work: {e['report']}\n\nOn {base[:12]}, before the work: "
+                  f"{baseline[1] or 'none: Agon could not run them there.'}") if tests else e["report"]
+        text = DUEL_REVIEW.format(copy=COPY if reviewer in REVIEW_COPY else "", base=base[:12], tests=tested,
+                                  prompt=prompt)
+        end = time.monotonic() + limit
+        if reviewer in REVIEW_COPY:  # its app can't be held to read-only: it reviews a throwaway copy
+            copy, folder = review_copy(path, path, reviewer)
+            try:
+                answer, problem, hit = ask_run("human", reviewer, "review", repath(text, [path], copy), folder, end,
+                                               halt)
+            finally:
+                rmtree(copy)
+        else:
+            answer, problem, hit = ask_run("human", reviewer, "review", text, path, end, halt)
+        if hit:
+            out_of_quota(reviewer, hit, own=False)
+        enter(duel, label, state="done", verdict=answer and verdict(answer), review=answer and clip(answer, 3000),
+              problem=problem and clip(f"The review failed: {problem}", 1000))
+    except Exception as e2:  # its app isn't there, git failed, agon.db locked...
+        with contextlib.suppress(Exception):
+            enter(duel, label, state="done", problem=clip(f"The review failed: {e2}", 1000))
+    finally:
+        close_db()
+
+
+def pick_duel(duel, label):
+    """The human picks duel `duel`'s winner, entry `label`: whose each entry was shows now, with how to merge the
+    winner (Agon never merges). Returns what the human reads."""
+    label = label.strip().lower() if isinstance(label, str) else ""
+    with transaction() as con:
+        row = con.execute("SELECT state, project FROM duels WHERE id = ?", (duel,)).fetchone()
+        if not row:
+            raise ToolError(f"There is no duel #{duel}.")
+        if row[0] != "ready":
+            raise ToolError(f"Duel #{duel} is {row[0]}: " + ("its winner is picked already." if row[0] == "picked" else
+                                                             "only a duel that is ready can have a winner."))
+        entries = entries_of(duel)
+        won = next((e for e in entries if e["label"] == label and e["stat"] and e["branch"]), None)
+        if not won:
+            raise ToolError(f"Duel #{duel} has no entry {label.upper() or '?'} with work to pick.")
+        con.execute("UPDATE duels SET state = 'picked', winner = ? WHERE id = ?", (label, duel))
+    drop = [e["branch"] for e in entries if e is not won and e["branch"]]
+    text = (f"Duel #{duel}: you picked {label.upper()}, by {won['agent']}. "
+            + " ".join(f"{e['label'].upper()} was {e['agent']}." for e in entries if e is not won)
+            + f" To merge it, in {row[1]}: git merge {won['branch']}"
+            + (f", and to drop the others: git branch -D {' '.join(drop)}" if drop else "") + ".")
+    post("agon", "human", text)
+    return text
+
+
+def stop_duel(duel):
+    """The human stops duel `duel`: its apps end, and it leaves nothing behind. Returns what the human reads."""
+    if duel in DUELS:
+        DUEL_STOPS[duel] = "the human stopped it"
+        return f"Duel #{duel} stops."
+    row = db().execute("SELECT state FROM duels WHERE id = ?", (duel,)).fetchone()
+    if not row:
+        raise ToolError(f"There is no duel #{duel}.")
+    raise ToolError(f"Duel #{duel} is {row[0]}: nothing of it runs.")
+
+
+def interrupted_duels():
+    """End the duels that ran when their arena ended (a crash, a closed terminal): the arena starts with this. Only one
+    arena runs (it holds the port), so a running duel that this one doesn't run has no arena. Their worktrees and branches
+    go, as a stopped duel's do, and the human hears of it."""
+    now = time.time()
+    for duel, top in db().execute("SELECT id, project FROM duels WHERE state = 'running'").fetchall():
+        if duel in DUELS:
+            continue
+        with transaction() as con:
+            con.execute("UPDATE duels SET state = 'interrupted', ended = ?, note = 'its arena ended while it ran' WHERE"
+                        " id = ?", (now, duel))
+            con.execute("UPDATE entries SET state = 'stopped' WHERE duel = ? AND state NOT IN ('done', 'failed',"
+                        " 'setup failed')", (duel,))
+        branches, trees = {e["branch"] for e in entries_of(duel) if e["branch"]}, []
+        with contextlib.suppress(ToolError, OSError):
+            for block in git(top, "worktree", "list", "--porcelain").split("\n\n"):
+                fields = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+                if fields.get("branch", "").removeprefix("refs/heads/") in branches or os.path.basename(
+                        fields.get("worktree", "")).startswith(f"agon-duel-{duel}-base-"):
+                    trees.append(fields["worktree"])
+        clean_duel(duel, top, trees)
+        post("agon", "human", f"Duel #{duel} ended: its arena closed while it ran. Its worktrees and branches are gone;"
+                              " start it again if you want it.")
+
+
+def unnamed(text, entries):
+    """`text` with the names of the entries' agents and of their apps as the entries' labels (entry A), for a blind
+    duel: what went wrong may name them."""
+    for e in entries:
+        words = "|".join(map(re.escape, IDENTITY.get(e["agent"], (e["agent"],))))
+        text = re.sub(rf"\b(?:{words})\b", f"entry {e['label'].upper()}", text, flags=re.I)
+    return text
+
+
+def duel_view(d, full=False):
+    """Duel `d` (its row, as a dict) for the arena: its entries' outcomes, or `full`, with what each agent said, its
+    review, its tests' report and its diff stat too. Until the human picks the winner, whose entry is whose stays
+    out: the entries are A, B and C, their reviewers are hidden too, and so are the agents' names in what went wrong."""
+    entries, blind, size = entries_of(d["id"]), d["state"] in ("running", "ready"), None if full else 300
+    shown = []
+    for e in entries:
+        problem = e["problem"] and (unnamed(e["problem"], entries) if blind else e["problem"])
+        entry = {"label": e["label"].upper(), "agent": None if blind else e["agent"], "state": e["state"],
+                 "started": e["started"], "ended": e["ended"], "compared": compared(d["baseline"], e["tests"]),
+                 "verdict": e["verdict"], "reviewer": None if blind else e["reviewer"], "reviewed": bool(e["reviewer"]),
+                 "change": e["stat"] and e["stat"].splitlines()[-1].strip(), "files": len(json.loads(e["files"])),
+                 "branch": e["branch"], "problem": problem and (clip(problem, size) if size else problem)}
+        if full:
+            entry |= {"answer": e["answer"], "review": e["review"], "report": e["report"], "stat": e["stat"]}
+        shown.append(entry)
+    return {key: d[key] for key in ("id", "project", "base", "state", "started", "ended", "baseline", "note")} | {
+        "prompt": d["prompt"] if full else clip(d["prompt"], 300), "winner": d["winner"] and d["winner"].upper(),
+        "entries": shown} | ({"report": d["report"]} if full else {})
+
+
+def duels_state(limit=5):
+    """The latest duels for the arena's snapshot, newest first (see duel_view())."""
+    cur = db().execute("SELECT * FROM duels ORDER BY id DESC LIMIT ?", (limit,))
+    names = [column[0] for column in cur.description]
+    return [duel_view(dict(zip(names, row))) for row in cur.fetchall()]
+
+
+def duel_state(duel):
+    """One duel in full for the arena (see duel_view())."""
+    cur = db().execute("SELECT * FROM duels WHERE id = ?", (duel,))
+    if not (row := cur.fetchone()):
+        raise ToolError(f"There is no duel #{duel}.")
+    return duel_view(dict(zip([column[0] for column in cur.description], row)), full=True)
+
+
+def checks_state():
+    """The setup and test commands a duel would run, as the arena's duel form shows them."""
+    shown = {}
+    for kind, command in (("tests", test_command), ("setup", setup_command)):
+        try:
+            found = command()
+            shown[kind] = command_line(found[0]) if found else None
+        except ToolError as e:
+            shown[kind] = f"a bad setting: {e}"
+    return shown
+
+
+def default_project(auto):
+    """The folder the arena's duel form starts with: AGON_PROJECT, autopilot's (`auto`, see autopilot_state()), else
+    the latest project Agon saw."""
+    if os.environ.get("AGON_PROJECT"):
+        return os.environ["AGON_PROJECT"]
+    if auto and auto.get("project"):
+        return auto["project"]
+    row = db().execute("SELECT project FROM (SELECT project, started AS at FROM duels UNION ALL SELECT project, started"
+                       " FROM asks UNION ALL SELECT project, updated FROM tasks) WHERE project IS NOT NULL ORDER BY at"
+                       " DESC LIMIT 1").fetchone()
+    return row and row[0]
+
+
+# The scoreboard, per project: only work whose author Agon knows counts (board tasks, task asks, duel entries), and every
+# number is a count with what it is out of. A duel counts once the human picked its winner: before that, whose entry is
+# whose stays hidden, and the scores would tell
+HINT_MIN = 3  # results an agent needs in a kind of file before a hint names it
+RAN = ("tests passed", "tests failed", "tests timed out")  # a test run that says something about the work
+
+
+def kind_of(path):
+    """The kind of a file, for the hints: its extension (.py), or its name when it has none (Dockerfile)."""
+    name = posixpath.basename(path.replace("\\", "/"))
+    return os.path.splitext(name)[1].lower() or name
+
+
+def scoreboard(limit=10):
+    """The scoreboard, per project (the top folder of its repository), the `limit` with the newest activity first (all:
+    None). For each agent: the duels it won of the picked ones it worked in (not when the setup failed in its worktree);
+    the runs of the human's tests on its work that passed (at board done, in task asks, in duels); and its work that
+    reviewers approved: board tasks (per task, its first verdict or after changes) and duel entries. Hints: for each
+    kind of file, the agents with at least HINT_MIN results in it, where a result is a board task approved at its first
+    review or not, or a picked duel won or not; the best one is named only when two or more have enough results and it
+    is ahead."""
+    con, projects = db(), {}
+
+    def scores(project, name, at):
+        p = projects.setdefault(project, {"at": 0, "agents": {}, "kinds": {}})
+        p["at"] = max(p["at"], at or 0)
+        return p["agents"].setdefault(name, {"duels": [0, 0], "tests": [0, 0], "reviews": [0, 0, 0]})
+
+    def tested(counts, tests):
+        if tests in RAN:
+            counts["tests"][0] += tests == "tests passed"
+            counts["tests"][1] += 1
+
+    def result(project, name, files, good):
+        for kind in {kind_of(f) for f in files if isinstance(f, str)}:
+            counts = projects[project]["kinds"].setdefault(kind, {}).setdefault(name, [0, 0])
+            counts[0] += good
+            counts[1] += 1
+
+    rounds = {}  # (task, owner) -> its project, files and verdicts, in order: one verdict for each done
+    for task, owner, verdict_, tests, at, project, files in con.execute(
+            "SELECT r.task, r.owner, r.verdict, r.tests, r.at, t.project, t.files FROM reviews r JOIN tasks t ON t.id ="
+            " r.task WHERE t.project IS NOT NULL ORDER BY r.id"):
+        tested(scores(project, owner, at), tests)
+        rounds.setdefault((task, owner), (project, files, []))[2].append(verdict_)
+    for (task, owner), (project, files, verdicts) in rounds.items():
+        counts = scores(project, owner, None)
+        counts["reviews"][0] += "approve" in verdicts
+        counts["reviews"][1] += verdicts[0] == "approve"
+        counts["reviews"][2] += 1
+        result(project, owner, json.loads(files), verdicts[0] == "approve")
+    for owner, tests, at, project in con.execute("SELECT owner, tests, updated, project FROM tasks WHERE state ="
+                                                 " 'review' AND owner IS NOT NULL AND project IS NOT NULL"):
+        tested(scores(project, owner, at), tests)  # its latest done, still waiting for a verdict
+    for name, tests, at, project in con.execute("SELECT COALESCE(answered, agent), tests, ended, project FROM asks WHERE"
+                                                " mode = 'task' AND ended IS NOT NULL AND project IS NOT NULL"):
+        tested(scores(project, name, at), tests)
+    for project, state, winner, at, name, label, entered, tests, verdict_, files in con.execute(
+            "SELECT d.project, d.state, d.winner, COALESCE(d.ended, d.started), e.agent, e.label, e.state, e.tests,"
+            " e.verdict, e.files FROM duels d JOIN entries e ON e.duel = d.id WHERE d.state NOT IN ('running',"
+            " 'ready')"):
+        counts = scores(project, name, at)
+        tested(counts, tests)
+        if verdict_:
+            counts["reviews"][0] += verdict_ == "approve"
+            counts["reviews"][1] += verdict_ == "approve"
+            counts["reviews"][2] += 1
+        if state == "picked" and entered != "setup failed":  # the human's setup failed there: no loss of the agent's
+            counts["duels"][0] += label == winner
+            counts["duels"][1] += 1
+            result(project, name, json.loads(files), label == winner)
+    shown = []
+    for project, p in sorted(projects.items(), key=lambda item: -item[1]["at"])[:limit]:
+        hints = []
+        for kind, per in sorted(p["kinds"].items()):
+            enough = sorted(([name, good, of] for name, (good, of) in per.items() if of >= HINT_MIN),
+                            key=lambda row: (-row[1] / row[2], -row[2], row[0]))
+            if enough:
+                ahead = len(enough) > 1 and enough[0][1] / enough[0][2] > enough[1][1] / enough[1][2]
+                hints.append({"kind": kind, "best": enough[0][0] if ahead else None,
+                              "agents": [{"name": name, "good": good, "of": of} for name, good, of in enough]})
+        shown.append({"project": project, "hints": hints, "agents": [
+            {"name": name, "duels": {"won": c["duels"][0], "of": c["duels"][1]},
+             "tests": {"passed": c["tests"][0], "of": c["tests"][1]},
+             "reviews": {"approved": c["reviews"][0], "first": c["reviews"][1], "of": c["reviews"][2]}}
+            for name, c in sorted(p["agents"].items())]})
+    return shown
+
+
+def gauge_windows(limits):
+    """The windows of a plan's usage in Claude Code's status line input (`rate_limits`): (its name, the percentage used,
+    when it resets or None), each window as reported. A window can be missing: it is then unknown, never 0%."""
+    found = []
+    for window, value in limits.items() if isinstance(limits, dict) else ():
+        if isinstance(value, dict) and re.fullmatch(r"[a-z][a-z0-9_]{0,31}", str(window)):
+            used, resets = value.get("used_percentage"), value.get("resets_at")
+            if number_(used) and 0 <= used <= 10000:  # a spend limit can pass 100
+                found.append((window, float(used), float(resets) if number_(resets) else None))
+    return found
+
+
+TERMINAL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_]?)|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def plain(text):
+    """`text` without what a terminal would act on: escape sequences (colors, a new window title, OSC 52's clipboard...)
+    and control characters but for tabs and line breaks. Agents' words reach the human's terminal only this way."""
+    return TERMINAL.sub("", text)
+
+
+def status_text(data, windows):
+    """The status line Agon prints for Claude Code: the model, the folder, the context used and the plan's usage."""
+    def text(value):
+        return plain(value).replace("\n", " ").replace("\t", " ") if isinstance(value, str) else ""
+
+    model = data.get("model") if isinstance(data.get("model"), dict) else {}
+    workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+    context = data.get("context_window") if isinstance(data.get("context_window"), dict) else {}
+    folder = text(workspace.get("current_dir")) or text(data.get("cwd"))
+    parts = [text(model.get("display_name")) or "Claude", os.path.basename(folder.rstrip("/\\")) or folder]
+    if number_(context.get("used_percentage")):
+        parts.append(f"context {context['used_percentage']:.0f}%")
+    parts += [f"{WINDOWS.get(window, window)} {used:.0f}%" for window, used, _ in windows]
+    return " · ".join(part for part in parts if part)
+
+
+def statusline(me, inp=None, out=None):
+    """`python agon.py statusline [NAME]`, Claude Code's status line command (statusLine in the human's settings, which
+    Agon never edits: setup prints it). From the JSON Claude Code hands it, Agon keeps only the plan's usage, each
+    window's percentage and reset time, with the session's id, for the arena's roster; the transcript, paths and
+    everything else stay out of agon.db. Then it prints a usual status line, so the human loses nothing. It never fails:
+    a status line command that exits with an error or prints nothing goes blank."""
+    out = out or sys.stdout.buffer
+    try:
+        data = json.loads((inp or sys.stdin.buffer).read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    windows = gauge_windows(data.get("rate_limits"))
+    session = data.get("session_id") if isinstance(data.get("session_id"), str) else None
+    try:
+        if windows and not bad_recipient(me) and me not in ("all", "human", "agon"):
+            now, session = time.time(), session and session[:200]
+            kept = {row[0]: row[1:] for row in db().execute("SELECT window, used, resets, session, seen FROM gauges"
+                                                            " WHERE agent = ?", (me,))}
+            # only what changed, or once a minute (the age the arena shows): every write makes the arena look again
+            fresh = [(window, used, resets) for window, used, resets in windows
+                     if kept.get(window, (None,) * 4)[:3] != (used, resets, session) or kept[window][3] < now - 60]
+            if fresh:
+                with transaction() as con:
+                    con.executemany("INSERT OR REPLACE INTO gauges(agent, window, used, resets, session, seen) VALUES"
+                                    " (?, ?, ?, ?, ?, ?)", [(me, *row, session, now) for row in fresh])
+    except Exception:  # agon.db locked, a bad AGON_DB...: the line still shows
+        pass
+    out.write(status_text(data, windows).encode() + b"\n")
+    out.flush()
+
+
+# The arena's page: inline style and scripts only, run by a nonce (see Web.do_GET()); the text of every message, task and
+# name goes in with textContent, never as markup. ARENA_STYLE and ARENA_RENDER also build the exported replay
+ARENA_STYLE = r"""
+:root { color-scheme: dark; --bg: #16161a; --panel: #1c1c21; --card: #24242b; --line: #33333b; --text: #e2e2e6;
+  --dim: #8e8e98; --claude: #e0865f; --gpt: #1fb389; --gemini: #6a9ff8; --human: #f2f2f2; --good: #3fb950;
+  --warn: #d7a13a; --bad: #f36b64; }
+@media (prefers-color-scheme: light) { :root { color-scheme: light; --bg: #f5f5f7; --panel: #fff; --card: #eeeef1;
+  --line: #d8d8de; --text: #1d1d22; --dim: #62626c; --claude: #b4532a; --gpt: #0a7b5f; --gemini: #2c63c9;
+  --human: #111; --good: #1a7f37; --warn: #9a6700; --bad: #cf222e; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; display: flex; flex-direction: column; height: 100dvh; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+h1 { font-size: 18px; margin: 0 4px 0 0; }
+h2 { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--dim);
+  margin: 14px 0 6px; }
+.grow { flex: 1; }
+.pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--card); color: var(--dim);
+  white-space: nowrap; }
+.pill.live { color: var(--good); } .pill.paused { background: var(--bad); color: #fff; }
+button, select, textarea, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; }
+button { cursor: pointer; } button:hover { border-color: var(--dim); }
+button:disabled { opacity: .5; cursor: default; }
+#stop { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; min-width: 84px; }
+#stop.resume { background: var(--good); border-color: var(--good); }
+nav { display: flex; gap: 2px; padding: 0 8px; background: var(--panel); border-bottom: 1px solid var(--line);
+  overflow-x: auto; }
+nav button { border: 0; border-radius: 0; background: none; color: var(--dim); padding: 10px 12px; }
+nav button[aria-selected="true"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--text); }
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+.panel { display: none; min-height: 0; overflow: auto; padding: 0 12px 16px; }
+body[data-tab="team"] #team, body[data-tab="board"] #board, body[data-tab="duels"] #duels,
+body[data-tab="score"] #score { display: block; }
+#chat { flex-direction: column; padding: 0; overflow: hidden; }
+body[data-tab="chat"] #chat { display: flex; }
+#log { flex: 1; min-height: 0; overflow: auto; padding: 4px 12px 12px; }
+form#say { display: flex; gap: 8px; align-items: flex-end; padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+  background: var(--panel); border-top: 1px solid var(--line); }
+#text { flex: 1; min-width: 0; resize: none; max-height: 35dvh; }
+.m { margin: 8px 0; padding: 7px 11px; border-radius: 10px; background: var(--card); border-left: 4px solid var(--dim); }
+.m .h { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 13px; }
+.m .h b { font-weight: 600; } .m time, .m .id { color: var(--dim); font-size: 12px; }
+.m pre { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.m.s-agon { background: none; border-left-style: dashed; } .m.s-agon pre { color: var(--dim); }
+.s-claude { border-color: var(--claude); } b.s-claude, .s-claude .h b { color: var(--claude); }
+.s-gpt { border-color: var(--gpt); } b.s-gpt, .s-gpt .h b { color: var(--gpt); }
+.s-gemini { border-color: var(--gemini); } b.s-gemini, .s-gemini .h b { color: var(--gemini); }
+.s-human { border-color: var(--human); }
+.divider { text-align: center; color: var(--dim); font-size: 13px; margin: 10px 0; }
+.card { background: var(--card); border-radius: 10px; padding: 9px 12px; margin: 8px 0; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.small { font-size: 13px; color: var(--dim); }
+.st-working .st { color: var(--good); } .st-limit .st { color: #fff; background: var(--bad); }
+.st-resting .st { color: #1d1d22; background: var(--warn); } .st-away { opacity: .7; }
+.good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.task { cursor: pointer; } .task:hover, .task:focus { outline: 1px solid var(--dim); }
+#detail { position: fixed; inset: 0; z-index: 5; display: flex; align-items: flex-end; justify-content: center;
+  background: rgba(0, 0, 0, .55); }
+#detail[hidden] { display: none; }
+#detail .sheet { width: min(760px, 100%); max-height: 88dvh; overflow: auto; background: var(--panel);
+  border-radius: 14px 14px 0 0; padding: 12px 16px 20px; }
+pre.text { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--card); border-radius: 8px; padding: 8px 10px; }
+.entries { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-weight: 600; font-size: 12px; }
+label.check { display: inline-flex; gap: 6px; align-items: center; margin-right: 12px; }
+#duel-form textarea, #duel-form input[type="text"] { display: block; width: 100%; margin: 6px 0; }
+#duel-form .row { margin: 6px 0; }
+.entry { background: var(--panel); border: 1px solid var(--line); margin: 0; }
+.entry.won { border: 2px solid var(--good); }
+code { font: 13px ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+#score-project { margin: 10px 0 0; max-width: 100%; }
+.hint { margin: 6px 0; }
+@media (min-width: 1100px) {
+  main { grid-template-columns: 300px minmax(0, 1fr) 420px; }
+  #team { display: block !important; border-right: 1px solid var(--line); }
+  #chat { display: flex !important; }
+  .side { display: none !important; border-left: 1px solid var(--line); }
+  body[data-side="board"] #board, body[data-side="duels"] #duels,
+  body[data-side="score"] #score { display: block !important; }
+  nav button.main { display: none; }
+  #detail { align-items: center; } #detail .sheet { border-radius: 14px; }
 }
-loop();
-f.onsubmit = async e => {
+"""
+ARENA_MAIN = """<nav id="tabs">
+<button type="button" class="main" data-panel="chat">Chat</button>
+<button type="button" class="main" data-panel="team">Team</button>
+<button type="button" data-panel="board">Board</button>
+<button type="button" data-panel="duels">Duels</button>
+<button type="button" data-panel="score">Score</button>
+</nav>
+<main>
+<section id="team" class="panel"><h2>Team</h2><div id="roster"></div><h2>Asks</h2><div id="asks"></div></section>
+<section id="chat" class="panel"><div id="log"><button type="button" id="older" hidden>Earlier messages</button></div>
+{composer}</section>
+<section id="board" class="panel side"><div id="tasks"></div></section>
+<section id="duels" class="panel side"><div id="duel-form"></div><div id="duel-list"></div></section>
+<section id="score" class="panel side"><select id="score-project" aria-label="Project" hidden></select>
+<div id="scores"></div><h2>Share</h2><div class="row"><button type="button" id="export-replay">Export the replay</button>
+<button type="button" id="export-scorecard">Export the scorecard</button></div>
+<div class="small">One HTML file each, to open anywhere: it loads nothing.</div></section>
+</main>
+<div id="detail" hidden><div class="sheet"><div class="row"><span class="grow"></span>
+<button type="button" id="close">Close</button></div><div id="detail-body"></div></div></div>"""
+# What the page and the replay share: building the chat, the roster, the asks and the board from the arena's JSON
+ARENA_RENDER = r"""
+'use strict';
+const $ = selector => document.querySelector(selector);
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+let skew = 0;  // the server's clock minus this one, so that "5 min ago" is right on a phone too
+const now = () => Date.now() / 1000 + skew;
+function span(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + ' s';
+  const m = Math.round(s / 60);
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60);
+  return h < 48 ? h + 'h ' + (m % 60) + 'm' : Math.round(h / 24) + ' days';
+}
+function clock(t) {
+  const d = new Date(t * 1000), hm = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  return t - now() > 20 * 3600 ? d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ' ' + hm : hm;
+}
+const KNOWN = ['claude', 'gpt', 'gemini', 'human', 'agon'];
+const who = name => 's-' + (KNOWN.includes(name) ? name : 'other');
+function outcome(text) {
+  text = String(text || '');
+  return text.includes('passed') ? 'good' : /failed|timed out|could not/.test(text) ? 'bad' : '';
+}
+function message(row) {  // [id, sender, rcpt, text, ts]
+  const [id, sender, rcpt, text, ts] = row, m = el('div', 'm ' + who(sender)), h = el('div', 'h');
+  m.dataset.id = id;
+  h.append(el('b', '', sender + ' → ' + rcpt), el('time', '', String(ts || '').slice(11, 16)), el('span', 'id', '#' + id));
+  m.append(h, el('pre', '', text));
+  return m;
+}
+function fuel(a) {
+  if (a.state === 'working') return 'working' + (a.since ? ' for ' + span(now() - a.since) : '');
+  if (a.state === 'limit') return 'out of quota until ' + clock(a.until);
+  if (a.state === 'resting') return 'resting until ' + clock(a.until);
+  if (a.state === 'idle') return 'idle';
+  return a.seen ? 'away, seen ' + span(now() - a.seen) + ' ago' : 'not seen yet';
+}
+function renderTeam(team, box) {
+  box.replaceChildren(...team.map(a => {
+    const card = el('div', 'card agent st-' + a.state), row = el('div', 'row');
+    row.append(el('b', who(a.name), a.name), el('span', 'pill st', fuel(a)));
+    if (a.app) row.append(el('span', 'small', a.app + (a.open ? ', open' : '')));
+    card.append(row);
+    if (a.why) card.append(el('div', 'small', a.why));
+    if (a.gauge && a.gauge.length)  // the plan's usage, as its status line last said: an age, never a guess
+      card.append(el('div', 'small', a.gauge.map(g => g.label + ' ' + Math.round(g.used) + '%, ' + span(now() - g.seen)
+        + ' ago').join(' · ')));
+    for (const t of a.tasks || [])
+      card.append(el('div', 'small', '#' + t.id + ' ' + t.title + ' (' + ({doing: 'in progress', review: 'in review',
+        reviewer: 'to review'}[t.role] || t.role) + ')'));
+    if (a.today) card.append(el('div', 'small', 'autopilot today: ' + a.today.wakes + ' wake' + (a.today.wakes === 1 ? ''
+      : 's') + ', ' + a.today.tokens.toLocaleString() + ' tokens' + (a.today.usd ? ', ~$' + a.today.usd.toFixed(2) : '')));
+    return card;
+  }));
+}
+function renderAsks(asks, box) {
+  if (!asks.length) return box.replaceChildren(el('div', 'small', 'No asks yet: an agent asks another company’s agent'
+    + ' for a second opinion with the ask tool.'));
+  box.replaceChildren(...asks.map(q => {
+    const card = el('div', 'card'), by = q.answered && q.answered !== q.agent ? q.agent + ', answered by ' + q.answered
+      : q.agent;
+    card.append(el('div', '', q.asker + ' asked ' + by + ' for ' + (q.task ? 'a review of task #' + q.task : q.mode ===
+      'review' ? 'a review' : 'a task')));
+    let what = '', cls = '';
+    if (q.problem) [what, cls] = ['failed: ' + q.problem, 'bad'];
+    else if (q.ended && q.mode === 'review') [what, cls] = [(q.verdict ? 'VERDICT: ' + q.verdict : 'no verdict') + ' (' +
+      q.tests + ')', outcome(q.tests)];
+    else if (q.ended) [what, cls] = [(q.branch ? 'on branch ' + q.branch : 'no file changed') + ' (' + q.tests + ')',
+      outcome(q.tests)];
+    card.append(el('div', 'small', q.ended ? span(q.ended - q.started) : 'running for ' + span(now() - q.started)));
+    if (what) card.append(el('div', 'small ' + cls, what));
+    return card;
+  }));
+}
+const COLUMNS = [['todo', 'To do'], ['doing', 'In progress'], ['review', 'In review'], ['done', 'Done']];
+function renderBoard(tasks, done, box, open) {
+  if (!tasks.length) return box.replaceChildren(el('div', 'small', 'The board is empty: the lead puts the work on it with'
+    + ' the board tool.'));
+  box.replaceChildren(...COLUMNS.map(([state, title]) => {
+    const list = tasks.filter(t => t.state === state), col = el('div');
+    col.append(el('h2', '', title + ' (' + (state === 'done' ? done : list.length) + ')'));
+    for (const t of list) {
+      const card = el('div', 'card task');
+      card.append(el('div', '', '#' + t.id + ' ' + t.title));
+      card.append(el('div', 'small', t.state === 'todo' ? 'added by ' + t.author : t.owner + (t.reviewer ? (t.state ===
+        'done' ? ', approved by ' : ', reviewer: ') + t.reviewer : '')));
+      if (t.tests) card.append(el('div', 'small ' + outcome(t.tests), t.tests));
+      if (t.files.length) card.append(el('div', 'small', t.files.join(', ')));
+      if (t.after.length) card.append(el('div', 'small', 'after ' + t.after.map(([i, s]) => '#' + i + ' ' + s).join(', ')));
+      if (open) {
+        card.tabIndex = 0;
+        card.addEventListener('click', () => open(t.id));
+        card.addEventListener('keydown', e => { if (e.key === 'Enter') open(t.id); });
+      }
+      col.append(card);
+    }
+    return col;
+  }));
+}
+function renderTask(t, box) {
+  box.replaceChildren(el('h2', '', 'Task #' + t.id), el('div', '', t.title),
+    el('div', 'small', 'state: ' + t.state + (t.owner ? ', ' + t.owner : '') + (t.reviewer ? ', reviewer ' + t.reviewer : '')
+      + ' · added by ' + t.author));
+  if (t.files.length) box.append(el('div', 'small', 'files: ' + t.files.join(', ')));
+  for (const [label, text] of [['Spec', t.spec], ['Notes, newest first', t.note], ['Tests at done: ' + (t.tests || ''),
+                                t.report]])
+    if (text) box.append(el('h2', '', label), el('pre', 'text', text));
+  if (t.reviews && t.reviews.length) {
+    box.append(el('h2', '', 'Verdicts'));
+    for (const r of t.reviews) box.append(el('div', 'small', r.reviewer + ': ' + r.verdict + ' (' + r.tests + ')'));
+  }
+}
+function button(text, click) {
+  const b = el('button', '', text);
+  b.type = 'button';
+  b.addEventListener('click', click);
+  return b;
+}
+function entryLine(e) {  // what came of a duel's entry, without the long texts
+  const lines = [];
+  if (e.compared) lines.push([e.compared, outcome(e.compared)]);
+  if (e.reviewed) lines.push(['review' + (e.reviewer ? ' by ' + e.reviewer : '') + ': ' + (e.verdict || (e.state ===
+    'reviewing' ? 'running' : 'no verdict')), e.verdict === 'approve' ? 'good' : e.verdict === 'changes' ? 'bad' : '']);
+  if (e.change) lines.push([e.change, '']);
+  else if (['done', 'failed', 'stopped'].includes(e.state)) lines.push(['no changes', '']);
+  if (e.problem) lines.push([e.problem, 'bad']);
+  return lines;
+}
+function renderDuels(duels, box, act) {  // act(what, duel, label): the live page's stop, pick and details
+  if (!duels.length) return box.replaceChildren(el('div', 'small', 'No duels yet: give two or three agents the same task,'
+    + ' then pick the best work.'));
+  box.replaceChildren(...duels.map(d => {
+    const card = el('div', 'card duel'), head = el('div', 'row');
+    head.append(el('b', '', 'Duel #' + d.id), el('span', 'pill', d.state), el('span', 'small grow', d.ended ?
+      clock(d.started) : 'for ' + span(now() - d.started)));
+    if (act && d.state === 'running') head.append(button('Stop', () => act('stop', d.id)));
+    if (act) head.append(button('Details', () => act('open', d.id)));
+    card.append(head, el('div', '', d.prompt), el('div', 'small', 'from ' + d.base.slice(0, 7) + ' in ' + d.project
+      + (d.baseline ? ' · at the start: ' + d.baseline : '')));
+    if (d.note) card.append(el('div', 'small', d.note));
+    const grid = el('div', 'entries');
+    for (const e of d.entries) {
+      const c = el('div', 'card entry' + (d.winner === e.label ? ' won' : '')), r = el('div', 'row');
+      r.append(el('b', e.agent ? who(e.agent) : '', e.label + (e.agent ? ' · ' + e.agent : '')),
+        el('span', 'pill', e.state));
+      c.append(r);
+      for (const [text, cls] of entryLine(e)) c.append(el('div', 'small ' + cls, text));
+      if (d.winner === e.label && e.branch) c.append(el('div', 'small', 'the winner: git merge ' + e.branch));
+      if (act && d.state === 'ready' && e.change && e.branch) c.append(button('Pick ' + e.label, () => act('pick', d.id,
+        e.label)));
+      grid.append(c);
+    }
+    card.append(grid);
+    return card;
+  }));
+}
+function renderDuel(d, box) {  // one duel in full: what each agent said, its review, its tests, its diff
+  box.replaceChildren(el('h2', '', 'Duel #' + d.id + ' · ' + d.state), el('pre', 'text', d.prompt),
+    el('div', 'small', 'from ' + d.base.slice(0, 12) + ' in ' + d.project));
+  if (d.note) box.append(el('div', 'small', d.note));
+  if (d.report) box.append(el('h2', '', 'At the start: ' + (d.baseline || '')), el('pre', 'text', d.report));
+  for (const e of d.entries) {
+    box.append(el('h2', '', 'Entry ' + e.label + (e.agent ? ' · ' + e.agent : '') + ' · ' + e.state));
+    for (const [text, cls] of entryLine(e)) box.append(el('div', 'small ' + cls, text));
+    if (e.branch) box.append(el('div', 'small', 'branch ' + e.branch));
+    for (const [label, text] of [['What it said', e.answer], ['What changed', e.stat], ['Its tests', e.report],
+                                 ['Its review', e.review]])
+      if (text) box.append(el('div', 'small', label), el('pre', 'text', text));
+  }
+}
+const HINT_MIN = 3;
+function ratio(a, b) { return b ? a + ' of ' + b : '–'; }
+function renderScores(projects, box, chosen) {  // one project's scoreboard: `chosen`, else the one with the latest work
+  if (!projects.length) return box.replaceChildren(el('h2', '', 'Score'), el('div', 'small', 'No scores yet: they come'
+    + ' from board tasks, task asks and duels, per project.'));
+  const p = projects.find(x => x.project === chosen) || projects[0], table = el('table'), head = el('tr');
+  for (const h of ['Agent', 'Duels won', 'Tests passed', 'Work approved']) head.append(el('th', '', h));
+  table.append(head);
+  for (const a of p.agents) {
+    const row = el('tr'), name = el('td');
+    name.append(el('b', who(a.name), a.name));
+    row.append(name, el('td', '', ratio(a.duels.won, a.duels.of)), el('td', '', ratio(a.tests.passed, a.tests.of)),
+      el('td', '', ratio(a.reviews.approved, a.reviews.of) + (a.reviews.of ? ', ' + a.reviews.first + ' at the first'
+        + ' review' : '')));
+    table.append(row);
+  }
+  const parts = [el('h2', '', 'Score'), el('div', 'small', p.project), table, el('h2', '', 'Hints')];
+  if (!p.hints.length) parts.push(el('div', 'small', 'None yet: a hint needs an agent with ' + HINT_MIN + ' results in'
+    + ' one kind of file.'));
+  for (const h of p.hints) {
+    const line = el('div', 'hint');
+    line.append(el('code', '', h.kind), ': ' + h.agents.map(a => a.name + ' ' + a.good + ' of ' + a.of).join(', '));
+    if (h.best) line.append(' — give such tasks to ', el('b', who(h.best), h.best));
+    parts.push(line);
+  }
+  parts.push(el('div', 'small', 'A result: a board task approved at its first review, or a duel won. Only counts, only'
+    + ' this project: small numbers say little.'));
+  box.replaceChildren(...parts);
+}
+function tabs(initial) {  // the phone's tabs; on a wide screen the chat and the team stay, and the tabs pick the side panel
+  const wide = matchMedia('(min-width: 1100px)');
+  function show(panel) {
+    document.body.dataset.tab = panel;
+    if (['board', 'duels', 'score'].includes(panel)) document.body.dataset.side = panel;
+    for (const b of document.querySelectorAll('#tabs button'))
+      b.setAttribute('aria-selected', String(b.dataset.panel === (wide.matches && !b.classList.contains('main') ?
+        document.body.dataset.side : document.body.dataset.tab)));
+  }
+  for (const b of document.querySelectorAll('#tabs button')) b.addEventListener('click', () => show(b.dataset.panel));
+  wide.addEventListener('change', () => show(document.body.dataset.tab));
+  document.body.dataset.side = 'board';
+  show(initial);
+  return show;
+}
+"""
+# The live page: the feed (GET /events), the human's messages, STOP and RESUME, and the task details
+ARENA_LIVE = r"""
+const log = $('#log'), panels = [];  // panels: what else draws itself from each snapshot (the duels, the scores)
+let last = null, first = null, stream = null, shown = null, paused = false, connected = false;
+const show = tabs('chat');
+function state(text, cls) { const s = $('#state'); s.textContent = text; s.className = 'pill ' + (cls || ''); }
+function status() {
+  if (!connected) return state(document.hidden ? 'asleep' : 'reconnecting…');
+  paused ? state('paused: STOP', 'paused') : state('live', 'live');
+}
+function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+function add(row) {
+  if (last !== null && row[0] <= last) return;  // shown already
+  const stick = nearBottom();
+  log.append(message(row));
+  last = row[0];
+  if (first === null) first = row[0];
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function update(s) {
+  shown = s;
+  skew = s.now - Date.now() / 1000;
+  paused = s.paused;
+  status();
+  const stop = $('#stop');
+  stop.textContent = paused ? 'Resume' : 'STOP';
+  stop.classList.toggle('resume', paused);
+  const pilot = $('#pilot');
+  pilot.hidden = !s.autopilot;
+  if (s.autopilot) pilot.textContent = 'autopilot: ' + (s.autopilot.agents || []).join(', ') + ', lead ' + s.autopilot.lead;
+  renderTeam(s.team, $('#roster'));
+  renderAsks(s.asks, $('#asks'));
+  renderBoard(s.tasks, s.done, $('#tasks'), openTask);
+  const to = $('#to'), picked = to.value;
+  to.replaceChildren(...['all', ...s.team.map(a => a.name)].map(name => el('option', '', name)));
+  to.value = [...to.options].some(o => o.value === picked) ? picked : 'all';
+  for (const render of panels) render(s);
+}
+function connect() {
+  if (stream) stream.close();
+  stream = new EventSource('/events' + (last !== null ? '?after=' + last : ''));
+  stream.addEventListener('start', e => {
+    const start = JSON.parse(e.data);
+    connected = true;
+    status();
+    if (last !== null && start.after > last)
+      log.append(el('div', 'divider', 'More messages came while this page was away than it catches up on: reload it to see'
+        + ' them all.'));
+    if (first === null) $('#older').hidden = !start.older;
+  });
+  stream.addEventListener('msg', e => add(JSON.parse(e.data)));
+  stream.addEventListener('board', e => update(JSON.parse(e.data)));
+  stream.onerror = () => { connected = false; status(); };  // the browser tries again after a moment
+}
+document.addEventListener('visibilitychange', () => {  // a hidden page lets its stream go: browsers allow six per site
+  if (!document.hidden) return connect();
+  if (stream) stream.close();
+  stream = null;
+  connected = false;
+  status();
+});
+$('#older').addEventListener('click', async () => {
+  const r = await fetch('/msgs?before=' + first + '&limit=200');
+  if (!r.ok) return;
+  const rows = await r.json(), top = log.scrollHeight - log.scrollTop;
+  $('#older').after(...rows.map(message));
+  if (rows.length) first = rows[0][0];
+  $('#older').hidden = rows.length < 200;
+  log.scrollTop = log.scrollHeight - top;
+});
+async function post(path, body) {  // true when Agon took it; else the human reads why
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) alert(await r.text());
+  return r.ok;
+}
+const text = $('#text');
+function fit() { text.style.height = 'auto'; text.style.height = text.scrollHeight + 2 + 'px'; }
+text.addEventListener('input', fit);
+text.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#say').requestSubmit(); }
+});
+$('#say').addEventListener('submit', async e => {
   e.preventDefault();
-  if (!t.value.trim()) return;
-  const r = await fetch('/msgs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                   body: JSON.stringify({ to: to.value, text: t.value }) });
-  if (r.ok) t.value = ''; else alert(await r.text());
-};
-</script>"""
+  if (!text.value.trim()) return;
+  if (await post('/msgs', {to: $('#to').value, text: text.value})) {
+    text.value = '';
+    fit();
+    log.scrollTop = log.scrollHeight;
+  }
+});
+$('#stop').addEventListener('click', () => post('/msgs', {to: 'all', text: paused ? 'RESUME' : 'STOP'}));
+async function openTask(id) {
+  const r = await fetch('/board?id=' + id);
+  if (!r.ok) return alert(await r.text());
+  renderTask(await r.json(), $('#detail-body'));
+  $('#detail').hidden = false;
+}
+function hide() { $('#detail').hidden = true; }
+$('#close').addEventListener('click', hide);
+$('#detail').addEventListener('click', e => { if (e.target === $('#detail')) hide(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hide(); });
+function duelForm(box) {  // a new duel: the task, the agents, the project; the commands it runs come from the settings
+  const form = el('form', 'card'), task = el('textarea'), folder = el('input'), agents = el('div', 'row'),
+    checks = el('div', 'small'), start = el('button', '', 'Start the duel');
+  task.rows = 3;
+  task.placeholder = 'The task, the same for each agent';
+  task.setAttribute('aria-label', 'Task');
+  folder.type = 'text';
+  folder.placeholder = 'The project folder: a git repository';
+  folder.setAttribute('aria-label', 'Project folder');
+  for (const name of ['claude', 'gpt', 'gemini']) {
+    const label = el('label', 'check'), box = el('input');
+    box.type = 'checkbox';
+    box.value = name;
+    box.checked = true;
+    label.append(box, el('span', who(name), name));
+    agents.append(label);
+  }
+  let typed = false;
+  folder.addEventListener('input', () => { typed = true; });
+  form.append(el('b', '', 'New duel'), task, agents, folder, checks, start);
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    start.disabled = true;
+    try {
+      if (await post('/duel', {prompt: task.value, folder: folder.value,
+                               agents: [...agents.querySelectorAll('input:checked')].map(b => b.value)})) task.value = '';
+    } finally {
+      start.disabled = false;
+    }
+  });
+  box.replaceChildren(form);
+  return s => {
+    if (!typed && s.project && folder.value !== s.project) folder.value = s.project;
+    checks.replaceChildren(
+      el('div', '', 'Setup in each worktree: ' + (s.checks.setup || 'none (AGON_SETUP_CMD): a worktree has only what git'
+        + ' tracks')),
+      el('div', '', 'Tests: ' + (s.checks.tests || 'none (AGON_TEST_CMD)')));
+  };
+}
+async function duelAct(what, id, label) {
+  if (what === 'open') {
+    const r = await fetch('/board?duel=' + id);
+    if (!r.ok) return alert(await r.text());
+    renderDuel(await r.json(), $('#detail-body'));
+    $('#detail').hidden = false;
+    return;
+  }
+  if (what === 'stop' && !confirm('Stop duel #' + id + '? Its apps end, and it leaves nothing behind.')) return;
+  if (what === 'pick' && !confirm('Pick ' + label + ' as the winner of duel #' + id + '? Then you see whose work each'
+    + ' entry was.')) return;
+  await post('/duel/' + what, {duel: id, label: label});
+}
+const drawForm = duelForm($('#duel-form'));
+panels.push(s => { drawForm(s); renderDuels(s.duels, $('#duel-list'), duelAct); });
+async function exportFile(kind) {  // the file comes back as JSON, and the page saves it
+  if (!confirm('Export the ' + kind + ' as one HTML file? It may contain code, file paths and whatever the agents wrote.'
+    + ' Agon masks keys, e-mail addresses and your home folder; check the file before you share it.')) return;
+  const r = await fetch('/export', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({kind: kind})});
+  if (!r.ok) return alert(await r.text());
+  const got = await r.json(), link = el('a');
+  link.href = URL.createObjectURL(new Blob([got.html], {type: 'text/html'}));
+  link.download = got.name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+  alert('Saved ' + got.name + '. ' + got.said);
+}
+$('#export-replay').addEventListener('click', () => exportFile('replay'));
+$('#export-scorecard').addEventListener('click', () => exportFile('scorecard'));
+const scoreProject = $('#score-project');  // which project's scores: the latest one, unless the human picks another
+scoreProject.addEventListener('change', () => { if (shown) renderScores(shown.score, $('#scores'), scoreProject.value); });
+panels.push(s => {
+  const names = s.score.map(p => p.project), picked = scoreProject.value;
+  if (names.join('\n') !== [...scoreProject.options].map(o => o.value).join('\n'))
+    scoreProject.replaceChildren(...names.map(name => el('option', '', name)));
+  scoreProject.value = names.includes(picked) ? picked : names[0] || '';
+  scoreProject.hidden = names.length < 2;
+  renderScores(s.score, $('#scores'), scoreProject.value);
+});
+setInterval(() => { if (shown && !document.hidden) update(shown); }, 30000);  // "for 5 min" moves on
+connect();
+"""
+COMPOSER = """<form id="say"><select id="to" aria-label="To"><option>all</option></select>
+<textarea id="text" rows="1" placeholder="Message the team" aria-label="Message"></textarea>
+<button>Send</button></form>"""
+PAGE = ("""<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Agon arena</title>
+<style nonce="{nonce}">""" + ARENA_STYLE + """</style>
+<header><h1>Agon</h1><span id="state" class="pill">connecting…</span><span id="pilot" class="pill" hidden></span>
+<span class="grow"></span><button type="button" id="stop">STOP</button></header>
+""" + ARENA_MAIN.replace("{composer}", COMPOSER) + """
+<script nonce="{nonce}">""" + ARENA_RENDER + ARENA_LIVE + """</script>
+""")
+
+
+# Export (python agon.py export, or the arena's buttons): a replay (the chat on a timeline, with the board, the duels and
+# the score as they are) or a scorecard (the score and the duels), as one HTML file that loads nothing: its own
+# Content-Security-Policy comes first and lets only its own script and style run (by their hashes), and its data sits
+# in a JSON data block where nothing can end it early. What looks private is masked unless the human says otherwise:
+# keys and tokens in known formats, e-mail addresses, and the home folder's path (as ~)
+EXPORT_MAX = 10000  # messages a replay has at most: the latest ones
+KEYS = re.compile("|".join((  # known formats of keys and tokens
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",  # PEM private keys
+    r"\bsk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}",  # Anthropic, OpenAI
+    r"\bAIza[0-9A-Za-z_-]{35}",  # Google
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})",  # GitHub
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",  # AWS access key ids
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",  # Slack
+    r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}",  # Stripe
+    r"\bhf_[A-Za-z0-9]{30,}",  # Hugging Face
+    r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",  # JSON Web Tokens
+)))
+EMAILS = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
+MASKS = (("key", "keys"), ("e-mail address", "e-mail addresses"), ("path into your home folder (now ~)",
+                                                                   "paths into your home folder (now ~)"))
+EXPORT_STYLE = r"""
+body.export main { grid-template-columns: minmax(0, 1fr); }
+#timeline { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+#at { flex: 1; min-width: 0; padding: 0; }
+body.scorecard main { display: block; overflow: auto; }
+body.scorecard .panel { display: block; max-width: 900px; margin: 0 auto; }
+@media (min-width: 1100px) {
+  body.export main { grid-template-columns: minmax(0, 1fr) 460px; }
+  body.scorecard main { display: block; }
+}
+"""
+# What both exports run: when, what was masked, every project's scores, the duels
+EXPORT_JS = r"""
+const shared = JSON.parse($('#data').textContent);
+skew = shared.at - Date.now() / 1000;  // "for 5 min" as it was at export
+$('#when').textContent = 'exported ' + new Date(shared.at * 1000).toLocaleString() + (shared.masked === null ?
+  ', nothing masked' : ', keys, e-mail addresses and the home folder masked (' + shared.masked + ')')
+  + (shared.older ? ', without the ' + shared.older + ' oldest messages' : '');
+if (!shared.score.length) renderScores([], $('#scores'));
+for (const p of shared.score) {  // every project's scores, one after another
+  const box = el('div');
+  renderScores([p], box);
+  $('#scores').append(box);
+}
+renderDuels(shared.duels, $('#duel-list'));
+"""
+# The replay: the chat up to the timeline's point, played at the chosen speed (long pauses shortened)
+REPLAY_JS = r"""
+const msgs = shared.msgs, log = $('#log'), at = $('#at');
+let count = 0, timer = null;
+const seconds = ts => Date.parse(String(ts).replace(' ', 'T')) / 1000;
+function show(k) {  // the chat up to message k
+  if (k < count) while (log.children.length > k) log.lastChild.remove();
+  else log.append(...msgs.slice(count, k).map(message));
+  count = k;
+  at.value = k;
+  $('#clock').textContent = (k ? String(msgs[k - 1][4]).slice(0, 16) : 'the start') + ' · ' + k + ' of ' + msgs.length;
+  log.scrollTop = log.scrollHeight;
+}
+function pause() { clearTimeout(timer); timer = null; $('#play').textContent = 'Play'; }
+function step() {
+  if (count >= msgs.length) return pause();
+  show(count + 1);
+  const gap = count < msgs.length ? seconds(msgs[count][4]) - seconds(msgs[count - 1][4]) : 0;
+  timer = setTimeout(step, Math.min(1500, Math.max(60, (gap || 0) * 1000 / Number($('#speed').value))));
+}
+$('#play').addEventListener('click', () => {
+  if (timer) return pause();
+  if (count >= msgs.length) show(0);
+  $('#play').textContent = 'Pause';
+  step();
+});
+at.max = msgs.length;
+at.addEventListener('input', () => { pause(); show(Number(at.value)); });
+show(msgs.length);
+tabs('chat');
+renderBoard(shared.tasks, shared.done, $('#tasks'));
+"""
+EXPORT_BODY = {
+    "replay": """<header><h1>Agon replay</h1><span id="when" class="small grow"></span>
+<button type="button" id="play">Play</button><select id="speed" aria-label="Speed"><option value="10">10×</option>
+<option value="60" selected>60×</option><option value="600">600×</option></select></header>
+<div id="timeline"><input type="range" id="at" min="0" value="0" aria-label="Where in the chat">
+<span id="clock" class="small"></span></div>
+<nav id="tabs"><button type="button" class="main" data-panel="chat">Chat</button>
+<button type="button" data-panel="board">Board</button><button type="button" data-panel="duels">Duels</button>
+<button type="button" data-panel="score">Score</button></nav>
+<main><section id="chat" class="panel"><div id="log"></div></section>
+<section id="board" class="panel side"><h2>The board at export</h2><div id="tasks"></div></section>
+<section id="duels" class="panel side"><h2>Duels</h2><div id="duel-list"></div></section>
+<section id="score" class="panel side"><div id="scores"></div></section></main>""",
+    "scorecard": """<header><h1>Agon scorecard</h1><span id="when" class="small grow"></span></header>
+<main><section id="score" class="panel"><div id="scores"></div><h2>Duels</h2><div id="duel-list"></div></section></main>""",
+}
+
+
+def csp_hash(text):
+    return "'sha256-" + base64.b64encode(hashlib.sha256(text.encode()).digest()).decode() + "'"
+
+
+def data_block(data):
+    """`data` as the text of a <script type="application/json">: nothing in it ends the element or starts a comment."""
+    text = json.dumps(data, ensure_ascii=False)
+    for char, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), (" ", "\\u2028"),
+                         (" ", "\\u2029")):
+        text = text.replace(char, escape)
+    return text
+
+
+def masked(value, counts, home):
+    """`value` (JSON data) with what looks private masked in every string: keys and tokens in known formats, e-mail
+    addresses, and paths into the home folder (`home`, a pattern) as ~. `counts` adds up what was masked."""
+    if isinstance(value, str):
+        value, n = KEYS.subn("[key hidden]", value)
+        counts[0] += n
+        value, n = EMAILS.subn("[e-mail hidden]", value)
+        counts[1] += n
+        if home:
+            value, n = home.subn("~", value)
+            counts[2] += n
+        return value
+    if isinstance(value, (list, tuple)):  # the chat's rows come from SQLite as tuples
+        return [masked(item, counts, home) for item in value]
+    if isinstance(value, dict):
+        return {key: masked(item, counts, home) for key, item in value.items()}
+    return value
+
+
+def windows_path(path, long=False):
+    """Windows: `path` in its 8.3 short form (C:\\Users\\LONGNA~1), or with `long` in its long one; None when it has no
+    other form, or on another system."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        convert = k32.GetLongPathNameW if long else k32.GetShortPathNameW
+        convert.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        convert.restype = wintypes.DWORD
+        found = ctypes.create_unicode_buffer(32768)
+        size = convert(str(path), found, len(found))
+        return found.value if 0 < size < len(found) and found.value != str(path) else None
+    except Exception:  # no ctypes, an old Windows...
+        return None
+
+
+def home_folder(home=None, other=None):
+    """A pattern for the home folder's path (`home`, else this user's) in the ways a text may spell it: as it is and with
+    /. A Windows path also with its backslashes doubled (in JSON or code), as Git Bash writes it (/c/Users/me), in any
+    letter case, and in its other form (`other`; for this user's, found: the 8.3 short form, C:\\Users\\LONGNA~1, that
+    %TEMP% uses for a long user name, or else the long one). A whole folder name only (/home/me, not /home/meg). None
+    for a drive or the root."""
+    if home is None:
+        home = str(Path.home())
+        other = windows_path(home) or windows_path(home, long=True)
+    windows = bool(re.match(r"[A-Za-z]:[\\/]", home))
+    if len((PureWindowsPath if windows else PurePosixPath)(home).parts) < 2:
+        return None
+    forms = []
+    for path in filter(None, (home, other)):
+        forms += [path, path.replace("\\", "/")]
+        if windows:
+            forms += [path.replace("\\", "\\\\"), "/" + path[0].lower() + path[2:].replace("\\", "/")]
+    forms = sorted(dict.fromkeys(forms), key=len, reverse=True)  # the longest first, where one starts another
+    return re.compile(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])", re.I if windows else 0)
+
+
+def export(kind, project=None, redact=True):
+    """A replay or a scorecard, as (the file's name, its HTML, what the human reads: what's in it, what was masked).
+    `project` (a folder) keeps a scorecard to that project."""
+    now = time.time()
+    if kind == "replay":
+        rows = db().execute("SELECT * FROM (SELECT id, sender, rcpt, text, ts FROM msgs ORDER BY id DESC LIMIT ?) ORDER"
+                            " BY id", (EXPORT_MAX,)).fetchall()
+        state = arena_state(now)
+        data = {"kind": kind, "at": now, "msgs": rows, "older": max(0, db().execute(
+            "SELECT COUNT(*) FROM msgs").fetchone()[0] - len(rows)), "tasks": state["tasks"], "done": state["done"],
+                "duels": duels_state(50), "score": scoreboard(None)}
+        what = f"A replay of {len(rows):,} messages, with the board, the duels and the score."
+    else:
+        if project and not os.path.isdir(project):
+            raise ToolError(f"{project} isn't a folder: give a project's folder, or no --project for every project.")
+        top = toplevel(project) if project else None
+        data = {"kind": kind, "at": now, "older": 0,
+                "score": [p for p in scoreboard(None) if top in (None, p["project"])],
+                "duels": [d for d in duels_state(50) if top in (None, d["project"])]}
+        what = f"A scorecard of {top or 'every project'}: " + ("the score and the duels." if data["score"] or data[
+            "duels"] else "Agon has no scores or duels for it yet.")
+    counts = [0, 0, 0]  # keys, e-mail addresses, paths into the home folder
+    if redact:
+        data = masked(data, counts, home_folder())
+    data["masked"] = sum(counts) if redact else None
+    style, script = ARENA_STYLE + EXPORT_STYLE, ARENA_RENDER + EXPORT_JS + (REPLAY_JS if kind == "replay" else "")
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+    html = (f'<!doctype html>\n<html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src'
+            f" 'none'; script-src {csp_hash(script)}; style-src {csp_hash(style)}; img-src data:; base-uri 'none';"
+            f""" form-action 'none'"><meta charset="utf-8"><meta name="viewport" content="width=device-width,"""
+            f""" initial-scale=1"><title>Agon {kind}, {stamp}</title><style>{style}</style></head>"""
+            f"""<body class="export {kind}">{EXPORT_BODY[kind]}<script type="application/json" id="data">"""
+            f"{data_block(data)}</script><script>{script}</script></body></html>\n")
+    name = f"agon-{kind}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}.html"
+    if not redact:
+        hidden = "Nothing is masked (--no-redact): keys, e-mail addresses and your home folder stay as they were."
+    elif data["masked"]:
+        hidden = "Agon masked what looked private: " + listed([f"{n} {words[n != 1]}" for n, words in zip(counts, MASKS)
+                                                               if n]) + "."
+    else:
+        hidden = "Agon found nothing to mask: no keys, e-mail addresses or paths into your home folder."
+    return name, html, (f"{what} It may contain code, file paths and whatever the agents wrote: check it before you"
+                        f" share it. {hidden}")
+
+
+HEARTBEAT = 15  # seconds between the comments that keep an event stream open (proxies and phones drop quiet ones)
+RECENT = 200  # messages a new page starts with (/msgs?before= pages back)...
+REPLAY = 1000  # ...and at most this many a page that comes back gets
+ARENA_CLOSING = threading.Event()  # the arena is shutting down: its streams and duels end
+
+
+@functools.lru_cache(maxsize=8)
+def arena_hosts(raw, port):
+    """The Host headers the arena answers: 127.0.0.1 and localhost on its port, and the exact names in AGON_ARENA_HOSTS
+    (comma-separated, with a :port unless it is the scheme's own), the way a tunnel to a phone reaches the arena:
+    Tailscale Serve passes on the tailnet's name. Never a pattern: the Host check is what keeps other websites out
+    (DNS rebinding)."""
+    names = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    for name in filter(None, (part.strip().lower() for part in raw.split(","))):
+        if not re.fullmatch(rf"{label}(?:\.{label})*(?::\d{{1,5}})?", name):
+            raise ValueError(f"AGON_ARENA_HOSTS must list exact host names, such as laptop.tailnet.ts.net, comma-separated;"
+                             f" {name!r} isn't one")
+        names.add(name)
+    return frozenset(names)
+
+
+class Arena(ThreadingHTTPServer):
+    """The arena's server, on 127.0.0.1 only, with a thread for each request: a page's event stream keeps one. On Windows
+    SO_REUSEADDR lets a second server bind the port while this one listens, and which one gets a request is then
+    undefined (Microsoft's docs; CPython issue gh-85307): there it is off, as socket.create_server leaves it."""
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+    def server_bind(self):
+        """Bind, without the name http.server looks up for the address (socket.getfqdn, a reverse DNS lookup: 35 s for
+        127.0.0.1 on GitHub's macOS runners, before the arena listens): it answers at 127.0.0.1 and needs none."""
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):  # a page that closed mid-answer: nothing to report
+            super().handle_error(request, client_address)
+
+
+def duel_number(body):
+    """The duel a POST names: {"duel": 3}."""
+    duel = body.get("duel")
+    if not isinstance(duel, int) or isinstance(duel, bool) or duel < 1:
+        raise ToolError('Send JSON like {"duel": 3}.')
+    return duel
 
 
 class Web(BaseHTTPRequestHandler):
-    # Agents act on what the chat says, so other websites must never post to it:
-    # the Host check stops DNS rebinding, and requiring JSON stops CSRF (plain forms can't send it).
+    # Agents act on what the chat says, so other websites must never post to it, nor read it: the Host check stops DNS
+    # rebinding; every POST must be JSON (plain forms can't send it) from the arena's own page (its Origin); and the page
+    # can't be framed, nor run a script it didn't bring (its Content-Security-Policy)
     def local(self):
-        if self.headers.get("Host") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+        try:
+            hosts = arena_hosts(os.environ.get("AGON_ARENA_HOSTS", ""), PORT)
+        except ValueError as e:
+            return self.answer(500, str(e))
+        if (self.headers.get("Host") or "").strip().lower() in hosts:
             return True
-        self.send_error(403)
+        self.answer(403, "The arena answers only at its own address.")
+
+    def same_origin(self):
+        """Browsers send an Origin with every POST: the arena's own page has the arena's scheme and Host."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if (self.headers.get("Origin") or "").strip().lower() in (f"http://{host}", f"https://{host}"):
+            return True
+        self.answer(403, "The arena takes this only from its own page (python agon.py say posts from a terminal).")
 
     def handle(self):
         try:
@@ -3258,50 +4907,255 @@ class Web(BaseHTTPRequestHandler):
         finally:
             close_db()  # every request runs in a new thread with its own connection
 
+    def guard(self):
+        """Headers for every answer: nothing is cached, sniffed, framed or given a referrer."""
+        for name, value in (("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                            ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer")):
+            self.send_header(name, value)
+
     def do_GET(self):
         if not self.local():
             return
-        if self.path.startswith("/msgs"):
-            after = int(self.path.partition("after=")[2] or 0)
-            rows = db().execute(
-                "SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id", (after,)
-            ).fetchall()
-            body, ctype = json.dumps(rows).encode(), "application/json"
-        else:
-            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        url = urlsplit(self.path)
+        query = {key: values[-1] for key, values in parse_qs(url.query).items()}
+        if url.path == "/events":
+            return self.events(query)
+        if url.path == "/msgs":  # the chat after message `after`, or up to `limit` messages before message `before`
+            after, before, limit = (number(query.get(key, default)) for key, default in (("after", "0"),
+                                                                                        ("before", "0"), ("limit", "200")))
+            if None in (after, before, limit):
+                return self.answer(400, "after, before and limit are message numbers.")
+            if before:
+                rows = db().execute("SELECT * FROM (SELECT id, sender, rcpt, text, ts FROM msgs WHERE id < ? ORDER BY id"
+                                    " DESC LIMIT ?) ORDER BY id", (before, min(limit, REPLAY))).fetchall()
+            else:
+                rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id",
+                                    (after,)).fetchall()
+            return self.json(rows)
+        if url.path == "/board":  # the arena's snapshot, or with id one task in full, or with duel one duel
+            if "duel" in query:
+                if (duel := number(query["duel"])) is None:
+                    return self.answer(400, "duel is a duel's number.")
+                try:
+                    return self.json(duel_state(duel))
+                except ToolError as e:
+                    return self.answer(404, str(e))
+            if "id" not in query:
+                return self.json(arena_state())
+            if (tid := number(query["id"])) is None:
+                return self.answer(400, "id is a task number.")
+            try:
+                return self.json(task_state(tid))
+            except ToolError as e:
+                return self.answer(404, str(e))
+        if url.path != "/":
+            return self.answer(404, "Nothing here: the arena is at /.")
+        nonce = secrets.token_urlsafe(18)  # a new one for every page: only the page's own script and style run
+        body = PAGE.replace("{nonce}", nonce).encode()
         self.send_response(200)
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{nonce}'; style-src"
+                         f" 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action"
+                         " 'none'; frame-ancestors 'none'")
+        self.guard()
         self.end_headers()
         self.wfile.write(body)
 
+    def events(self, query):
+        """GET /events, the arena's live feed as Server-Sent Events: each chat message as an event `msg` with its id (a
+        page that comes back names the last one it has: the browser in Last-Event-ID, the page itself in ?after=), the
+        snapshot of GET /board as an event `board` whenever it changes, and a comment every HEARTBEAT seconds. First an
+        event `start` says which message the feed starts at and whether older ones exist."""
+        raw = self.headers.get("Last-Event-ID") or query.get("after")
+        last = number(raw) if raw not in (None, "") else None
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.guard()
+        self.end_headers()
+
+        def send(event, data, eid=None):  # one event; JSON keeps its data on one line
+            head = f"id: {eid}\n" if eid is not None else ""
+            self.wfile.write(f"{head}event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            newest = newest_id()
+            since = max(last, newest - REPLAY) if last is not None else max(0, newest - RECENT)
+            send("start", {"after": since, "older": bool(db().execute("SELECT 1 FROM msgs WHERE id <= ? LIMIT 1",
+                                                                      (since,)).fetchone())})
+            shown, beat = None, time.monotonic()
+            while not ARENA_CLOSING.is_set():
+                version = data_version()
+                for row in db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id LIMIT ?",
+                                        (since, REPLAY)).fetchall():
+                    send("msg", list(row), row[0])
+                    since = row[0]
+                state = arena_state()
+                now = state.pop("now")  # the time alone is no change
+                if (text := json.dumps(state, sort_keys=True)) != shown:
+                    send("board", state | {"now": now})
+                    shown = text
+                if time.monotonic() - beat >= HEARTBEAT:
+                    self.wfile.write(b": ping\n\n")
+                    beat = time.monotonic()
+                self.wfile.flush()
+                wait_for_change(version, max(0.05, beat + HEARTBEAT - time.monotonic()), ARENA_CLOSING.is_set)
+        except OSError:  # the page is gone (Windows: WinError 10053 or 10054)
+            pass
+        except sqlite3.Error as e:  # agon.db stayed locked: the page reconnects in a moment
+            self.log_error("agon: the event stream stopped: %s", e)
+
     def do_POST(self):
-        if not self.local():
+        if not self.local() or not self.same_origin():
             return
         if self.headers.get("Content-Type") != "application/json":
-            return self.send_error(415)
+            return self.answer(415, "Send JSON.")
         try:
-            msg = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
-            text, to = msg["text"], msg.get("to", "all")
+            body = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
         except Exception:
-            text = to = None
+            body = None
+        handler = {"/msgs": self.say, "/duel": self.duel, "/duel/pick": self.pick, "/duel/stop": self.stop,
+                   "/export": self.export}.get(urlsplit(self.path).path)
+        if handler is None:
+            return self.answer(404, "Nothing here.")
+        handler(body if isinstance(body, dict) else {})
+
+    def say(self, body):
+        """POST /msgs: the human's message, as {"to": ..., "text": ...}. STOP pauses the team, the next message resumes."""
+        text, to = body.get("text"), body.get("to", "all")
         if not isinstance(text, str) or not text.strip() or bad_recipient(to):
             return self.answer(400, 'Send JSON like {"to": "all", "text": "..."}.')
         if problem := too_long(text):
             return self.answer(413, problem)
         post("human", to.strip(), text)
         self.send_response(204)
+        self.guard()
         self.end_headers()
+
+    def duel(self, body):
+        """POST /duel: the human starts a duel, as {"prompt": ..., "agents": ["claude", "gpt"], "folder": ...}."""
+        self.act(lambda: {"duel": start_duel(body.get("prompt"), body.get("agents"), body.get("folder"))})
+
+    def pick(self, body):
+        """POST /duel/pick: the human picks a duel's winner, as {"duel": 3, "label": "A"}."""
+        self.act(lambda: {"text": pick_duel(duel_number(body), body.get("label"))})
+
+    def stop(self, body):
+        """POST /duel/stop: the human stops a running duel, as {"duel": 3}."""
+        self.act(lambda: {"text": stop_duel(duel_number(body))})
+
+    def export(self, body):
+        """POST /export: a replay or a scorecard to download, as {"kind": "replay"}, always masked (see export()):
+        {"name": its file name, "html": the file, "said": what the human reads}."""
+        if body.get("kind") not in ("replay", "scorecard"):
+            return self.answer(400, 'Send JSON like {"kind": "replay"} or {"kind": "scorecard"}.')
+        name, html, said = export(body["kind"])
+        self.json({"name": name, "html": html, "said": said})
+
+    def act(self, do):
+        """Answer with what do() returns, as JSON, or with why Agon did nothing."""
+        try:
+            self.json(do())
+        except ToolError as e:
+            self.answer(400, str(e))
+
+    def json(self, value):
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.guard()
+        self.end_headers()
+        self.wfile.write(body)
 
     def answer(self, code, text):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.guard()
         self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, *args):
         pass
+
+
+SENDER_COLORS = {"claude": "33", "gpt": "32", "gemini": "94", "human": "1", "agon": "2"}  # others: cyan
+
+
+def windows_colors():
+    """Windows: turn on the console's virtual-terminal processing, which colors need (Python doesn't for a script).
+    False when stdout isn't a console, or when this Windows can't."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle, mode = k32.GetStdHandle(-11 & 0xFFFFFFFF), wintypes.DWORD()  # STD_OUTPUT_HANDLE
+        # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(k32.GetConsoleMode(handle, ctypes.byref(mode)) and k32.SetConsoleMode(handle, mode.value | 0x0005))
+    except Exception:  # no ctypes, not Windows...
+        return False
+
+
+def colors(stream):
+    """Whether `python agon.py watch` colors what it prints: never with NO_COLOR (set and not empty: no-color.org), which comes before
+    FORCE_COLOR (as in Python itself), always with FORCE_COLOR; else on a terminal that shows colors."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("TERM") == "dumb" or not stream.isatty():
+        return False
+    return os.name != "nt" or windows_colors()
+
+
+def watch_line(row, color):
+    """One message as `python agon.py watch` prints it: its time, id, sender and recipient, then its text, every further line indented.
+    Only plain text reaches the terminal: an agent's escape sequences could retitle it or write the clipboard."""
+    i, sender, rcpt, text, ts = row
+    head = f"{str(ts)[11:16]} #{i} {plain(str(sender))} → {plain(str(rcpt))}:"
+    if color:
+        head = f"\x1b[{SENDER_COLORS.get(sender, '36')}m{head}\x1b[0m"
+    return head + " " + "\n    ".join(plain(str(text)).splitlines() or [""]) + "\n"
+
+
+def chat_feed(out=None, show=20):
+    """`python agon.py watch`: the team's chat in the terminal: the last `show` messages, then each one as it comes,
+    until Ctrl+C."""
+    out = out or sys.stdout
+    if hasattr(out, "reconfigure"):  # a file or a pipe gets UTF-8, where Windows would use the ANSI code page
+        out.reconfigure(errors="replace", **({} if out.isatty() else {"encoding": "utf-8"}))
+    color, since = colors(out), max(0, newest_id() - show)
+    while True:
+        version = data_version()
+        rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id LIMIT 500",
+                            (since,)).fetchall()
+        for row in rows:
+            out.write(watch_line(row, color))
+            since = row[0]
+        out.flush()
+        if not rows:
+            wait_for_change(version, 3600)
+
+
+def human_says(to, text):
+    """`python agon.py say`: the human's message from a terminal, checked as the arena checks it. STOP pauses the team, and
+    the next message resumes it. Returns what to print; a ToolError says why nothing was sent."""
+    if not isinstance(text, str) or not text.strip():
+        raise ToolError("Nothing sent: give the text (or - to read it from stdin, --file to read a file).")
+    if problem := bad_recipient(to) or too_long(text):
+        raise ToolError(f"Nothing sent: {problem}")
+    was = paused()
+    post("human", to.strip(), text)
+    if text.strip() == "STOP":
+        return "Sent: the team is paused until your next message."
+    return "Sent: the team goes on." if was else "Sent."
 
 
 def command_line(args):
@@ -3430,6 +5284,46 @@ def setup(out=None):
         "Now: agy won't run (AGON_GEMINI_PLAN=1 runs it on your Google login, at your own risk)." if barred("gemini")
         else "Now: Agon may run agy.")
 
+    # the arena, and a phone that reaches it through a tunnel (the arena answers only at the names it knows)
+    hosts = os.environ.get("AGON_ARENA_HOSTS", "").strip()
+    say("", "== Arena: the chat, each agent's fuel, the board, duels and the score, in a browser",
+        "  " + command_line([py, script]) + f"   then open http://127.0.0.1:{PORT}",
+        "It answers only at its own address and takes posts only from its own page. On a phone, through a tunnel:",
+        f"  ssh -L {PORT}:127.0.0.1:{PORT} you@this-computer   (an SSH app on the phone; then http://127.0.0.1:{PORT})",
+        f"  tailscale serve --bg {PORT}   (Tailscale on both; it passes its own name, so list that exact name, such as",
+        "  laptop.tail1234.ts.net, in AGON_ARENA_HOSTS, comma-separated: never a pattern, the check keeps other sites out)",
+        f"Now: AGON_ARENA_HOSTS is {hosts}" if hosts else "Now: AGON_ARENA_HOSTS isn't set: 127.0.0.1 and localhost only.",
+        "In a terminal: python agon.py watch follows the chat, python agon.py say TEXT posts as you, and python agon.py",
+        "export replay|scorecard writes one HTML file to share (keys, e-mail addresses and your home folder masked).")
+
+    # a plan's usage, which only Claude Code's status line reports; Agon keeps its percentages and reset times only
+    if windows:  # Claude Code runs it with Git Bash (backslashes vanish) or PowerShell (a quoted program is a string)
+        runner = Path(py).as_posix()
+        status = f'{runner if " " not in runner else "py"} "{Path(script).as_posix()}" statusline'
+    else:
+        status = shlex.join([py, script, "statusline"])
+    say("", "== Fuel: the plan's usage in the arena (optional; Claude Code only, on a Pro or Max plan)",
+        "Claude Code's status line gets the plan's 5-hour and 7-day usage. Agon's status line command keeps only those",
+        "percentages, their reset times and the session id (not the transcript or the folders), and prints a usual line.",
+        "A plugin can't set the status line: merge this into " + str(home / ".claude" / "settings.json") + " yourself:",
+        "  " + json.dumps({"statusLine": {"type": "command", "command": status}}),
+        "Without it (or in an IDE panel that shows no status line) the arena shows working, idle, out of quota and the",
+        "reset time, as for the other apps.")
+
+    # duels: a worktree has only what git tracks, so the setup command installs the rest in each one
+    setup_ = os.environ.get("AGON_SETUP_CMD", "").strip()
+    say("", "== Duels: two or three agents do the same task on branches of their own; you pick the winner (the arena)",
+        "Each works in a new git worktree from your last commit: no node_modules, .venv or .env there. AGON_SETUP_CMD",
+        "installs them in each worktree first (run like AGON_TEST_CMD: without a shell, as you, one worktree at a time,",
+        f"stopped after AGON_SETUP_TIMEOUT seconds, {SETUP_TIMEOUT}); AGON_ROOT tells it your project's folder, to copy",
+        "an .env from. A trap: after pip install -e with code under src/, Python in any worktree imports your main",
+        "folder's code, so every entry's tests test the same code. Give each worktree a virtual environment of its own:",
+        "a setup script that makes .venv there and runs pip install -e . in it, and a test command that names it by a",
+        "relative path, taken from the worktree: " + (r".venv\Scripts\python.exe" if windows else ".venv/bin/python")
+        + " -m pytest -q.",
+        f"Now: AGON_SETUP_CMD is {setup_}" if setup_ else "Now: AGON_SETUP_CMD isn't set: the worktrees get nothing but"
+        " what git tracks.")
+
 
 class Args(argparse.ArgumentParser):
     def error(self, message):  # argparse exits with 2, which Claude Code and Codex read as "keep the agent going"
@@ -3472,16 +5366,96 @@ def main(argv):
         return autopilot(args.agents, args.lead, args.project)
     elif argv == ["stats"]:
         stats()
+    elif argv[:1] == ["watch"]:
+        Args(prog="agon.py watch", description="The team's chat in the terminal, live: the last 20 messages, then each"
+             " new one, until Ctrl+C. One color per sender on a terminal; NO_COLOR turns them off, FORCE_COLOR on."
+             ).parse_args(argv[1:])
+        chat_feed()
+    elif argv[:1] == ["say"]:
+        cli = Args(prog="agon.py say", description="Post a message to the team as the human, as the arena does: STOP"
+                   " pauses the team, the next message resumes it.")
+        cli.add_argument("--to", default="all", metavar="NAME", help="all (the default) or one agent: claude, gpt, ...")
+        cli.add_argument("--file", metavar="PATH", help="read the text from this file (UTF-8)")
+        cli.add_argument("text", nargs="*", help="the text; - reads it from stdin (UTF-8). PowerShell 5.1, and any call"
+                         " through agon.cmd, drop the quotes inside an argument: use - or --file for such text")
+        args = cli.parse_args(argv[1:])
+        try:
+            if args.file:
+                text = Path(args.file).read_bytes().decode("utf-8-sig")
+            elif args.text == ["-"]:
+                text = sys.stdin.buffer.read().decode("utf-8-sig")
+            else:
+                text = " ".join(args.text)
+            print(human_says(args.to, text))
+        except (ToolError, OSError, UnicodeDecodeError) as e:
+            print(f"agon say: {e}", file=sys.stderr)
+            return 1
+    elif argv[:1] == ["export"]:
+        cli = Args(prog="agon.py export", description="A replay (the chat on a timeline, with the board, the duels and"
+                   " the score) or a scorecard (the score and the duels), as one HTML file that loads nothing. It may"
+                   " contain code, file paths and whatever the agents wrote: Agon masks keys and tokens in known"
+                   " formats, e-mail addresses and your home folder's path, and says how many.")
+        cli.add_argument("kind", choices=("replay", "scorecard"))
+        cli.add_argument("-o", "--output", metavar="FILE", help="the file to write (default: agon-KIND-DATE.html here)")
+        cli.add_argument("--project", metavar="FOLDER", help="a scorecard of this project only")
+        cli.add_argument("--no-redact", action="store_true", help="mask nothing: keys, e-mail addresses and your home"
+                         " folder stay as they are")
+        args = cli.parse_args(argv[1:])
+        try:
+            name, html, said = export(args.kind, args.project, not args.no_redact)
+            Path(args.output or name).write_bytes(html.encode("utf-8"))  # bytes: a script's text must stay as hashed
+        except (ToolError, OSError) as e:
+            print(f"agon export: {e}", file=sys.stderr)
+            return 1
+        print(f"Saved {args.output or name}. {said}")
+    elif argv[:1] == ["statusline"]:
+        cli = Args(prog="agon.py statusline", description="Claude Code's status line command: prints the model, the"
+                   " folder, the context and the plan's usage, and keeps only the plan's usage (the percentage of each"
+                   " window, when it resets, the session id) for the arena.")
+        cli.add_argument("name", nargs="?", default="claude", help="the agent's name in Agon (default claude)")
+        statusline(cli.parse_args(argv[1:]).name)
     elif argv:
         # Host apps end their MCP servers with SIGINT (Claude Code) or SIGTERM (Codex, agy after closing stdin).
         # Take SIGTERM like Ctrl+C: the server unwinds and waits while running asks stop their apps and log it
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
-        url = f"http://127.0.0.1:{PORT}"
-        print(f"Agon arena: {url}  (Ctrl+C to stop)")
-        webbrowser.open(url)
-        ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+        for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):  # like Ctrl+C (SIGHUP: its terminal closed; SIGBREAK: Ctrl+Break
+            if hasattr(signal, name):  # on Windows): a running duel stops its apps and leaves nothing behind
+                signal.signal(getattr(signal, name), lambda *_: sys.exit(0))
+        return arena()
+    return 0
+
+
+def arena():
+    """`python agon.py`: the arena at http://127.0.0.1:8765 until Ctrl+C. Returns the exit code."""
+    url = f"http://127.0.0.1:{PORT}"
+    try:
+        arena_hosts(os.environ.get("AGON_ARENA_HOSTS", ""), PORT)  # a bad setting stops it before it listens
+        server = Arena(("127.0.0.1", PORT), Web)
+    except ValueError as e:
+        print(f"agon: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"agon: the arena can't listen on 127.0.0.1:{PORT} ({e.strerror or e}). Agon's arena may run there already:"
+              f" open {url}. Or another program uses the port.", file=sys.stderr)
+        return 1
+    print(f"Agon arena: {url}  (Ctrl+C to stop)", flush=True)
+    try:
+        interrupted_duels()  # a duel that ran when the last arena ended can't go on
+    except sqlite3.Error as e:
+        print(f"agon: {e}", file=sys.stderr)
+    close_db()
+    webbrowser.open(url)
+    try:
+        server.serve_forever()
+    finally:
+        ARENA_CLOSING.set()  # its event streams and duels end
+        server.server_close()
+        if DUELS:
+            print("agon: the duel stops: its apps end, and its worktrees and branches go...", file=sys.stderr, flush=True)
+        for thread in list(DUELS.values()):
+            thread.join(GRACE + 15)
     return 0
 
 

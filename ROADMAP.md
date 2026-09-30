@@ -23,7 +23,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 3.1 — Review evidence (fix found in a real-CLI audit)
 - [x] Phase 4 — Task board (no downtime)
 - [x] Phase 5 — Autopilot (Agon wakes the agents itself)
-- [ ] Phase 6 — The arena
+- [x] Phase 6 — The arena
 - [ ] Phase 7 — Packaging
 
 ## How every session works
@@ -68,16 +68,17 @@ When asked to do "the next phase":
 - **Storage:** SQLite in WAL mode (`busy_timeout=5000`, `synchronous=NORMAL`), one connection per thread, in
   `~/.agon/agon.db` (`AGON_DB`) so that every app's copy of `agon.py` shares it.
   Tables: `msgs`, `agents(name, client, cursor, last_seen, autoruns, out_of_quota_until)`, `tasks` and `releases`
-  (Phase 4).
+  (Phase 4); `runs`, `pilot`, `live` and `state` (Phase 5); `asks`, `reviews`, `duels`, `entries` and `gauges`
+  (Phase 6). New steps only ever go at the end of `SCHEMA`, counted in `PRAGMA user_version`.
 - **Delivery:** per-agent cursor stored in the database; advance it only after the output is written
   (at-least-once). Waiting uses `PRAGMA data_version` every 0.2 s (near-zero CPU, ≤ 0.2 s latency).
 - **Agent tools (max 4):** `send`, `inbox`, `ask` (Phase 3), `board` (Phase 4).
 - **Wake-up layers:** Claude Code channels (a doorbell: the push only says that messages wait) → Stop hooks in all
   three apps (a JSON decision on stdout) → `inbox(wait)` → the human. `UserPromptSubmit` hooks (Claude Code, Codex)
   tell an agent that comes back which of its tasks went to others.
-- **Security:** arena on 127.0.0.1 with Host and JSON checks; every message shows its author (`[HUMAN]` stands
-  out); messages from agents are requests, never permissions; Agon never edits user config files; reviews are
-  read-only by default.
+- **Security:** arena on 127.0.0.1 with Host (plus exact `AGON_ARENA_HOSTS`), Origin and JSON checks and a
+  nonce-based CSP; every message shows its author (`[HUMAN]` stands out); messages from agents are requests, never
+  permissions; Agon never edits user config files; reviews are read-only by default.
 
 ## Phase 1 — Solid core
 
@@ -271,6 +272,15 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
   contain code).
 - Terminal: `python agon.py watch` (live colored feed) and `python agon.py say [--to NAME] TEXT`.
 - Tests: SSE resume, `/board` JSON, a duel with fake CLIs, scoreboard update, exported HTML has no external URLs.
+- Done in v0.6.0, with what the research changed: fuel is states for every agent, plus Claude's plan percentages from
+  the status line command the human sets (Agon keeps only the numbers, their reset times and the session id); a phone
+  goes through SSH or Tailscale, with exact extra names in `AGON_ARENA_HOSTS` and an Origin check on every POST; a
+  hidden tab lets its event stream go (six connections per site); duels get `AGON_SETUP_CMD` in each worktree, a
+  baseline test run on the commit they start from, blind A/B/C labels until the pick, one duel and one setup or test
+  run at a time; the scoreboard counts only work whose author Agon knows, and hints need three results, shown as raw
+  counts; export masks known key formats, e-mail addresses and the home folder (`--no-redact` keeps them), with its
+  CSP first and hashes; `say` reads stdin or a file (PowerShell drops quotes); the arena no longer shares its port on
+  Windows. Measured facts: see Phase 6 additions below.
 
 ## Phase 7 — Packaging
 
@@ -292,7 +302,7 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
 - The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
   (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.
 
-## Verified platform facts (checked 2026-09-24; Phase 4 and 5 additions 2026-09-25)
+## Verified platform facts (checked 2026-09-24; Phase 4 and 5 additions 2026-09-25; Phase 6 additions 2026-09-26 to 30)
 
 Sources are official docs unless marked *(secondary)*. Re-check when you can; these change often.
 
@@ -654,6 +664,50 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
 
 *Agon's autopilot* (Linux, Python 3.11): idle 30 MB RSS and ~0.1% of a core (it polls `PRAGMA data_version` every
 0.2 s).
+
+**Phase 6 additions (checked 2026-09-26 to 2026-09-30; hands-on with Python 3.11, Chromium via Playwright 1.56, git
+2.43 and Claude Code 2.1.283 on Linux, unless marked)**
+
+- Server-Sent Events on `http.server.ThreadingHTTPServer`: a stream that ends makes Chromium reconnect after `retry`
+  with `Last-Event-ID`. Chromium opens at most six connections to one host across a profile's tabs: with six arena
+  tabs holding a stream, a seventh tab's load (and a POST, STOP included) hangs until one closes. A closed tab is
+  noticed at the next write (BrokenPipeError; on Windows WinError 10053/10054). One idle stream costs ~0.1% of a core
+  (polling `PRAGMA data_version` every 0.2 s).
+- CPython sets SO_REUSEADDR whenever `allow_reuse_address` is true, on every platform, and `HTTPServer` sets it. On
+  Windows a second socket with SO_REUSEADDR binds a port another one listens on, and which one gets a connection is
+  undefined ([Microsoft](https://learn.microsoft.com/windows/win32/winsock/using-so-reuseaddr-and-so-exclusiveaddruse),
+  CPython gh-85307). Checked by the user on Windows with Python 3.12 and 3.14: a second ThreadingHTTPServer binds the
+  same port; with `allow_reuse_address` off, a second bind is refused whether it sets SO_REUSEADDR or not.
+- Claude Code's status line ([docs](https://code.claude.com/docs/en/statusline)): the command gets JSON on stdin with
+  `rate_limits.five_hour` and `seven_day` (`used_percentage` 0-100, `resets_at` in Unix seconds) only for Pro and Max
+  subscribers, after the session's first API response (`spend_limit` behind a Claude apps gateway, v2.1.251+), and the
+  transcript's path, the folders and the cost too. On Windows it runs through Git Bash, or PowerShell when Git Bash is
+  absent: paths take forward slashes. A plugin can set only `agent` and `subagentStatusLine`, not the main status line
+  ([plugins reference](https://code.claude.com/docs/en/plugins-reference)).
+- Codex reports its limits through `codex app-server` (`account/rateLimits/read`); the command is experimental, and a
+  long-lived process can spoil the refresh token that every Codex client shares *(from its source and issues; not
+  used)*. agy documents no usage source.
+- Tailscale Serve (`tailscale serve --bg 8765`, from its source) passes its own `*.ts.net` name as the Host; VS Code's
+  port forwarding rewrites it to localhost *(from its source; not tried)*. `ssh -L` keeps `127.0.0.1:8765`.
+- git 2.43: three threads making worktrees, committing and removing them on one repository at once: no error. A
+  gemini review copy (`git clone --mirror --shared`) of a linked worktree works: HEAD is the worktree's branch.
+- A new worktree has only what git tracks. Claude Code's `claude -p --worktree NAME` makes
+  `<repo>/.claude/worktrees/NAME` (where a project's own test runner may find it); Agon's go to the temporary folder.
+- With a `src/` layout installed by `pip install -e`, Python started in a worktree imports the main folder's package.
+- An HTML file opened as `file://` with a `<meta http-equiv="Content-Security-Policy">` first in `<head>`: an external
+  stylesheet, image, `fetch()` and an image beacon are all refused, and no request reaches the network. Data in a
+  `<script type="application/json">` with `<`, `>`, `&`, U+2028 and U+2029 escaped parses back exactly; unescaped, a
+  `</script>` in it ends the element early. The arena's download (a Blob URL on an `<a download>`) works under its CSP.
+- Terminals: Python enables no VT processing in a Windows console (Agon calls `SetConsoleMode`); printing an emoji to a
+  redirected stdout fails without UTF-8; PowerShell 5.1 drops the double quotes inside an argument to a native program,
+  and so does any call through `agon.cmd` in PowerShell 7 *(Windows facts from Microsoft's docs; not tried here)*.
+- `http.server.HTTPServer.server_bind` looks up the address's name (`socket.getfqdn`, a reverse DNS lookup). For
+  `127.0.0.1` it took 35 s in each new process on GitHub's macOS runners, 0.01 s on the Linux and Windows ones *(CI,
+  2026-09-30)*. The arena binds without it and listens within about 0.1 s.
+- Windows paths *(the maintainer on Windows 11, and CI)*: `%TEMP%` is inside the home folder, in the 8.3 short form of
+  a long user name (`C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub's runner); git spells the same folder long, with
+  `/`. Git Bash, and so Claude Code's Bash tool, writes the home folder as `/c/Users/me`. A child's `print()` into a
+  pipe ends its lines with `\r\n`.
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,
