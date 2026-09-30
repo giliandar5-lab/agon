@@ -12,11 +12,13 @@ python agon.py               browser arena at http://127.0.0.1:8765
 import argparse
 import contextlib
 import datetime
+import functools
 import json
 import os
 import posixpath
 import queue
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -3488,7 +3490,7 @@ def statusline(me, inp=None, out=None):
 
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Agon</title>
-<style>
+<style nonce="{nonce}">
   body { margin: 0; font: 15px system-ui, sans-serif; background: #16161a; color: #ddd; }
   #log { padding: 16px 16px 90px; max-width: 900px; margin: auto; }
   .m { margin: 10px 0; padding: 10px 14px; border-radius: 10px; background: #222228; border-left: 4px solid #888; }
@@ -3508,7 +3510,7 @@ PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="wi
   <input id="t" placeholder="Task or message for the team..." autofocus autocomplete="off">
   <button>Send</button>
 </form>
-<script>
+<script nonce="{nonce}">
 let last = 0;
 async function loop() {
   try {
@@ -3538,13 +3540,59 @@ f.onsubmit = async e => {
 </script>"""
 
 
+HEARTBEAT = 15  # seconds between the comments that keep an event stream open (proxies and phones drop quiet ones)
+RECENT = 200  # messages a new page starts with (/msgs?before= pages back)...
+REPLAY = 1000  # ...and at most this many a page that comes back gets
+ARENA_CLOSING = threading.Event()  # the arena is shutting down: its streams and duels end
+
+
+@functools.lru_cache(maxsize=8)
+def arena_hosts(raw, port):
+    """The Host headers the arena answers: 127.0.0.1 and localhost on its port, and the exact names in AGON_ARENA_HOSTS
+    (comma-separated, with a :port unless it is the scheme's own), the way a tunnel to a phone reaches the arena:
+    Tailscale Serve passes on the tailnet's name. Never a pattern: the Host check is what keeps other websites out
+    (DNS rebinding)."""
+    names = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    for name in filter(None, (part.strip().lower() for part in raw.split(","))):
+        if not re.fullmatch(rf"{label}(?:\.{label})*(?::\d{{1,5}})?", name):
+            raise ValueError(f"AGON_ARENA_HOSTS must list exact host names, such as laptop.tailnet.ts.net, comma-separated;"
+                             f" {name!r} isn't one")
+        names.add(name)
+    return frozenset(names)
+
+
+class Arena(ThreadingHTTPServer):
+    """The arena's server, on 127.0.0.1 only, with a thread for each request: a page's event stream keeps one. On Windows
+    SO_REUSEADDR lets a second server bind the port while this one listens, and which one gets a request is then
+    undefined (Microsoft's docs; CPython issue gh-85307): there it is off, as socket.create_server leaves it."""
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        if not isinstance(sys.exc_info()[1], ConnectionError):  # a page that closed mid-answer: nothing to report
+            super().handle_error(request, client_address)
+
+
 class Web(BaseHTTPRequestHandler):
-    # Agents act on what the chat says, so other websites must never post to it:
-    # the Host check stops DNS rebinding, and requiring JSON stops CSRF (plain forms can't send it).
+    # Agents act on what the chat says, so other websites must never post to it, nor read it: the Host check stops DNS
+    # rebinding; every POST must be JSON (plain forms can't send it) from the arena's own page (its Origin); and the page
+    # can't be framed, nor run a script it didn't bring (its Content-Security-Policy)
     def local(self):
-        if self.headers.get("Host") in (f"127.0.0.1:{PORT}", f"localhost:{PORT}"):
+        try:
+            hosts = arena_hosts(os.environ.get("AGON_ARENA_HOSTS", ""), PORT)
+        except ValueError as e:
+            return self.answer(500, str(e))
+        if (self.headers.get("Host") or "").strip().lower() in hosts:
             return True
-        self.send_error(403)
+        self.answer(403, "The arena answers only at its own address.")
+
+    def same_origin(self):
+        """Browsers send an Origin with every POST: the arena's own page has the arena's scheme and Host."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if (self.headers.get("Origin") or "").strip().lower() in (f"http://{host}", f"https://{host}"):
+            return True
+        self.answer(403, "The arena takes this only from its own page (python agon.py say posts from a terminal).")
 
     def handle(self):
         try:
@@ -3552,11 +3600,19 @@ class Web(BaseHTTPRequestHandler):
         finally:
             close_db()  # every request runs in a new thread with its own connection
 
+    def guard(self):
+        """Headers for every answer: nothing is cached, sniffed, framed or given a referrer."""
+        for name, value in (("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                            ("X-Frame-Options", "DENY"), ("Referrer-Policy", "no-referrer")):
+            self.send_header(name, value)
+
     def do_GET(self):
         if not self.local():
             return
         url = urlsplit(self.path)
         query = {key: values[-1] for key, values in parse_qs(url.query).items()}
+        if url.path == "/events":
+            return self.events(query)
         if url.path == "/msgs":  # the chat after message `after`, or up to `limit` messages before message `before`
             after, before, limit = (number(query.get(key, default)) for key, default in (("after", "0"),
                                                                                         ("before", "0"), ("limit", "200")))
@@ -3564,7 +3620,7 @@ class Web(BaseHTTPRequestHandler):
                 return self.answer(400, "after, before and limit are message numbers.")
             if before:
                 rows = db().execute("SELECT * FROM (SELECT id, sender, rcpt, text, ts FROM msgs WHERE id < ? ORDER BY id"
-                                    " DESC LIMIT ?) ORDER BY id", (before, min(limit, 1000))).fetchall()
+                                    " DESC LIMIT ?) ORDER BY id", (before, min(limit, REPLAY))).fetchall()
             else:
                 rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id",
                                     (after,)).fetchall()
@@ -3580,43 +3636,103 @@ class Web(BaseHTTPRequestHandler):
                 return self.answer(404, str(e))
         if url.path != "/":
             return self.answer(404, "Nothing here: the arena is at /.")
-        body = PAGE.encode()
+        nonce = secrets.token_urlsafe(18)  # a new one for every page: only the page's own script and style run
+        body = PAGE.replace("{nonce}", nonce).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Security-Policy", f"default-src 'none'; script-src 'nonce-{nonce}'; style-src"
+                         f" 'nonce-{nonce}'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action"
+                         " 'none'; frame-ancestors 'none'")
+        self.guard()
         self.end_headers()
         self.wfile.write(body)
 
-    def json(self, value):
-        body = json.dumps(value).encode()
+    def events(self, query):
+        """GET /events, the arena's live feed as Server-Sent Events: each chat message as an event `msg` with its id (a
+        page that comes back names the last one it has: the browser in Last-Event-ID, the page itself in ?after=), the
+        snapshot of GET /board as an event `board` whenever it changes, and a comment every HEARTBEAT seconds. First an
+        event `start` says which message the feed starts at and whether older ones exist."""
+        raw = self.headers.get("Last-Event-ID") or query.get("after")
+        last = number(raw) if raw not in (None, "") else None
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.guard()
         self.end_headers()
-        self.wfile.write(body)
+
+        def send(event, data, eid=None):  # one event; JSON keeps its data on one line
+            head = f"id: {eid}\n" if eid is not None else ""
+            self.wfile.write(f"{head}event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            newest = newest_id()
+            since = max(last, newest - REPLAY) if last is not None else max(0, newest - RECENT)
+            send("start", {"after": since, "older": bool(db().execute("SELECT 1 FROM msgs WHERE id <= ? LIMIT 1",
+                                                                      (since,)).fetchone())})
+            shown, beat = None, time.monotonic()
+            while not ARENA_CLOSING.is_set():
+                version = data_version()
+                for row in db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id LIMIT ?",
+                                        (since, REPLAY)).fetchall():
+                    send("msg", list(row), row[0])
+                    since = row[0]
+                state = arena_state()
+                now = state.pop("now")  # the time alone is no change
+                if (text := json.dumps(state, sort_keys=True)) != shown:
+                    send("board", state | {"now": now})
+                    shown = text
+                if time.monotonic() - beat >= HEARTBEAT:
+                    self.wfile.write(b": ping\n\n")
+                    beat = time.monotonic()
+                self.wfile.flush()
+                wait_for_change(version, max(0.05, beat + HEARTBEAT - time.monotonic()), ARENA_CLOSING.is_set)
+        except OSError:  # the page is gone (Windows: WinError 10053 or 10054)
+            pass
+        except sqlite3.Error as e:  # agon.db stayed locked: the page reconnects in a moment
+            self.log_error("agon: the event stream stopped: %s", e)
 
     def do_POST(self):
-        if not self.local():
+        if not self.local() or not self.same_origin():
             return
         if self.headers.get("Content-Type") != "application/json":
-            return self.send_error(415)
+            return self.answer(415, "Send JSON.")
         try:
-            msg = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
-            text, to = msg["text"], msg.get("to", "all")
+            body = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
         except Exception:
-            text = to = None
+            body = None
+        handler = {"/msgs": self.say}.get(urlsplit(self.path).path)
+        if handler is None:
+            return self.answer(404, "Nothing here.")
+        handler(body if isinstance(body, dict) else {})
+
+    def say(self, body):
+        """POST /msgs: the human's message, as {"to": ..., "text": ...}. STOP pauses the team, the next message resumes."""
+        text, to = body.get("text"), body.get("to", "all")
         if not isinstance(text, str) or not text.strip() or bad_recipient(to):
             return self.answer(400, 'Send JSON like {"to": "all", "text": "..."}.')
         if problem := too_long(text):
             return self.answer(413, problem)
         post("human", to.strip(), text)
         self.send_response(204)
+        self.guard()
         self.end_headers()
+
+    def json(self, value):
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.guard()
+        self.end_headers()
+        self.wfile.write(body)
 
     def answer(self, code, text):
         body = text.encode()
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.guard()
         self.end_headers()
         self.wfile.write(body)
 
@@ -3804,10 +3920,30 @@ def main(argv):
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
-        url = f"http://127.0.0.1:{PORT}"
-        print(f"Agon arena: {url}  (Ctrl+C to stop)")
-        webbrowser.open(url)
-        ThreadingHTTPServer(("127.0.0.1", PORT), Web).serve_forever()
+        return arena()
+    return 0
+
+
+def arena():
+    """`python agon.py`: the arena at http://127.0.0.1:8765 until Ctrl+C. Returns the exit code."""
+    url = f"http://127.0.0.1:{PORT}"
+    try:
+        arena_hosts(os.environ.get("AGON_ARENA_HOSTS", ""), PORT)  # a bad setting stops it before it listens
+        server = Arena(("127.0.0.1", PORT), Web)
+    except ValueError as e:
+        print(f"agon: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"agon: the arena can't listen on 127.0.0.1:{PORT} ({e.strerror or e}). Agon's arena may run there already:"
+              f" open {url}. Or another program uses the port.", file=sys.stderr)
+        return 1
+    print(f"Agon arena: {url}  (Ctrl+C to stop)", flush=True)
+    webbrowser.open(url)
+    try:
+        server.serve_forever()
+    finally:
+        ARENA_CLOSING.set()  # its event streams end
+        server.server_close()
     return 0
 
 

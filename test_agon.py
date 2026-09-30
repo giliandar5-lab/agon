@@ -410,9 +410,11 @@ agon.PORT = arena.server_port  # the arena checks the Host header against its po
 threading.Thread(target=arena.serve_forever, daemon=True).start()
 
 
-def arena_post(body):
+def arena_post(body, path="/msgs", origin=None, host=None):  # a POST from the arena's page (its Origin, since Phase 6)
     c = http.client.HTTPConnection("127.0.0.1", agon.PORT, timeout=10)
-    c.request("POST", "/msgs", body=body, headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json", "Host": host or f"127.0.0.1:{agon.PORT}",
+               "Origin": f"http://127.0.0.1:{agon.PORT}" if origin is None else origin}
+    c.request("POST", path, body=body, headers={key: value for key, value in headers.items() if value})
     r = c.getresponse()
     status, text = r.status, r.read().decode()
     c.close()
@@ -3405,18 +3407,18 @@ assert [(t["title"], t["role"]) for t in roster()["claude"]["tasks"]] == [("Pars
 detail = agon.task_state(1)
 assert detail["spec"] == "Parse the config." and detail["report"] == "Test results, run by Agon: fine." and detail[
     "reviews"] == [{"reviewer": "claude", "verdict": "changes", "tests": "tests failed", "at": 5}], detail
-arena = ThreadingHTTPServer(("127.0.0.1", 0), agon.Web)
+arena = agon.Arena(("127.0.0.1", 0), agon.Web)
 agon.PORT = arena.server_port
 threading.Thread(target=arena.serve_forever, daemon=True).start()
 
 
-def arena_get(path, host=None):  # (status, body as text) of a GET to the arena
+def arena_get(path, host=None, full=False):  # (status, body as text[, headers]) of a GET to the arena
     c = http.client.HTTPConnection("127.0.0.1", agon.PORT, timeout=10)
     c.request("GET", path, headers={"Host": host or f"127.0.0.1:{agon.PORT}"})
     r = c.getresponse()
-    status_, text_ = r.status, r.read().decode()
+    status_, text_, headers_ = r.status, r.read().decode(), r.headers
     c.close()
-    return status_, text_
+    return (status_, text_, headers_) if full else (status_, text_)
 
 
 code_, body = arena_get("/board")
@@ -3430,8 +3432,157 @@ for i in range(3):
 newest = agon.newest_id()
 assert [row[3] for row in json.loads(arena_get(f"/msgs?before={newest}&limit=2")[1])] == ["page 0", "page 1"]
 assert [row[3] for row in json.loads(arena_get(f"/msgs?after={newest - 1}")[1])] == ["page 2"]
+
+
+class Feed:
+    """A page's event stream (GET /events), read line by line: its events as (event, id, data)."""
+
+    def __init__(self, path="/events", last=None, host=None):
+        self.c = http.client.HTTPConnection("127.0.0.1", agon.PORT, timeout=10)
+        headers = {"Host": host or f"127.0.0.1:{agon.PORT}"} | ({"Last-Event-ID": str(last)} if last is not None else {})
+        self.c.request("GET", path, headers=headers)
+        self.r = self.c.getresponse()
+        self.comments = []
+
+    def next(self, kind=None):  # the next event (of kind `kind`), skipping comments and the retry line
+        event, eid, data = None, None, None
+        while True:
+            line = self.r.fp.readline().decode("utf-8")
+            assert line, "the stream ended"
+            line = line.rstrip("\n")
+            if line.startswith(":"):
+                self.comments.append(line)
+            elif line.startswith("event: "):
+                event = line[7:]
+            elif line.startswith("id: "):
+                eid = int(line[4:])
+            elif line.startswith("data: "):
+                data = json.loads(line[6:])
+            elif line == "" and event:
+                if kind in (None, event):
+                    return event, eid, data
+                event, eid, data = None, None, None
+
+    def close(self):  # the response too: while it is open, so is the socket
+        self.r.close()
+        self.c.close()
+
+
+# /events: a new page gets the latest RECENT messages, each as an event msg with its id, then the snapshot as an event
+# board; then every new message, and the snapshot whenever it changes. A comment every HEARTBEAT seconds keeps it open
+agon.HEARTBEAT, agon.RECENT, agon.REPLAY = 0.5, 3, 4
+for i in range(3, 8):
+    agon.post("gpt", "all", f"page {i}")
+newest = agon.newest_id()
+feed = Feed()
+assert feed.r.status == 200 and feed.r.headers["Content-Type"] == "text/event-stream; charset=utf-8"
+assert feed.r.headers["Cache-Control"] == "no-store" and feed.r.fp.readline() == b"retry: 2000\n"
+assert feed.next() == ("start", None, {"after": newest - 3, "older": True})
+assert [feed.next()[1:] for _ in range(3)] == [(i, [i, "gpt", "all", f"page {i - newest + 7}", (
+    agon.db().execute("SELECT ts FROM msgs WHERE id = ?", (i,)).fetchone()[0])]) for i in range(newest - 2, newest + 1)]
+kind, eid, snapshot = feed.next()
+assert (kind, eid) == ("board", None) and snapshot.keys() == agon.arena_state().keys(), snapshot  # no id: a message's
+t0 = time.monotonic()
+agon.post("human", "gpt", "live 🙂")
+assert feed.next("msg")[1:] == (newest + 1, [newest + 1, "human", "gpt", "live 🙂", agon.db().execute(
+    "SELECT ts FROM msgs WHERE id = ?", (newest + 1,)).fetchone()[0]]) and time.monotonic() - t0 < 3
+agon.db().execute("UPDATE agents SET out_of_quota_until = ? WHERE name = 'ivy'", (time.time() + 60,))
+_, _, snapshot = feed.next("board")  # the snapshot changed: ivy is out of quota now
+assert {a["name"]: a["state"] for a in snapshot["team"]}["ivy"] == "limit"
+t0, line = time.monotonic(), b""
+while line != b": ping\n":  # nothing changes now: the heartbeat comes
+    assert time.monotonic() - t0 < 5, line
+    line = feed.r.fp.readline()
+feed.close()
+# A page that comes back names its last message (Last-Event-ID from the browser, ?after= from the page itself): it gets
+# only what came after it, at most REPLAY messages, and start says whether older ones exist
+for last, path in ((newest - 1, "/events"), (None, f"/events?after={newest - 1}")):
+    feed = Feed(path, last)
+    assert feed.next() == ("start", None, {"after": newest - 1, "older": True}), path
+    assert [feed.next()[1] for _ in range(2)] == [newest, newest + 1] and feed.next()[0] == "board"
+    feed.close()
+feed = Feed(last=0)  # long away: the last REPLAY messages
+assert feed.next() == ("start", None, {"after": newest + 1 - 4, "older": True})
+assert feed.next()[1] == newest + 1 - 3
+feed.close()
+assert Feed(host="evil.example:80").r.status == 403
+# A page that closed its stream frees the thread that served it at the next heartbeat or message
+
+
+def serving():  # the arena's threads that answer a request now
+    return sum("process_request_thread" in thread.name for thread in threading.enumerate())
+
+
+until(lambda: serving() == 0, 10)  # the streams above are closed
+feeds = [Feed() for _ in range(3)]
+for f in feeds:
+    f.next("board")
+assert serving() == 3
+for f in feeds:
+    f.close()
+until(lambda: serving() == 0, 10)
+agon.HEARTBEAT, agon.RECENT, agon.REPLAY = 15, 200, 1000
+
+# The page: its script and style run by a nonce that changes with every load (Content-Security-Policy), it loads nothing
+# else, it can't be framed, and nothing is cached or sniffed
+code_, page, headers = arena_get("/", full=True)
+nonce = re.search(r"script-src 'nonce-([\w-]+)'", headers["Content-Security-Policy"])[1]
+assert code_ == 200 and f'<script nonce="{nonce}">' in page and f'<style nonce="{nonce}">' in page, page[:300]
+assert "{nonce}" not in page and nonce not in arena_get("/")[1]  # a new one for each page
+for needed in ("default-src 'none'", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'",
+               "form-action 'none'"):
+    assert needed in headers["Content-Security-Policy"], needed
+assert (headers["X-Frame-Options"], headers["X-Content-Type-Options"], headers["Referrer-Policy"]) == (
+    "DENY", "nosniff", "no-referrer")
+# Every POST comes from the arena's own page: the Origin a browser sends is the arena's scheme and Host
+assert arena_post(json.dumps({"to": "all", "text": "from the page"}))[0] == 204
+for origin in ("", "http://evil.example", f"http://127.0.0.1:{agon.PORT}.evil.example", "null",
+               f"http://localhost:{agon.PORT}"):  # localhost is the arena too, but not the Host this request named
+    assert arena_post(json.dumps({"to": "all", "text": "forged"}), origin=origin)[0] == 403, origin
+assert arena_post(json.dumps({"to": "all", "text": "x"}), path="/nowhere")[0] == 404
+assert agon.db().execute("SELECT COUNT(*) FROM msgs WHERE text = 'forged'").fetchone()[0] == 0
+# AGON_ARENA_HOSTS: exact extra names the arena answers, such as a tailnet's for Tailscale Serve (which passes the Host on)
+with settings(AGON_ARENA_HOSTS=" laptop.tail1234.ts.net, 100.101.102.103:8443"):
+    for host in ("laptop.tail1234.ts.net", "LAPTOP.tail1234.ts.net", "100.101.102.103:8443"):
+        assert arena_get("/board", host=host)[0] == 200, host
+    for host in ("tail1234.ts.net", "evil.laptop.tail1234.ts.net", "laptop.tail1234.ts.net:444", "100.101.102.103"):
+        assert arena_get("/board", host=host)[0] == 403, host
+    assert arena_post(json.dumps({"to": "all", "text": "from the phone"}), host="laptop.tail1234.ts.net",
+                      origin="https://laptop.tail1234.ts.net")[0] == 204
+    assert arena_post(json.dumps({"to": "all", "text": "forged"}), host="laptop.tail1234.ts.net",
+                      origin=f"http://127.0.0.1:{agon.PORT}")[0] == 403
+for bad in ("*.ts.net", "https://laptop.ts.net", "laptop.ts.net/x", "a b", "laptop..ts.net"):
+    try:
+        agon.arena_hosts(bad, 8765)
+        raise AssertionError(f"{bad} must be refused")
+    except ValueError as e:
+        assert str(e).startswith("AGON_ARENA_HOSTS must list exact host names"), e
+    with settings(AGON_ARENA_HOSTS=bad):
+        assert arena_get("/board")[0] == 500  # never answered with the check off
 arena.shutdown()
 arena.server_close()
+# One arena per port: a second server can't bind it (on Windows, SO_REUSEADDR would have let it), and `python agon.py`
+# says so and exits
+first = agon.Arena(("127.0.0.1", 0), agon.Web)
+try:
+    agon.Arena(("127.0.0.1", first.server_port), agon.Web)
+    raise AssertionError("a second arena bound the same port")
+except OSError:
+    pass
+first.server_close()
+holder = socket.socket()
+try:
+    holder.bind(("127.0.0.1", 8765))  # the arena's own port, unless something (an arena) holds it already
+    holder.listen()
+except OSError:
+    pass
+taken = subprocess.run([sys.executable, SERVER], capture_output=True, text=True, timeout=60, env=ARENA_DB)
+holder.close()
+assert taken.returncode == 1 and "the arena can't listen on 127.0.0.1:8765" in taken.stderr and (
+    "open http://127.0.0.1:8765" in taken.stderr), taken
+bad_hosts = subprocess.run([sys.executable, SERVER], capture_output=True, text=True, timeout=60,
+                           env=ARENA_DB | {"AGON_ARENA_HOSTS": "*.ts.net"})
+assert bad_hosts.returncode == 1 and "AGON_ARENA_HOSTS must list exact host names" in bad_hosts.stderr, bad_hosts
 
 agon.close_db()
 agon.DB = test_db
