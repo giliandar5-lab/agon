@@ -41,7 +41,7 @@ import unicodedata
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import parse_qs, urlsplit
 
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
@@ -4748,15 +4748,44 @@ def masked(value, counts, home):
     return value
 
 
-def home_folder():
-    """A pattern for the home folder's path in either slash, a whole folder name only (/home/me, not /home/meg), or
-    None when the home folder is a drive or the root."""
-    home = Path.home()
-    if len(home.parts) < 2:
+def windows_path(path, long=False):
+    """Windows: `path` in its 8.3 short form (C:\\Users\\LONGNA~1), or with `long` in its long one; None when it has no
+    other form, or on another system."""
+    if os.name != "nt":
         return None
-    forms = dict.fromkeys((str(home), home.as_posix()))
-    return re.compile(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])",
-                      re.I if os.name == "nt" else 0)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        convert = k32.GetLongPathNameW if long else k32.GetShortPathNameW
+        convert.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        convert.restype = wintypes.DWORD
+        found = ctypes.create_unicode_buffer(32768)
+        size = convert(str(path), found, len(found))
+        return found.value if 0 < size < len(found) and found.value != str(path) else None
+    except Exception:  # no ctypes, an old Windows...
+        return None
+
+
+def home_folder(home=None, other=None):
+    """A pattern for the home folder's path (`home`, else this user's) in the ways a text may spell it: as it is and with
+    /. A Windows path also with its backslashes doubled (in JSON or code), as Git Bash writes it (/c/Users/me), in any
+    letter case, and in its other form (`other`; for this user's, found: the 8.3 short form, C:\\Users\\LONGNA~1, that
+    %TEMP% uses for a long user name, or else the long one). A whole folder name only (/home/me, not /home/meg). None
+    for a drive or the root."""
+    if home is None:
+        home = str(Path.home())
+        other = windows_path(home) or windows_path(home, long=True)
+    windows = bool(re.match(r"[A-Za-z]:[\\/]", home))
+    if len((PureWindowsPath if windows else PurePosixPath)(home).parts) < 2:
+        return None
+    forms = []
+    for path in filter(None, (home, other)):
+        forms += [path, path.replace("\\", "/")]
+        if windows:
+            forms += [path.replace("\\", "\\\\"), "/" + path[0].lower() + path[2:].replace("\\", "/")]
+    forms = sorted(dict.fromkeys(forms), key=len, reverse=True)  # the longest first, where one starts another
+    return re.compile(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])", re.I if windows else 0)
 
 
 def export(kind, project=None, redact=True):

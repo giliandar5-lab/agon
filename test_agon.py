@@ -3412,11 +3412,11 @@ said_line = {"session_id": "sess-1", "transcript_path": "/home/me/.claude/projec
                              "seven_day": {"used_percentage": 41, "resets_at": int(now) + 3 * 86400}}}
 
 
-def status(payload, name=None, env=None):  # the status line command as Claude Code runs it: (exit code, stdout)
-    p = subprocess.run([sys.executable, SERVER, "statusline", *([name] if name else [])], env=env or ARENA_DB,
-                       input=payload if isinstance(payload, bytes) else json.dumps(payload).encode(),
+def status(payload, name=None, env=None):  # the status line command as Claude Code runs it: (exit code, stdout, with
+    p = subprocess.run([sys.executable, SERVER, "statusline", *([name] if name else [])], env=env or ARENA_DB,  # \r\n
+                       input=payload if isinstance(payload, bytes) else json.dumps(payload).encode(),  # read as \n)
                        capture_output=True, timeout=60)
-    return p.returncode, p.stdout.decode("utf-8")
+    return p.returncode, p.stdout.decode("utf-8").replace("\r\n", "\n")
 
 
 assert status(said_line) == (0, "Opus 9 · secret-project · context 23% · 5h 62% · 7d 41%\n")
@@ -4011,7 +4011,7 @@ with duel_env():
 # A duel that ran when its arena ended (a crash, a closed window) can't go on: the next arena ends it, with its worktrees
 # and branches (only one arena runs: it holds the port)
 old = agon.db().execute("INSERT INTO duels(project, prompt, base, started) VALUES (?, 'Old', ?, ?)",
-                        (str(duelrepo), base, time.time() - 600)).lastrowid
+                        (here, base, time.time() - 600)).lastrowid  # the project as a duel stores it: as git spells it
 tree, branch, _ = agon.new_worktree(str(duelrepo), f"duel-{old}a", f"agon/duel-{old}-a", base)
 base_tree = tempfile.mkdtemp(prefix=f"agon-duel-{old}-base-")
 git_in(duelrepo, "worktree", "add", "-q", "--detach", base_tree, base)
@@ -4074,6 +4074,19 @@ with duel_env(AGON_TEST_CMD=GREP, AGON_PROJECT=str(duelrepo)):
         assert needed in page, needed
 arena.shutdown()
 arena.server_close()
+# TEMPORARY DIAGNOSTIC for the macOS CI (to be removed): how long a fresh process takes for socket.getfqdn("127.0.0.1"),
+# which http.server's server_bind calls, and an arena bound that way (its stack is dumped if it takes a minute)
+for code_ in ("import socket, time\nfor i in (1, 2):\n    t = time.monotonic()\n    name = socket.getfqdn('127.0.0.1')\n"
+              "    print(f'getfqdn(127.0.0.1) #{i} = {name!r} in {time.monotonic() - t:.2f} s', flush=True)",
+              "import faulthandler, http.server, time, agon\nfaulthandler.dump_traceback_later(60)\n"
+              "agon.Arena.server_bind = http.server.HTTPServer.server_bind\nt = time.monotonic()\n"
+              "agon.Arena(('127.0.0.1', 0), agon.Web).server_close()\n"
+              "print(f'an arena bound as http.server binds: {time.monotonic() - t:.2f} s', flush=True)"):
+    try:
+        probe_ = subprocess.run([sys.executable, "-c", code_], cwd=HERE, capture_output=True, text=True, timeout=150)
+        print("DIAGNOSTIC:", probe_.returncode, probe_.stdout.strip(), probe_.stderr.strip()[-3000:], flush=True)
+    except subprocess.TimeoutExpired as e:
+        print("DIAGNOSTIC: still running after 150 s:", e.stdout, e.stderr, flush=True)
 for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHUP: its terminal closed) ends
     free = socket.socket()  # `python agon.py` like Ctrl+C: its running duel stops and leaves nothing behind
     free.bind(("127.0.0.1", 0))
@@ -4083,15 +4096,23 @@ for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHU
     server = subprocess.Popen([sys.executable, "-c", "import sys, agon\nagon.PORT = int(sys.argv[1])\n"
                                "sys.exit(agon.main([]))", str(agon.PORT)], cwd=HERE, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)
-    printed, output = queue.Queue(), []
+    printed, output, t_ = queue.Queue(), [], time.monotonic()
     threading.Thread(target=lambda: [*map(printed.put, server.stdout), printed.put(None)], daemon=True).start()
     try:
-        first_line = printed.get(timeout=120)  # it listens once it says so
-        if not (first_line or "").startswith("Agon arena: "):
+        with contextlib.suppress(queue.Empty):
+            first_line = None
+            first_line = printed.get(timeout=120)  # it listens once it says so
+        print(f"DIAGNOSTIC: the arena said it listens after {time.monotonic() - t_:.2f} s", flush=True)  # TEMPORARY
+        if not (first_line or "").startswith("Agon arena: "):  # show what it printed: kill it, and its output ends
+            ended = server.poll()
+            if ended is None:
+                server.kill()
             with contextlib.suppress(queue.Empty):
-                while (line := printed.get(timeout=5)) is not None:
+                while (line := printed.get(timeout=10)) is not None:
                     output.append(line)
-            raise AssertionError(f"the arena didn't start ({server.poll()}): {first_line!r}{''.join(output)}")
+            state = "still running" if ended is None else f"exit code {ended}"
+            raise AssertionError(f"the arena didn't say it listens within 120 s ({state}): {first_line!r}"
+                                 f"{''.join(output)}")
         code_, text = arena_post(json.dumps({"prompt": "HANG", "agents": ["claude", "gpt"], "folder": str(duelrepo)}),
                                  path="/duel")
         duel = json.loads(text)["duel"]
@@ -4247,12 +4268,30 @@ assert raw["msgs"][-1][3].startswith("keys: " + " ".join(secrets_)) and raw["mas
     "Nothing is masked (--no-redact): keys, e-mail addresses and your home folder stay as they were."), raw_said
 assert data["tasks"] == agon.arena_state()["tasks"] and data["score"] == agon.scoreboard(None) and [
     d["id"] for d in data["duels"]] == [d["id"] for d in agon.duels_state(50)]
+# Windows spells the home folder more ways than one: with / or with its backslashes doubled (in JSON or code), as Git
+# Bash writes it (/c/Users/me), in any letter case, and in its 8.3 short form (C:\Users\LONGNA~1, which %TEMP% uses for a
+# long user name, and so the duels' worktrees): each is masked, and only a whole folder name
+forms = agon.home_folder("C:\\Users\\Longname", "C:\\Users\\LONGNA~1")
+spelled_ = ("C:\\Users\\Longname\\a C:/Users/Longname/b C:\\\\Users\\\\Longname\\\\c /c/Users/Longname/d"
+            " c:\\users\\longname\\e C:\\Users\\LONGNA~1\\AppData\\Local\\Temp\\f /c/Users/LONGNA~1/g"
+            " C:\\Users\\Longnamer\\h D:\\Users\\Longname\\i")
+counts = [0, 0, 0]
+assert agon.masked([spelled_], counts, forms) == [
+    "~\\a ~/b ~\\\\c ~/d ~\\e ~\\AppData\\Local\\Temp\\f ~/g C:\\Users\\Longnamer\\h D:\\Users\\Longname\\i"] and (
+    counts == [0, 0, 7]), (agon.masked([spelled_], [0, 0, 0], forms), counts)
+assert agon.home_folder("/home/me").sub("~", "/home/me/x /home/meg/y /HOME/ME/z") == "~/x /home/meg/y /HOME/ME/z"
+assert agon.home_folder("/") is None and agon.home_folder("C:\\") is None
+if os.name == "nt":  # this user's home folder, and its 8.3 short form when it has one
+    short = agon.windows_path(Path.home())
+    assert agon.home_folder().fullmatch(str(Path.home())) and (short is None or agon.home_folder().fullmatch(short)), (
+        Path.home(), short)
 # the scorecard: every project, or one (a folder in it will do); a folder that isn't one says so
 (duelrepo / "sub").mkdir()
 name, html, said = agon.export("scorecard", str(duelrepo / "sub"))
 data = json.loads(re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)[1])
-assert name.startswith("agon-scorecard-") and [p["project"] for p in data["score"]] == [here] and {
-    d["project"] for d in data["duels"]} == {here} and "msgs" not in data, data["score"]
+shown = agon.masked(here, [0, 0, 0], agon.home_folder())  # ~\AppData\... on Windows, where %TEMP% is in the home folder
+assert name.startswith("agon-scorecard-") and [p["project"] for p in data["score"]] == [shown] and {
+    d["project"] for d in data["duels"]} == {shown} and "msgs" not in data, (data["score"], shown)
 assert said.startswith(f"A scorecard of {here}: the score and the duels. It may contain code"), said
 assert agon.export("scorecard", str(plain))[2].startswith(f"A scorecard of {plain}: Agon has no scores or duels for it"
                                                           " yet.")
