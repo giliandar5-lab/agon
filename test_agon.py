@@ -3534,6 +3534,14 @@ for needed in ("default-src 'none'", "connect-src 'self'", "frame-ancestors 'non
     assert needed in headers["Content-Security-Policy"], needed
 assert (headers["X-Frame-Options"], headers["X-Content-Type-Options"], headers["Referrer-Policy"]) == (
     "DENY", "nosniff", "no-referrer")
+# It has the chat, the roster with the asks, the board, STOP, the phone's tabs; it follows /events and lets its stream go
+# while hidden (browsers allow six connections to a site: six open tabs would leave STOP hanging). Agents' words go in as
+# text only, and nothing is loaded from elsewhere
+for needed in ('id="log"', 'id="roster"', 'id="asks"', 'id="tasks"', 'id="stop"', 'id="say"', 'id="tabs"',
+               'name="viewport"', "new EventSource('/events'", "visibilitychange", "stream.close()", "'RESUME'",
+               "@media (min-width: 1100px)", "100dvh", "prefers-color-scheme"):
+    assert needed in page, needed
+assert "innerHTML" not in page and "on" + "click=" not in page and not re.search(r"https?://", page)
 # Every POST comes from the arena's own page: the Origin a browser sends is the arena's scheme and Host
 assert arena_post(json.dumps({"to": "all", "text": "from the page"}))[0] == 204
 for origin in ("", "http://evil.example", f"http://127.0.0.1:{agon.PORT}.evil.example", "null",

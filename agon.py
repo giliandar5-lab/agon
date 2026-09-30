@@ -3369,7 +3369,7 @@ def team_state(now):
         if name in today:
             entry["today"] = dict(zip(("wakes", "tokens", "usd"), today[name]))
         if until and until > now:
-            entry |= {"state": "limit", "until": until, "why": "its usage limit"}
+            entry |= {"state": "limit", "until": until}
         elif parked and parked > now:
             entry |= {"state": "resting", "until": parked, "why": why}
         elif name in runs:
@@ -3488,56 +3488,351 @@ def statusline(me, inp=None, out=None):
     out.flush()
 
 
-PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Agon</title>
-<style nonce="{nonce}">
-  body { margin: 0; font: 15px system-ui, sans-serif; background: #16161a; color: #ddd; }
-  #log { padding: 16px 16px 90px; max-width: 900px; margin: auto; }
-  .m { margin: 10px 0; padding: 10px 14px; border-radius: 10px; background: #222228; border-left: 4px solid #888; }
-  .m b { margin-right: 8px; } .m i { color: #777; font-size: 12px; }
-  .m pre { margin: 6px 0 0; white-space: pre-wrap; font: inherit; }
-  .claude { border-color: #d97757; } .claude b { color: #d97757; }
-  .gemini { border-color: #4f8ff7; } .gemini b { color: #4f8ff7; }
-  .gpt { border-color: #10a37f; } .gpt b { color: #10a37f; }
-  .human { border-color: #eee; background: #2b2b33; }
-  form { position: fixed; bottom: 0; left: 0; right: 0; display: flex; gap: 8px; padding: 14px; background: #101013; }
-  input, select, button { font: inherit; padding: 10px; border-radius: 8px; border: 1px solid #333; background: #222228; color: #eee; }
-  input { flex: 1; min-width: 0; }
-</style>
-<div id="log"></div>
-<form id="f">
-  <select id="to"><option>all</option><option>claude</option><option>gemini</option><option>gpt</option></select>
-  <input id="t" placeholder="Task or message for the team..." autofocus autocomplete="off">
-  <button>Send</button>
-</form>
-<script nonce="{nonce}">
-let last = 0;
-async function loop() {
-  try {
-    const rows = await (await fetch('/msgs?after=' + last)).json();
-    for (const [id, sender, rcpt, text, ts] of rows) {
-      last = id;
-      const d = document.createElement('div');
-      d.className = 'm ' + sender;
-      d.innerHTML = '<b></b><i></i><pre></pre>';
-      d.querySelector('b').textContent = sender + ' \\u2192 ' + rcpt;
-      d.querySelector('i').textContent = ts;
-      d.querySelector('pre').textContent = text;
-      log.append(d);
-    }
-    if (rows.length) scrollTo(0, document.body.scrollHeight);
-  } catch {}
-  setTimeout(loop, 1000);
+# The arena's page: inline style and scripts only, run by a nonce (see Web.do_GET()); the text of every message, task and
+# name goes in with textContent, never as markup. ARENA_STYLE and ARENA_RENDER also build the exported replay
+ARENA_STYLE = r"""
+:root { color-scheme: dark; --bg: #16161a; --panel: #1c1c21; --card: #24242b; --line: #33333b; --text: #e2e2e6;
+  --dim: #8e8e98; --claude: #e0865f; --gpt: #1fb389; --gemini: #6a9ff8; --human: #f2f2f2; --good: #3fb950;
+  --warn: #d7a13a; --bad: #f36b64; }
+@media (prefers-color-scheme: light) { :root { color-scheme: light; --bg: #f5f5f7; --panel: #fff; --card: #eeeef1;
+  --line: #d8d8de; --text: #1d1d22; --dim: #62626c; --claude: #b4532a; --gpt: #0a7b5f; --gemini: #2c63c9;
+  --human: #111; --good: #1a7f37; --warn: #9a6700; --bad: #cf222e; } }
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; display: flex; flex-direction: column; height: 100dvh; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+h1 { font-size: 18px; margin: 0 4px 0 0; }
+h2 { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--dim);
+  margin: 14px 0 6px; }
+.grow { flex: 1; }
+.pill { font-size: 12px; padding: 2px 9px; border-radius: 999px; background: var(--card); color: var(--dim);
+  white-space: nowrap; }
+.pill.live { color: var(--good); } .pill.paused { background: var(--bad); color: #fff; }
+button, select, textarea, input { font: inherit; color: inherit; background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 12px; }
+button { cursor: pointer; } button:hover { border-color: var(--dim); }
+button:disabled { opacity: .5; cursor: default; }
+#stop { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; min-width: 84px; }
+#stop.resume { background: var(--good); border-color: var(--good); }
+nav { display: flex; gap: 2px; padding: 0 8px; background: var(--panel); border-bottom: 1px solid var(--line);
+  overflow-x: auto; }
+nav button { border: 0; border-radius: 0; background: none; color: var(--dim); padding: 10px 12px; }
+nav button[aria-selected="true"] { color: var(--text); box-shadow: inset 0 -2px 0 var(--text); }
+main { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+.panel { display: none; min-height: 0; overflow: auto; padding: 0 12px 16px; }
+body[data-tab="team"] #team, body[data-tab="board"] #board, body[data-tab="duels"] #duels,
+body[data-tab="score"] #score { display: block; }
+#chat { flex-direction: column; padding: 0; overflow: hidden; }
+body[data-tab="chat"] #chat { display: flex; }
+#log { flex: 1; min-height: 0; overflow: auto; padding: 4px 12px 12px; }
+form#say { display: flex; gap: 8px; align-items: flex-end; padding: 8px 12px max(8px, env(safe-area-inset-bottom));
+  background: var(--panel); border-top: 1px solid var(--line); }
+#text { flex: 1; min-width: 0; resize: none; max-height: 35dvh; }
+.m { margin: 8px 0; padding: 7px 11px; border-radius: 10px; background: var(--card); border-left: 4px solid var(--dim); }
+.m .h { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 13px; }
+.m .h b { font-weight: 600; } .m time, .m .id { color: var(--dim); font-size: 12px; }
+.m pre { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.m.s-agon { background: none; border-left-style: dashed; } .m.s-agon pre { color: var(--dim); }
+.s-claude { border-color: var(--claude); } b.s-claude, .s-claude .h b { color: var(--claude); }
+.s-gpt { border-color: var(--gpt); } b.s-gpt, .s-gpt .h b { color: var(--gpt); }
+.s-gemini { border-color: var(--gemini); } b.s-gemini, .s-gemini .h b { color: var(--gemini); }
+.s-human { border-color: var(--human); }
+.divider { text-align: center; color: var(--dim); font-size: 13px; margin: 10px 0; }
+.card { background: var(--card); border-radius: 10px; padding: 9px 12px; margin: 8px 0; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.small { font-size: 13px; color: var(--dim); }
+.st-working .st { color: var(--good); } .st-limit .st { color: #fff; background: var(--bad); }
+.st-resting .st { color: #1d1d22; background: var(--warn); } .st-away { opacity: .7; }
+.good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+.task { cursor: pointer; } .task:hover, .task:focus { outline: 1px solid var(--dim); }
+#detail { position: fixed; inset: 0; z-index: 5; display: flex; align-items: flex-end; justify-content: center;
+  background: rgba(0, 0, 0, .55); }
+#detail[hidden] { display: none; }
+#detail .sheet { width: min(760px, 100%); max-height: 88dvh; overflow: auto; background: var(--panel);
+  border-radius: 14px 14px 0 0; padding: 12px 16px 20px; }
+pre.text { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.45 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--card); border-radius: 8px; padding: 8px 10px; }
+.entries { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--dim); font-weight: 600; font-size: 12px; }
+label.check { display: inline-flex; gap: 6px; align-items: center; margin-right: 12px; }
+@media (min-width: 1100px) {
+  main { grid-template-columns: 300px minmax(0, 1fr) 420px; }
+  #team { display: block !important; border-right: 1px solid var(--line); }
+  #chat { display: flex !important; }
+  .side { display: none !important; border-left: 1px solid var(--line); }
+  body[data-side="board"] #board, body[data-side="duels"] #duels, body[data-side="score"] #score { display: block !important; }
+  nav button.main { display: none; }
+  #detail { align-items: center; } #detail .sheet { border-radius: 14px; }
 }
-loop();
-f.onsubmit = async e => {
+"""
+ARENA_MAIN = """<nav id="tabs">
+<button type="button" class="main" data-panel="chat">Chat</button>
+<button type="button" class="main" data-panel="team">Team</button>
+<button type="button" data-panel="board">Board</button>
+<button type="button" data-panel="duels">Duels</button>
+<button type="button" data-panel="score">Score</button>
+</nav>
+<main>
+<section id="team" class="panel"><h2>Team</h2><div id="roster"></div><h2>Asks</h2><div id="asks"></div></section>
+<section id="chat" class="panel"><div id="log"><button type="button" id="older" hidden>Earlier messages</button></div>
+{composer}</section>
+<section id="board" class="panel side"><div id="tasks"></div></section>
+<section id="duels" class="panel side"><div id="duel-form"></div><div id="duel-list"></div></section>
+<section id="score" class="panel side"><div id="scores"></div></section>
+</main>
+<div id="detail" hidden><div class="sheet"><div class="row"><span class="grow"></span>
+<button type="button" id="close">Close</button></div><div id="detail-body"></div></div></div>"""
+# What the page and the replay share: building the chat, the roster, the asks and the board from the arena's JSON
+ARENA_RENDER = r"""
+'use strict';
+const $ = selector => document.querySelector(selector);
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+let skew = 0;  // the server's clock minus this one, so that "5 min ago" is right on a phone too
+const now = () => Date.now() / 1000 + skew;
+function span(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return s + ' s';
+  const m = Math.round(s / 60);
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60);
+  return h < 48 ? h + 'h ' + (m % 60) + 'm' : Math.round(h / 24) + ' days';
+}
+function clock(t) {
+  const d = new Date(t * 1000), hm = d.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+  return t - now() > 20 * 3600 ? d.toLocaleDateString([], {month: 'short', day: 'numeric'}) + ' ' + hm : hm;
+}
+const KNOWN = ['claude', 'gpt', 'gemini', 'human', 'agon'];
+const who = name => 's-' + (KNOWN.includes(name) ? name : 'other');
+function outcome(text) {
+  text = String(text || '');
+  return text.includes('passed') ? 'good' : /failed|timed out|could not/.test(text) ? 'bad' : '';
+}
+function message(row) {  // [id, sender, rcpt, text, ts]
+  const [id, sender, rcpt, text, ts] = row, m = el('div', 'm ' + who(sender)), h = el('div', 'h');
+  m.dataset.id = id;
+  h.append(el('b', '', sender + ' → ' + rcpt), el('time', '', String(ts || '').slice(11, 16)), el('span', 'id', '#' + id));
+  m.append(h, el('pre', '', text));
+  return m;
+}
+function fuel(a) {
+  if (a.state === 'working') return 'working' + (a.since ? ' for ' + span(now() - a.since) : '');
+  if (a.state === 'limit') return 'out of quota until ' + clock(a.until);
+  if (a.state === 'resting') return 'resting until ' + clock(a.until);
+  if (a.state === 'idle') return 'idle';
+  return a.seen ? 'away, seen ' + span(now() - a.seen) + ' ago' : 'not seen yet';
+}
+function renderTeam(team, box) {
+  box.replaceChildren(...team.map(a => {
+    const card = el('div', 'card agent st-' + a.state), row = el('div', 'row');
+    row.append(el('b', who(a.name), a.name), el('span', 'pill st', fuel(a)));
+    if (a.app) row.append(el('span', 'small', a.app + (a.open ? ', open' : '')));
+    card.append(row);
+    if (a.why) card.append(el('div', 'small', a.why));
+    if (a.gauge && a.gauge.length)  // the plan's usage, as its status line last said: an age, never a guess
+      card.append(el('div', 'small', a.gauge.map(g => g.label + ' ' + Math.round(g.used) + '%, ' + span(now() - g.seen)
+        + ' ago').join(' · ')));
+    for (const t of a.tasks || [])
+      card.append(el('div', 'small', '#' + t.id + ' ' + t.title + ' (' + ({doing: 'in progress', review: 'in review',
+        reviewer: 'to review'}[t.role] || t.role) + ')'));
+    if (a.today) card.append(el('div', 'small', 'autopilot today: ' + a.today.wakes + ' wake' + (a.today.wakes === 1 ? ''
+      : 's') + ', ' + a.today.tokens.toLocaleString() + ' tokens' + (a.today.usd ? ', ~$' + a.today.usd.toFixed(2) : '')));
+    return card;
+  }));
+}
+function renderAsks(asks, box) {
+  if (!asks.length) return box.replaceChildren(el('div', 'small', 'No asks yet: an agent asks another company’s agent'
+    + ' for a second opinion with the ask tool.'));
+  box.replaceChildren(...asks.map(q => {
+    const card = el('div', 'card'), by = q.answered && q.answered !== q.agent ? q.agent + ', answered by ' + q.answered
+      : q.agent;
+    card.append(el('div', '', q.asker + ' asked ' + by + ' for ' + (q.task ? 'a review of task #' + q.task : q.mode ===
+      'review' ? 'a review' : 'a task')));
+    let what = '', cls = '';
+    if (q.problem) [what, cls] = ['failed: ' + q.problem, 'bad'];
+    else if (q.ended && q.mode === 'review') [what, cls] = [(q.verdict ? 'VERDICT: ' + q.verdict : 'no verdict') + ' (' +
+      q.tests + ')', outcome(q.tests)];
+    else if (q.ended) [what, cls] = [(q.branch ? 'on branch ' + q.branch : 'no file changed') + ' (' + q.tests + ')',
+      outcome(q.tests)];
+    card.append(el('div', 'small', q.ended ? span(q.ended - q.started) : 'running for ' + span(now() - q.started)));
+    if (what) card.append(el('div', 'small ' + cls, what));
+    return card;
+  }));
+}
+const COLUMNS = [['todo', 'To do'], ['doing', 'In progress'], ['review', 'In review'], ['done', 'Done']];
+function renderBoard(tasks, done, box, open) {
+  if (!tasks.length) return box.replaceChildren(el('div', 'small', 'The board is empty: the lead puts the work on it with'
+    + ' the board tool.'));
+  box.replaceChildren(...COLUMNS.map(([state, title]) => {
+    const list = tasks.filter(t => t.state === state), col = el('div');
+    col.append(el('h2', '', title + ' (' + (state === 'done' ? done : list.length) + ')'));
+    for (const t of list) {
+      const card = el('div', 'card task');
+      card.append(el('div', '', '#' + t.id + ' ' + t.title));
+      card.append(el('div', 'small', t.state === 'todo' ? 'added by ' + t.author : t.owner + (t.reviewer ? (t.state ===
+        'done' ? ', approved by ' : ', reviewer: ') + t.reviewer : '')));
+      if (t.tests) card.append(el('div', 'small ' + outcome(t.tests), t.tests));
+      if (t.files.length) card.append(el('div', 'small', t.files.join(', ')));
+      if (t.after.length) card.append(el('div', 'small', 'after ' + t.after.map(([i, s]) => '#' + i + ' ' + s).join(', ')));
+      if (open) {
+        card.tabIndex = 0;
+        card.addEventListener('click', () => open(t.id));
+        card.addEventListener('keydown', e => { if (e.key === 'Enter') open(t.id); });
+      }
+      col.append(card);
+    }
+    return col;
+  }));
+}
+function renderTask(t, box) {
+  box.replaceChildren(el('h2', '', 'Task #' + t.id), el('div', '', t.title),
+    el('div', 'small', 'state: ' + t.state + (t.owner ? ', ' + t.owner : '') + (t.reviewer ? ', reviewer ' + t.reviewer : '')
+      + ' · added by ' + t.author));
+  if (t.files.length) box.append(el('div', 'small', 'files: ' + t.files.join(', ')));
+  for (const [label, text] of [['Spec', t.spec], ['Notes, newest first', t.note], ['Tests at done: ' + (t.tests || ''),
+                                t.report]])
+    if (text) box.append(el('h2', '', label), el('pre', 'text', text));
+  if (t.reviews && t.reviews.length) {
+    box.append(el('h2', '', 'Verdicts'));
+    for (const r of t.reviews) box.append(el('div', 'small', r.reviewer + ': ' + r.verdict + ' (' + r.tests + ')'));
+  }
+}
+function tabs(initial) {  // the phone's tabs; on a wide screen the chat and the team stay, and the tabs pick the side panel
+  const wide = matchMedia('(min-width: 1100px)');
+  function show(panel) {
+    document.body.dataset.tab = panel;
+    if (['board', 'duels', 'score'].includes(panel)) document.body.dataset.side = panel;
+    for (const b of document.querySelectorAll('#tabs button'))
+      b.setAttribute('aria-selected', String(b.dataset.panel === (wide.matches && !b.classList.contains('main') ?
+        document.body.dataset.side : document.body.dataset.tab)));
+  }
+  for (const b of document.querySelectorAll('#tabs button')) b.addEventListener('click', () => show(b.dataset.panel));
+  wide.addEventListener('change', () => show(document.body.dataset.tab));
+  document.body.dataset.side = 'board';
+  show(initial);
+  return show;
+}
+"""
+# The live page: the feed (GET /events), the human's messages, STOP and RESUME, and the task details
+ARENA_LIVE = r"""
+const log = $('#log'), panels = [];  // panels: what else draws itself from each snapshot (the duels, the scores)
+let last = null, first = null, stream = null, shown = null, paused = false, connected = false;
+const show = tabs('chat');
+function state(text, cls) { const s = $('#state'); s.textContent = text; s.className = 'pill ' + (cls || ''); }
+function status() {
+  if (!connected) return state(document.hidden ? 'asleep' : 'reconnecting…');
+  paused ? state('paused: STOP', 'paused') : state('live', 'live');
+}
+function nearBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+function add(row) {
+  if (last !== null && row[0] <= last) return;  // shown already
+  const stick = nearBottom();
+  log.append(message(row));
+  last = row[0];
+  if (first === null) first = row[0];
+  if (stick) log.scrollTop = log.scrollHeight;
+}
+function update(s) {
+  shown = s;
+  skew = s.now - Date.now() / 1000;
+  paused = s.paused;
+  status();
+  const stop = $('#stop');
+  stop.textContent = paused ? 'Resume' : 'STOP';
+  stop.classList.toggle('resume', paused);
+  const pilot = $('#pilot');
+  pilot.hidden = !s.autopilot;
+  if (s.autopilot) pilot.textContent = 'autopilot: ' + (s.autopilot.agents || []).join(', ') + ', lead ' + s.autopilot.lead;
+  renderTeam(s.team, $('#roster'));
+  renderAsks(s.asks, $('#asks'));
+  renderBoard(s.tasks, s.done, $('#tasks'), openTask);
+  const to = $('#to'), picked = to.value;
+  to.replaceChildren(...['all', ...s.team.map(a => a.name)].map(name => el('option', '', name)));
+  to.value = [...to.options].some(o => o.value === picked) ? picked : 'all';
+  for (const render of panels) render(s);
+}
+function connect() {
+  if (stream) stream.close();
+  stream = new EventSource('/events' + (last !== null ? '?after=' + last : ''));
+  stream.addEventListener('start', e => {
+    const start = JSON.parse(e.data);
+    connected = true;
+    status();
+    if (last !== null && start.after > last)
+      log.append(el('div', 'divider', 'More messages came while this page was away than it catches up on: reload it to see'
+        + ' them all.'));
+    if (first === null) $('#older').hidden = !start.older;
+  });
+  stream.addEventListener('msg', e => add(JSON.parse(e.data)));
+  stream.addEventListener('board', e => update(JSON.parse(e.data)));
+  stream.onerror = () => { connected = false; status(); };  // the browser tries again after a moment
+}
+document.addEventListener('visibilitychange', () => {  // a hidden page lets its stream go: browsers allow six per site
+  if (!document.hidden) return connect();
+  if (stream) stream.close();
+  stream = null;
+  connected = false;
+  status();
+});
+$('#older').addEventListener('click', async () => {
+  const r = await fetch('/msgs?before=' + first + '&limit=200');
+  if (!r.ok) return;
+  const rows = await r.json(), top = log.scrollHeight - log.scrollTop;
+  $('#older').after(...rows.map(message));
+  if (rows.length) first = rows[0][0];
+  $('#older').hidden = rows.length < 200;
+  log.scrollTop = log.scrollHeight - top;
+});
+async function post(path, body) {  // true when Agon took it; else the human reads why
+  const r = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) alert(await r.text());
+  return r.ok;
+}
+const text = $('#text');
+function fit() { text.style.height = 'auto'; text.style.height = text.scrollHeight + 2 + 'px'; }
+text.addEventListener('input', fit);
+text.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#say').requestSubmit(); }
+});
+$('#say').addEventListener('submit', async e => {
   e.preventDefault();
-  if (!t.value.trim()) return;
-  const r = await fetch('/msgs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                   body: JSON.stringify({ to: to.value, text: t.value }) });
-  if (r.ok) t.value = ''; else alert(await r.text());
-};
-</script>"""
+  if (!text.value.trim()) return;
+  if (await post('/msgs', {to: $('#to').value, text: text.value})) { text.value = ''; fit(); log.scrollTop = log.scrollHeight; }
+});
+$('#stop').addEventListener('click', () => post('/msgs', {to: 'all', text: paused ? 'RESUME' : 'STOP'}));
+async function openTask(id) {
+  const r = await fetch('/board?id=' + id);
+  if (!r.ok) return alert(await r.text());
+  renderTask(await r.json(), $('#detail-body'));
+  $('#detail').hidden = false;
+}
+function hide() { $('#detail').hidden = true; }
+$('#close').addEventListener('click', hide);
+$('#detail').addEventListener('click', e => { if (e.target === $('#detail')) hide(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') hide(); });
+setInterval(() => { if (shown && !document.hidden) update(shown); }, 30000);  // "for 5 min" moves on
+connect();
+"""
+COMPOSER = """<form id="say"><select id="to" aria-label="To"><option>all</option></select>
+<textarea id="text" rows="1" placeholder="Message the team" aria-label="Message"></textarea>
+<button>Send</button></form>"""
+PAGE = ("""<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Agon arena</title>
+<style nonce="{nonce}">""" + ARENA_STYLE + """</style>
+<header><h1>Agon</h1><span id="state" class="pill">connecting…</span><span id="pilot" class="pill" hidden></span>
+<span class="grow"></span><button type="button" id="stop">STOP</button></header>
+""" + ARENA_MAIN.replace("{composer}", COMPOSER) + """
+<script nonce="{nonce}">""" + ARENA_RENDER + ARENA_LIVE + """</script>
+""")
 
 
 HEARTBEAT = 15  # seconds between the comments that keep an event stream open (proxies and phones drop quiet ones)
