@@ -3291,6 +3291,148 @@ with settings(AGON_AUTOPILOT="1"):  # a headless app autopilot runs: neither its
     hook("hal", {"hook_event_name": "UserPromptSubmit", "prompt": "Go on."})
 assert busy_since("hal") == 0
 
+# The roster: each agent's fuel from what Agon knows. claude, gpt and gemini are on it from the start; another agent for a
+# week after its last visit. out of quota (until the reset) comes first, then resting (autopilot's brakes), then working
+# (an autopilot turn, a duel, an ask, or its app's hooks and tool calls), idle (seen in the last 15 minutes) and away
+now = time.time()
+agon.touch("gpt", "codex-mcp-client")
+agon.db().execute("UPDATE agents SET out_of_quota_until = ? WHERE name = 'gpt'", (now + 3600,))
+agon.db().execute("INSERT INTO pilot(agent, parked, why) VALUES ('gemini', ?, 'it woke 12 times in the last hour"
+                  " (AGON_MAX_WAKES_PER_HOUR)')", (now + 600,))
+agon.db().execute("INSERT INTO runs(agent, trigger, started) VALUES ('claude', '#1 human -> claude', ?)", (now - 30,))
+agon.db().execute("INSERT INTO runs(agent, trigger, started, ended, status, tokens_in, tokens_out, usd) VALUES"
+                  " ('claude', '#0 human -> claude', ?, ?, 'done', 1200, 300, 0.25)", (now - 90, now - 60))
+agon.db().execute("INSERT INTO agents(name, last_seen) VALUES ('old', ?), ('recent', ?)", (now - 8 * 86400,
+                                                                                         now - 6 * 86400))
+agon.touch("ivy", "antigravity-client")
+agon.touch("uno")
+agon.db().execute("INSERT INTO live(pid, agent, client, beat) VALUES (4242, 'uno', 'claude-code', ?)", (now,))
+agon.mark("uno", now - 5)
+
+
+def roster(**changes):
+    return {a["name"]: a for a in agon.arena_state()["team"]}
+
+
+team = roster()
+assert list(team)[:3] == ["claude", "gpt", "gemini"] and "old" not in team and "recent" in team, list(team)
+assert team["claude"]["state"] == "away" and team["claude"]["app"] == "", team["claude"]  # never seen, no autopilot
+assert team["claude"]["today"] == {"wakes": 2, "tokens": 1500, "usd": 0.25}, team["claude"]
+agon.db().execute("INSERT INTO state(key, value) VALUES ('autopilot', ?)", (json.dumps(
+    {"pid": 77, "beat": now, "project": str(project), "agents": ["claude", "gpt"], "lead": "claude"}),))
+team = roster()
+assert (team["claude"]["state"], team["claude"]["since"], team["claude"]["why"]) == ("working", now - 30,
+                                                                                    "autopilot woke it"), team["claude"]
+assert agon.arena_state()["autopilot"] == {"pid": 77, "project": str(project), "agents": ["claude", "gpt"],
+                                           "lead": "claude"}
+assert (team["gpt"]["state"], team["gpt"]["until"], team["gpt"]["app"]) == ("limit", now + 3600, "Codex"), team["gpt"]
+assert (team["gemini"]["state"], team["gemini"]["until"]) == ("resting", now + 600), team["gemini"]
+assert team["gemini"]["why"].endswith("(AGON_MAX_WAKES_PER_HOUR)") and team["gemini"]["seen"] is None
+assert (team["uno"]["state"], team["uno"]["since"], team["uno"]["open"]) == ("working", now - 5, True), team["uno"]
+assert (team["ivy"]["state"], team["ivy"]["app"], team["ivy"]["open"]) == ("idle", "Antigravity", False), team["ivy"]
+assert team["recent"]["state"] == "away" and team["recent"]["seen"] == (now - 6 * 86400) // 60 * 60, team["recent"]
+ask = agon.begin_ask("hal", "ivy", "review", str(project))  # an ask the agent answers is work
+team = roster()
+assert (team["ivy"]["state"], team["ivy"]["why"]) == ("working", "a review for hal") and team["hal"]["state"] == "idle"
+agon.end_ask(ask, answered="ivy", verdict="approve", tests="tests passed")
+agon.end_ask(ask, problem="later calls change nothing")
+assert roster()["ivy"]["state"] == "idle" and agon.arena_state()["asks"][0] | {"started": 0, "ended": 0} == {
+    "id": ask, "asker": "hal", "agent": "ivy", "answered": "ivy", "mode": "review", "task": None, "started": 0,
+    "ended": 0, "verdict": "approve", "tests": "tests passed", "branch": None, "problem": None}
+agon.db().execute("UPDATE state SET value = ? WHERE key = 'autopilot'", (json.dumps({"pid": 77, "beat": now - 600}),))
+assert roster()["claude"]["state"] == "away" and agon.arena_state()["autopilot"] is None  # autopilot is gone
+
+# Claude Code's status line (python agon.py statusline, set by the human in their own settings): Agon keeps only the plan's
+# usage, each window's percentage and reset time with the session id, and prints a usual line. Nothing else of its input
+# (the transcript's path, the folders, the cost) reaches agon.db, and a window it doesn't report stays unknown, never 0%
+ARENA_DB = dict(os.environ, AGON_DB=agon.DB)
+said_line = {"session_id": "sess-1", "transcript_path": "/home/me/.claude/projects/x/secret-transcript.jsonl",
+             "cwd": "/home/me/secret-project", "model": {"id": "claude-x", "display_name": "Opus 9"},
+             "workspace": {"current_dir": "/home/me/secret-project", "project_dir": "/home/me/secret-project"},
+             "cost": {"total_cost_usd": 12.34}, "context_window": {"used_percentage": 23.4},
+             "rate_limits": {"five_hour": {"used_percentage": 62.4, "resets_at": int(now) + 3600},
+                             "seven_day": {"used_percentage": 41, "resets_at": int(now) + 3 * 86400}}}
+
+
+def status(payload, name=None, env=None):  # the status line command as Claude Code runs it: (exit code, stdout)
+    p = subprocess.run([sys.executable, SERVER, "statusline", *([name] if name else [])], env=env or ARENA_DB,
+                       input=payload if isinstance(payload, bytes) else json.dumps(payload).encode(),
+                       capture_output=True, timeout=60)
+    return p.returncode, p.stdout.decode("utf-8")
+
+
+assert status(said_line) == (0, "Opus 9 · secret-project · context 23% · 5h 62% · 7d 41%\n")
+rows = agon.db().execute("SELECT agent, window, used, resets, session FROM gauges ORDER BY window").fetchall()
+assert rows == [("claude", "five_hour", 62.4, int(now) + 3600, "sess-1"),
+                ("claude", "seven_day", 41.0, int(now) + 3 * 86400, "sess-1")], rows
+agon.db().execute("PRAGMA wal_checkpoint(FULL)")
+# the database, its WAL and shared memory, read by another process: in this one, closing any file of the database drops
+# the POSIX locks that this process's SQLite connection holds on it (sqlite.org/howtocorrupt.html, 2.2)
+leak = subprocess.run([sys.executable, "-c", "import pathlib, sys\nfor p in pathlib.Path(sys.argv[1]).parent.glob("
+                       "pathlib.Path(sys.argv[1]).name + '*'):\n    b = p.read_bytes()\n    if b'secret-transcript' in b"
+                       " or b'secret-project' in b or b'12.34' in b:\n        print(p)", agon.DB], capture_output=True,
+                      text=True, timeout=60)
+assert leak.returncode == 0 and leak.stdout == "", leak
+gauge = roster()["claude"]["gauge"]
+assert [(g["label"], g["used"]) for g in gauge] == [("5h", 62.4), ("7d", 41.0)] and now <= gauge[0]["seen"] <= time.time()
+seen = agon.data_version()
+assert status(said_line)[0] == 0 and agon.data_version() == seen  # the same numbers within a minute: no write
+assert status(said_line | {"rate_limits": {"five_hour": {"used_percentage": 70, "resets_at": int(now) - 5}}})[1] == (
+    "Opus 9 · secret-project · context 23% · 5h 70%\n")
+assert agon.data_version() != seen and [g["label"] for g in roster()["claude"]["gauge"]] == ["7d"]  # 5h has reset
+for odd in (b"not json", b"[1]", json.dumps({"rate_limits": {"five_hour": {"used_percentage": "62"}, "../x": {
+        "used_percentage": 5}}, "model": {"display_name": "Opus\x1b[31m 9"}}).encode()):
+    assert status(odd) in ((0, "Claude\n"), (0, "Opus 9\n")), odd  # never fails; control characters stay out
+assert status(said_line, name="all")[0] == 0 and status(said_line, env=dict(os.environ, AGON_DB=str(Path(TMP)))) == (
+    0, "Opus 9 · secret-project · context 23% · 5h 62% · 7d 41%\n")  # a database it can't open: the line still shows
+assert agon.db().execute("SELECT COUNT(*) FROM gauges WHERE agent = 'all'").fetchone()[0] == 0
+
+# /board is the same snapshot as JSON (without its long texts: /board?id=N has one task in full, with every verdict), and
+# /msgs pages through the chat; anything else is 404
+agon.db().execute("INSERT INTO tasks(title, spec, author, created, updated, state, owner, reviewer, tests, report)"
+                  " VALUES ('Parser', 'Parse the config.', 'claude', 1, 1, 'review', 'gpt', 'claude', 'tests passed',"
+                  " 'Test results, run by Agon: fine.')")
+for i in range(12):
+    agon.db().execute("INSERT INTO tasks(title, author, created, updated, state, owner) VALUES (?, 'claude', 1, 1,"
+                      " 'done', 'gpt')", (f"Done {i}",))
+agon.db().execute("INSERT INTO tasks(title, author, created, updated, after) VALUES ('Docs', 'claude', 1, 1, '[1, 99]')")
+agon.db().execute("INSERT INTO reviews(task, owner, reviewer, verdict, tests, at) VALUES (1, 'gpt', 'claude', 'changes',"
+                  " 'tests failed', 5)")
+board = agon.arena_state()
+assert [t["id"] for t in board["tasks"]] == [1, 14, *range(4, 14)] and board["done"] == 12, board["tasks"]
+assert board["tasks"][1]["after"] == [[1, "review"], [99, "gone"]] and "spec" not in board["tasks"][0]
+assert [(t["title"], t["role"]) for t in roster()["claude"]["tasks"]] == [("Parser", "reviewer")]
+detail = agon.task_state(1)
+assert detail["spec"] == "Parse the config." and detail["report"] == "Test results, run by Agon: fine." and detail[
+    "reviews"] == [{"reviewer": "claude", "verdict": "changes", "tests": "tests failed", "at": 5}], detail
+arena = ThreadingHTTPServer(("127.0.0.1", 0), agon.Web)
+agon.PORT = arena.server_port
+threading.Thread(target=arena.serve_forever, daemon=True).start()
+
+
+def arena_get(path, host=None):  # (status, body as text) of a GET to the arena
+    c = http.client.HTTPConnection("127.0.0.1", agon.PORT, timeout=10)
+    c.request("GET", path, headers={"Host": host or f"127.0.0.1:{agon.PORT}"})
+    r = c.getresponse()
+    status_, text_ = r.status, r.read().decode()
+    c.close()
+    return status_, text_
+
+
+code_, body = arena_get("/board")
+got = json.loads(body)
+assert code_ == 200 and got.keys() == board.keys() and got["tasks"] == board["tasks"] and got["team"][0]["name"] == "claude"
+assert json.loads(arena_get("/board?id=1")[1])["spec"] == "Parse the config."
+assert arena_get("/board?id=x")[0] == 400 and arena_get("/board?id=999")[0] == 404 and arena_get("/nope")[0] == 404
+assert arena_get("/board", host="evil.example:80")[0] == 403 and arena_get("/msgs?after=x")[0] == 400
+for i in range(3):
+    agon.post("human", "all", f"page {i}")
+newest = agon.newest_id()
+assert [row[3] for row in json.loads(arena_get(f"/msgs?before={newest}&limit=2")[1])] == ["page 0", "page 1"]
+assert [row[3] for row in json.loads(arena_get(f"/msgs?after={newest - 1}")[1])] == ["page 2"]
+arena.shutdown()
+arena.server_close()
+
 agon.close_db()
 agon.DB = test_db
 

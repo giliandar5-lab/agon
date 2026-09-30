@@ -6,6 +6,7 @@ python agon.py hook <name>   the agent's hook: Stop wakes it with new messages, 
 python agon.py setup         prints how to connect Claude Code, Codex and Antigravity (writes nothing)
 python agon.py autopilot     wakes the agents when messages come for them, with no app open (--help for options)
 python agon.py stats         what autopilot's wakes took: per agent and per completed task
+python agon.py statusline    Claude Code's status line: keeps the plan's usage for the arena, prints a usual line
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
@@ -32,6 +33,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
@@ -1421,8 +1423,8 @@ def ask_rounds(session, ask, agent, prompt, mode, cwd, top, tests):
 
 # The task board (Phase 4): the lead splits the work into tasks, each with the files it edits and the tasks it waits for;
 # an agent claims one before it edits those files, and when it is done, an agent from another company reviews it
-BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version FROM"
-             " tasks")
+BOARD_SQL = ("SELECT id, title, spec, files, after, state, author, owner, reviewer, note, tests, report, version,"
+             " project FROM tasks")
 FAILED = {"add": "Nothing added", "claim": "Nothing claimed", "done": "Nothing done", "review": "Nothing reviewed"}
 STATES = {"todo": "to do", "doing": "in progress", "review": "in review", "done": "done"}  # a task's state, in words
 
@@ -3287,6 +3289,203 @@ def stats(out=None):
             " at API prices, not what a plan charges; Codex and agy report no cost.")
 
 
+# The arena (Phase 6), where the human watches and steers: the page follows the chat and every change of the team and the
+# board through Server-Sent Events (GET /events), and reads the same snapshot at GET /board
+APPS = {"claude-code": "Claude Code", "codex-mcp-client": "Codex", "antigravity-client": "Antigravity"}  # by clientInfo
+TEAM = ("claude", "gpt", "gemini")  # on the roster from the start; another agent stays there for a week after its visit
+ASK_STALE = 7200  # an ask without an end this many seconds after its start lost its server: it is no work any more
+WINDOWS = {"five_hour": "5h", "seven_day": "7d", "spend_limit": "spend"}  # a plan's windows in Claude Code's status line
+
+
+def number_(value):
+    """Whether `value` from JSON is a finite number (not a bool)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def autopilot_state(now):
+    """Autopilot's heartbeat as the arena shows it (its process, folder, agents and lead), or None when none runs."""
+    row = db().execute("SELECT value FROM state WHERE key = 'autopilot'").fetchone()
+    try:
+        info = json.loads(row[0]) if row else {}
+    except ValueError:
+        info = {}
+    if isinstance(info, dict) and number_(info.get("beat")) and info["beat"] > now - LIVE:
+        return {key: info.get(key) for key in ("pid", "project", "agents", "lead")}
+
+
+def team_state(now):
+    """The roster: each agent's fuel, from what Agon knows. `state` is limit (out of quota `until` the reset), resting
+    (until `until`, autopilot's brake: `why`), working (`since`: an autopilot turn, a duel, an ask, or its app's hooks and
+    tool calls; `why`), idle (seen within ONLINE seconds) or away. With its app, whether one of its apps is open, its
+    board tasks, what autopilot's wakes took today, and the plan's usage its status line reported (`gauge`: each window
+    with its percentage and when Agon heard it). Times that often move are rounded to the minute, so that the snapshot
+    only changes when something did."""
+    con, auto = db(), autopilot_state(now)
+    agents = {row[0]: row[1:] for row in con.execute("SELECT name, client, last_seen, out_of_quota_until, busy FROM"
+                                                     " agents")}
+    pilot = {agent: (parked, why) for agent, parked, why in con.execute("SELECT agent, parked, why FROM pilot")}
+    runs = dict(con.execute("SELECT agent, MAX(started) FROM runs WHERE status = 'running' GROUP BY agent")) if auto else {}
+    asks = {}
+    for worker, asker, mode, task, started in con.execute(
+            "SELECT COALESCE(answered, agent), asker, mode, task, started FROM asks WHERE ended IS NULL AND started > ?"
+            " ORDER BY id", (now - ASK_STALE,)):
+        asks.setdefault(worker, (asker, mode, task, started))
+    duels = {}  # an agent that works in a running duel: its entry's app, or the review it was asked for
+    for duel, agent, reviewer, state, since in con.execute(
+            "SELECT duel, agent, reviewer, entries.state, COALESCE(entries.started, duels.started) FROM entries JOIN"
+            " duels ON duels.id = entries.duel WHERE duels.state = 'running' AND entries.state IN ('working',"
+            " 'reviewing')"):
+        duels.setdefault(reviewer if state == "reviewing" else agent, (duel, since))
+    live = {}
+    for agent, busy in con.execute("SELECT agent, busy FROM live WHERE beat > ?", (now - LIVE,)):
+        live[agent] = max(live.get(agent, 0), busy)
+    today = {row[0]: row[1:] for row in con.execute(
+        "SELECT agent, COUNT(*), COALESCE(SUM(tokens_in + tokens_out), 0), COALESCE(SUM(usd), 0) FROM runs WHERE"
+        " started >= ? GROUP BY agent", (midnight(now),))}
+    gauges = {}
+    for agent, window, used, resets, seen in con.execute(
+            "SELECT agent, window, used, resets, seen FROM gauges WHERE resets IS NULL OR resets > ? ORDER BY agent,"
+            " window", (now,)):
+        gauges.setdefault(agent, []).append({"window": window, "label": WINDOWS.get(window, window), "used": used,
+                                             "resets": resets, "seen": seen})
+    tasks = {}
+    for t in board_tasks("WHERE state IN ('doing', 'review')"):
+        tasks.setdefault(t["owner"], []).append({"id": t["id"], "title": t["title"], "role": t["state"]})
+        if t["state"] == "review" and t["reviewer"]:
+            tasks.setdefault(t["reviewer"], []).append({"id": t["id"], "title": t["title"], "role": "reviewer"})
+    busy_ones = set(runs) | set(duels) | set(asks) | set(live) | set(tasks)
+    week = now - 7 * 86400
+    names = [*TEAM, *sorted(name for name, (_, seen, _, _) in agents.items()
+                            if name not in TEAM and ((seen or 0) > week or name in busy_ones))]
+    roster = []
+    for name in names:
+        client, seen, until, busy = agents.get(name, (None, None, None, 0))
+        parked, why = pilot.get(name, (None, None))
+        busy = max(busy or 0, live.get(name, 0))
+        entry = {"name": name, "app": APPS.get(client, client or ""), "open": name in live,
+                 "seen": seen and seen // 60 * 60, "tasks": tasks.get(name, []), "gauge": gauges.get(name, [])}
+        if name in today:
+            entry["today"] = dict(zip(("wakes", "tokens", "usd"), today[name]))
+        if until and until > now:
+            entry |= {"state": "limit", "until": until, "why": "its usage limit"}
+        elif parked and parked > now:
+            entry |= {"state": "resting", "until": parked, "why": why}
+        elif name in runs:
+            entry |= {"state": "working", "since": runs[name], "why": "autopilot woke it"}
+        elif name in duels:
+            entry |= {"state": "working", "since": duels[name][1], "why": f"duel #{duels[name][0]}"}
+        elif name in asks:
+            asker, mode, task, started = asks[name]
+            what = f"a review of task #{task}" if task else "a review" if mode == "review" else "a task"
+            entry |= {"state": "working", "since": started, "why": f"{what} for {asker}"}
+        elif busy > now - BUSY:
+            entry |= {"state": "working", "since": busy, "why": ""}
+        elif seen and seen > now - ONLINE:
+            entry |= {"state": "idle"}
+        else:
+            entry |= {"state": "away"}
+        roster.append(entry)
+    return roster
+
+
+def arena_state(now=None):
+    """What the arena shows, as JSON: whether the team is paused, autopilot, the roster (see team_state()), the open
+    tasks and the latest done ones (without their long texts: GET /board?id=N has one in full), and the latest asks."""
+    now = now or time.time()
+    everything = board_tasks()
+    states = {t["id"]: t["state"] for t in everything}
+    done = [t for t in everything if t["state"] == "done"]
+    tasks = [{"id": t["id"], "title": t["title"], "state": t["state"], "owner": t["owner"], "reviewer": t["reviewer"],
+              "author": t["author"], "files": t["files"], "after": [[i, states.get(i, "gone")] for i in t["after"]],
+              "tests": t["tests"], "project": t["project"]} for t in everything if t["state"] != "done"] + [
+        {"id": t["id"], "title": t["title"], "state": "done", "owner": t["owner"], "reviewer": t["reviewer"],
+         "author": t["author"], "files": t["files"], "after": [], "tests": t["tests"], "project": t["project"]}
+        for t in done[-10:]]
+    cur = db().execute("SELECT id, asker, agent, answered, mode, task, started, ended, verdict, tests, branch, problem"
+                       " FROM asks ORDER BY id DESC LIMIT 20")
+    names = [column[0] for column in cur.description]
+    asks = [dict(zip(names, row)) | {"problem": row[-1] and clip(row[-1], 300)} for row in cur]
+    return {"now": now, "paused": paused(), "autopilot": autopilot_state(now), "team": team_state(now), "tasks": tasks,
+            "done": len(done), "asks": asks}
+
+
+def task_state(tid):
+    """One task in full for the arena: its fields, spec, notes, the report of the tests at done, and every verdict."""
+    t = board_task(tid)
+    t["reviews"] = [dict(zip(("reviewer", "verdict", "tests", "at"), row)) for row in db().execute(
+        "SELECT reviewer, verdict, tests, at FROM reviews WHERE task = ? ORDER BY id", (tid,))]
+    return t
+
+
+def gauge_windows(limits):
+    """The windows of a plan's usage in Claude Code's status line input (`rate_limits`): (its name, the percentage used,
+    when it resets or None), each window as reported. A window can be missing: it is then unknown, never 0%."""
+    found = []
+    for window, value in limits.items() if isinstance(limits, dict) else ():
+        if isinstance(value, dict) and re.fullmatch(r"[a-z][a-z0-9_]{0,31}", str(window)):
+            used, resets = value.get("used_percentage"), value.get("resets_at")
+            if number_(used) and 0 <= used <= 10000:  # a spend limit can pass 100
+                found.append((window, float(used), float(resets) if number_(resets) else None))
+    return found
+
+
+TERMINAL = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|[@-_]?)|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def plain(text):
+    """`text` without what a terminal would act on: escape sequences (colors, a new window title, OSC 52's clipboard...)
+    and control characters but for tabs and line breaks. Agents' words reach the human's terminal only this way."""
+    return TERMINAL.sub("", text)
+
+
+def status_text(data, windows):
+    """The status line Agon prints for Claude Code: the model, the folder, the context used and the plan's usage."""
+    def text(value):
+        return plain(value).replace("\n", " ").replace("\t", " ") if isinstance(value, str) else ""
+
+    model = data.get("model") if isinstance(data.get("model"), dict) else {}
+    workspace = data.get("workspace") if isinstance(data.get("workspace"), dict) else {}
+    context = data.get("context_window") if isinstance(data.get("context_window"), dict) else {}
+    folder = text(workspace.get("current_dir")) or text(data.get("cwd"))
+    parts = [text(model.get("display_name")) or "Claude", os.path.basename(folder.rstrip("/\\")) or folder]
+    if number_(context.get("used_percentage")):
+        parts.append(f"context {context['used_percentage']:.0f}%")
+    parts += [f"{WINDOWS.get(window, window)} {used:.0f}%" for window, used, _ in windows]
+    return " · ".join(part for part in parts if part)
+
+
+def statusline(me, inp=None, out=None):
+    """`python agon.py statusline [NAME]`, Claude Code's status line command (statusLine in the human's settings, which
+    Agon never edits: setup prints it). From the JSON Claude Code hands it, Agon keeps only the plan's usage, each
+    window's percentage and reset time, with the session's id, for the arena's roster; the transcript, paths and
+    everything else stay out of agon.db. Then it prints a usual status line, so the human loses nothing. It never fails:
+    a status line command that exits with an error or prints nothing goes blank."""
+    out = out or sys.stdout.buffer
+    try:
+        data = json.loads((inp or sys.stdin.buffer).read().decode("utf-8", "replace") or "{}")
+    except ValueError:
+        data = {}
+    data = data if isinstance(data, dict) else {}
+    windows = gauge_windows(data.get("rate_limits"))
+    session = data.get("session_id") if isinstance(data.get("session_id"), str) else None
+    try:
+        if windows and not bad_recipient(me) and me not in ("all", "human", "agon"):
+            now, session = time.time(), session and session[:200]
+            kept = {row[0]: row[1:] for row in db().execute("SELECT window, used, resets, session, seen FROM gauges"
+                                                            " WHERE agent = ?", (me,))}
+            # only what changed, or once a minute (the age the arena shows): every write makes the arena look again
+            fresh = [(window, used, resets) for window, used, resets in windows
+                     if kept.get(window, (None,) * 4)[:3] != (used, resets, session) or kept[window][3] < now - 60]
+            if fresh:
+                with transaction() as con:
+                    con.executemany("INSERT OR REPLACE INTO gauges(agent, window, used, resets, session, seen) VALUES"
+                                    " (?, ?, ?, ?, ?, ?)", [(me, *row, session, now) for row in fresh])
+    except Exception:  # agon.db locked, a bad AGON_DB...: the line still shows
+        pass
+    out.write(status_text(data, windows).encode() + b"\n")
+    out.flush()
+
+
 PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Agon</title>
 <style>
@@ -3356,16 +3555,42 @@ class Web(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.local():
             return
-        if self.path.startswith("/msgs"):
-            after = int(self.path.partition("after=")[2] or 0)
-            rows = db().execute(
-                "SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id", (after,)
-            ).fetchall()
-            body, ctype = json.dumps(rows).encode(), "application/json"
-        else:
-            body, ctype = PAGE.encode(), "text/html; charset=utf-8"
+        url = urlsplit(self.path)
+        query = {key: values[-1] for key, values in parse_qs(url.query).items()}
+        if url.path == "/msgs":  # the chat after message `after`, or up to `limit` messages before message `before`
+            after, before, limit = (number(query.get(key, default)) for key, default in (("after", "0"),
+                                                                                        ("before", "0"), ("limit", "200")))
+            if None in (after, before, limit):
+                return self.answer(400, "after, before and limit are message numbers.")
+            if before:
+                rows = db().execute("SELECT * FROM (SELECT id, sender, rcpt, text, ts FROM msgs WHERE id < ? ORDER BY id"
+                                    " DESC LIMIT ?) ORDER BY id", (before, min(limit, 1000))).fetchall()
+            else:
+                rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id",
+                                    (after,)).fetchall()
+            return self.json(rows)
+        if url.path == "/board":  # the arena's snapshot, or with id one task in full
+            if "id" not in query:
+                return self.json(arena_state())
+            if (tid := number(query["id"])) is None:
+                return self.answer(400, "id is a task number.")
+            try:
+                return self.json(task_state(tid))
+            except ToolError as e:
+                return self.answer(404, str(e))
+        if url.path != "/":
+            return self.answer(404, "Nothing here: the arena is at /.")
+        body = PAGE.encode()
         self.send_response(200)
-        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def json(self, value):
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -3567,6 +3792,12 @@ def main(argv):
         return autopilot(args.agents, args.lead, args.project)
     elif argv == ["stats"]:
         stats()
+    elif argv[:1] == ["statusline"]:
+        cli = Args(prog="agon.py statusline", description="Claude Code's status line command: prints the model, the"
+                   " folder, the context and the plan's usage, and keeps only the plan's usage (the percentage of each"
+                   " window, when it resets, the session id) for the arena.")
+        cli.add_argument("name", nargs="?", default="claude", help="the agent's name in Agon (default claude)")
+        statusline(cli.parse_args(argv[1:]).name)
     elif argv:
         # Host apps end their MCP servers with SIGINT (Claude Code) or SIGTERM (Codex, agy after closing stdin).
         # Take SIGTERM like Ctrl+C: the server unwinds and waits while running asks stop their apps and log it
