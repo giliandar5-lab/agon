@@ -101,7 +101,7 @@ assert seen and seen[0] != id(con)  # another thread gets its own
 
 # 4. agents table; schema steps are counted in PRAGMA user_version
 cols = [row[1] for row in con.execute("PRAGMA table_info(agents)")]
-assert cols == ["name", "client", "cursor", "last_seen", "autoruns", "out_of_quota_until"], cols
+assert cols == ["name", "client", "cursor", "last_seen", "autoruns", "out_of_quota_until", "busy"], cols  # busy: v0.6
 assert con.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
 old = sqlite3.connect(Path(TMP, "v01.db"), isolation_level=None)  # a database made by agon v0.1
 old.execute("CREATE TABLE msgs(id INTEGER PRIMARY KEY, sender TEXT, rcpt TEXT, text TEXT, ts TEXT)")
@@ -973,6 +973,11 @@ def agon_said():  # the latest line Agon wrote for the human
     return con.execute("SELECT text FROM msgs WHERE sender = 'agon' AND rcpt = 'human' ORDER BY id DESC").fetchone()[0]
 
 
+def last_ask(db=None):  # Phase 6: the latest row in asks, as a dict (of the main test database, or of `db`)
+    cur = (db or con).execute("SELECT * FROM asks ORDER BY id DESC LIMIT 1")
+    return dict(zip([column[0] for column in cur.description], cur.fetchone()))
+
+
 def beating():  # whether the child of a HANG app still writes
     size = BEAT.stat().st_size if BEAT.exists() else -1
     time.sleep(0.4)
@@ -1019,6 +1024,10 @@ for name, app in APPS.items():
     looked = f"{app} looked at {Path(run['cwd']).name}: 3 tests passed.\nVERDICT: approve"
     assert text.rstrip().endswith(f"s, VERDICT: approve ({agon.NO_TESTS}).\n\n{NONE}\n\nIts review:\n{looked}"), text
     assert re.fullmatch(rf"rev asked {name} for a review: {name} answered in \d+s, {APPROVED}", agon_said())
+    row = last_ask()  # Phase 6: the arena's record of it
+    assert (row["asker"], row["agent"], row["mode"], row["answered"], row["verdict"], row["tests"], row["branch"],
+            row["problem"]) == ("rev", name, "review", name, "approve", agon.NO_TESTS, None, None), row
+    assert row["project"] == agon.toplevel(str(project)) and row["started"] <= row["ended"] <= time.time(), row
     assert "Don't run the tests either: Agon ran them before you started" in run["prompt"], run["prompt"]
     assert f"\n\n{NONE}\n\nWhat rev asks:\nPlease review" in run["prompt"], run["prompt"]  # Phase 3.1: what Agon ran
 res, text = asked(rev, agent="gpt", prompt="PLAIN, please", cwd=str(project))  # no JSON: the output is the answer
@@ -1027,6 +1036,9 @@ assert "isError" not in res and text.endswith(f", no verdict ({agon.NO_TESTS}).\
 res, text = asked(rev, agent="claude", prompt="CRASH, please", cwd=str(project))
 assert res["isError"] is True and re.match(r"claude failed after \d+s \(exit code 3\): boom: the fake crashed$", text)
 assert agon_said() == f"rev asked claude for a review: {text}"
+row = last_ask()
+assert row["answered"] == "claude" and row["verdict"] is None and row["problem"] == text and row["ended"], row
+asks = con.execute("SELECT COUNT(*) FROM asks").fetchone()[0]  # the checks below refuse before anything runs
 runs = len(fake_runs())
 for args, why in (({"agent": "bard", "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
                   ({"agent": ["gpt"], "prompt": "hi"}, "`agent` must be claude, gpt or gemini."),
@@ -1046,6 +1058,7 @@ res, text = asked(plugged, agent="gpt", prompt="hi")
 assert res["isError"] is True and "pass `cwd`, the absolute path of your project folder" in text, text
 plugged.close()
 assert len(fake_runs()) == runs  # none of them ran an app
+assert con.execute("SELECT COUNT(*) FROM asks").fetchone()[0] == asks  # and none of them is an ask on record
 for where, env in ((str(project), ASK), (str(HERE), ASK | {"CLAUDE_PROJECT_DIR": str(project)})):
     near = Agent("near", env=env, cwd=where)  # without cwd: Claude Code's project folder, else the server's folder
     assert "isError" not in near.call("ask", agent="gpt", prompt="hi")
@@ -1082,6 +1095,9 @@ assert in_repo("show", f"{branch}:sub/notes.txt") == "written by codex"  # commi
 assert in_repo("log", "-1", "--format=%an <%ae>|%s", branch) == "gpt (Agon) <agon@localhost>|gpt: EDIT notes.txt," \
                                                                 " please"
 assert not (repo / "sub" / "notes.txt").exists() and in_repo("status", "--porcelain") == ""  # ...not in the caller's
+row = last_ask()
+assert (row["mode"], row["branch"], row["tests"], row["verdict"]) == ("task", branch, agon.NO_TESTS, None), row
+assert row["project"] == agon.toplevel(str(repo)), row  # the repository's top folder, though it ran in sub/
 assert re.fullmatch(rf"rev asked gpt for a task: gpt finished in \d+s on branch {branch} \(no tests run: set"
                     r" AGON_TEST_CMD\): 1 file changed, 1 insertion\(\+\)\.", agon_said()), agon_said()
 res, text = asked(rev, agent="gemini", prompt="EDIT g.txt and then CRASH", mode="task", cwd=str(repo))
@@ -1214,6 +1230,7 @@ assert re.match(rf"gpt is out of quota until ~\d\d:\d\d, so gemini answered in \
 assert [run["app"] for run in fake_runs()[runs:]] == ["agy"]  # gpt's app never ran, and claude doesn't ask itself
 assert re.fullmatch(r"claude asked gpt for a review: gpt is out of quota until ~\d\d:\d\d, so gemini answered in \d+s,"
                     rf" {APPROVED}", agon_said()), agon_said()
+assert (last_ask()["agent"], last_ask()["answered"], last_ask()["verdict"]) == ("gpt", "gemini", "approve")  # fallback
 lead.close()
 mark("gpt", 0)
 limited, runs, t0 = Agent("rev2", env=ASK | {"FAKE_LIMIT": "agy"}), len(fake_runs()), time.time()
@@ -1226,6 +1243,7 @@ limited.close()
 alone = Agent("rev3", env=ASK | {"AGON_FALLBACK": ""})
 res, text = asked(alone, agent="gemini", prompt="Please review", cwd=str(project))
 assert res["isError"] is True and re.fullmatch(r"Nobody could answer: gemini is out of quota until ~\d\d:\d\d\.", text)
+assert last_ask()["answered"] is None and last_ask()["problem"] == text, last_ask()  # nobody could
 alone.close()
 chain, runs = Agent("rev4", env=ASK | {"FAKE_LIMIT": "codex,claude"}), len(fake_runs())
 res, text = asked(chain, agent="gpt", prompt="EDIT part.txt, please", mode="task", cwd=str(repo))
@@ -1348,6 +1366,7 @@ until(lambda: not beating())
 assert busy.rpc("ping", id=41) == {"jsonrpc": "2.0", "id": 41, "result": {}}  # and no reply to the cancelled ask
 until(lambda: agon_said().startswith("busy asked gpt for a review: gpt was stopped after "))
 assert agon_said().endswith("s: the call was cancelled, or the app that asked is gone."), agon_said()
+assert last_ask()["problem"].startswith("gpt was stopped after ") and last_ask()["ended"], last_ask()  # ended there too
 BEAT.unlink()
 busy.write(call(42, "ask", agent="gemini", prompt="HANG, please", cwd=str(project)))
 until(BEAT.exists)
@@ -1804,7 +1823,7 @@ agon.migrate(v03)
 assert v03.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
 assert [row[1] for row in v03.execute("PRAGMA table_info(tasks)")][:6] == ["id", "title", "spec", "files", "after", "state"]
 assert [row[1] for row in v03.execute("PRAGMA table_info(releases)")] == ["id", "task", "agent", "why", "told"]
-assert [row[1] for row in v03.execute("PRAGMA table_info(tasks)")][-1] == "version"  # every change moves it on
+assert "version" in [row[1] for row in v03.execute("PRAGMA table_info(tasks)")]  # every change moves it on
 v03.close()
 if sys.version_info >= (3, 12):  # SQLite's own autocommit mode, whatever Python's default becomes: BEGIN IMMEDIATE works
     assert agon.db().autocommit is True
@@ -2008,6 +2027,11 @@ assert bdb.execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 1
     "claude", "all", "Approved task #1 (tests passed): Build the menu. Ready to claim now: #2 Test it.\nclaude:\n"
                      "    Read ui/menu.py; quit works.")  # everyone but claude hears that #2 is free
 assert "[done: gpt, approved by claude] Build the menu" in coder("board", action="list")
+# Phase 6: every verdict stays in reviews (the task's own row changes), with what the tests showed, for the scoreboard;
+# and the task knows its project, from the folder done ran the tests in
+assert bdb.execute("SELECT task, owner, reviewer, verdict, tests FROM reviews ORDER BY id").fetchall() == [
+    (1, "gpt", "claude", "changes", "tests failed"), (1, "gpt", "claude", "approve", "tests passed")]
+assert bdb.execute("SELECT project FROM tasks WHERE id = 1").fetchone() == (agon.toplevel(str(project)),)
 # changes while the owner is away (no sign of it for AGON_LEASE s, or out of quota): the task goes back to the board
 assert lead("board", action="done", id=4, note="Docs written.").startswith("Task #4 is in review (no tests run: set"
                                                                           " AGON_TEST_CMD). gpt is asked to review it.")
@@ -2154,6 +2178,10 @@ assert approved[:2] == ("agon", "claude") and re.fullmatch(
     r"Approved task #1 \(no tests run: set AGON_TEST_CMD\): Parser\.\ngpt, reviewing headless on the user's plan"
     r" \(AGON_AUTO_REVIEW, \d+s\):\n    codex looked at project: 3 tests passed\.\n    VERDICT: approve", approved[2]
 ), approved
+row = last_ask(adb)  # Phase 6: an automatic review is an ask by Agon itself, for the board's task
+assert (row["asker"], row["agent"], row["mode"], row["task"], row["answered"], row["verdict"], row["tests"]) == (
+    "agon", "gpt", "review", 1, "gpt", "approve", agon.NO_TESTS) and row["ended"], row
+assert adb.execute("SELECT task, owner, reviewer, verdict FROM reviews").fetchall() == [(1, "claude", "gpt", "approve")]
 limited = Agent("claude", env=AUTO | {"FAKE_LIMIT": "codex"})  # gpt hits its usage limit: gemini reviews, in its copy
 limited("board", action="add", title="Lexer", spec="ASK FOR FIXES in the lexer.", files=["lexer.py"])
 limited("board", action="claim", id=2)
@@ -3151,7 +3179,7 @@ for sql in agon.SCHEMA[:7]:
     v04.execute(sql)
 v04.execute("PRAGMA user_version = 7")
 agon.migrate(v04)
-assert v04.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 11
+assert v04.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) > 11
 for table, columns in (("runs", "id agent trigger session started ended status tokens_in tokens_cached tokens_out usd"
                                 " task note"),
                        ("pilot", "agent session turns context started used usd tokens_in tokens_cached tokens_out"
@@ -3159,6 +3187,32 @@ for table, columns in (("runs", "id agent trigger session started ended status t
                        ("live", "pid agent client socket busy beat wake pushed"), ("state", "key value")):
     assert [row[1] for row in v04.execute(f"PRAGMA table_info({table})")] == columns.split(), table
 v04.close()
+# Phase 6: a database made by v0.5.0 (its 11 steps, with an agent, a task and a run in it) opens and gets the arena's
+# steps: the history of asks and verdicts, duels, the plan gauges, a task's project and an agent's busy mark
+v05 = sqlite3.connect(Path(TMP, "v05.db"), isolation_level=None)
+for sql in agon.SCHEMA[:11]:
+    v05.execute(sql)
+v05.execute("PRAGMA user_version = 11")
+v05.execute("INSERT INTO agents(name, client, cursor, last_seen) VALUES ('gpt', 'codex-mcp-client', 7, 1790000000.0)")
+v05.execute("INSERT INTO tasks(title, author, created, updated) VALUES ('Old task', 'claude', 1, 1)")
+v05.execute("INSERT INTO runs(agent, trigger, started) VALUES ('gpt', '#7 human -> gpt', 1)")
+v05.close()
+opened = subprocess.run([sys.executable, "-c", "import agon; agon.db(); agon.close_db()"], cwd=HERE, capture_output=True,
+                        text=True, env=dict(os.environ, AGON_DB=str(Path(TMP, "v05.db"))), timeout=60)
+assert opened.returncode == 0, opened  # as any copy of agon.py opens it
+v05 = sqlite3.connect(Path(TMP, "v05.db"), isolation_level=None)
+assert v05.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 18
+for table, columns in (("asks", "id asker agent mode task project started ended answered verdict tests branch problem"),
+                       ("reviews", "id task owner reviewer verdict tests at"),
+                       ("duels", "id project prompt base state started ended winner baseline report note"),
+                       ("entries", "duel label agent branch state started ended tests report stat files answer problem"
+                                   " reviewer verdict review"),
+                       ("gauges", "agent window used resets session seen")):
+    assert [row[1] for row in v05.execute(f"PRAGMA table_info({table})")] == columns.split(), table
+assert v05.execute("SELECT name, cursor, busy FROM agents").fetchall() == [("gpt", 7, 0)]  # kept, and idle
+assert v05.execute("SELECT title, version, project FROM tasks").fetchall() == [("Old task", 0, None)]
+assert v05.execute("SELECT agent, status FROM runs").fetchall() == [("gpt", "running")]
+v05.close()
 
 # Phase 5: the command. One autopilot at a time; SIGTERM ends it like Ctrl+C (running turns end and are recorded), and
 # the human hears it in the arena. Bad settings stop it before anything runs
@@ -3202,6 +3256,41 @@ for key, value in saved_env.items():
         os.environ.pop(key, None)
     else:
         os.environ[key] = value
+agon.close_db()
+agon.DB = test_db
+
+# Phase 6, the arena, in this process on a team of its own
+agon.close_db()
+agon.DB, test_db = str(Path(TMP, "arena.db")), agon.DB
+
+
+def busy_since(name):
+    return agon.db().execute("SELECT busy FROM agents WHERE name = ?", (name,)).fetchone()[0]
+
+
+# Who works: every app's hooks say so (UserPromptSubmit: a turn starts; Stop: it ends, unless new messages keep the agent
+# going), and a tool call means the agent works too. Autopilot's own headless runs are counted by autopilot instead
+agon.touch("hal", "codex-mcp-client")
+assert busy_since("hal") == 0
+t0 = time.time()
+assert hook("hal", {"hook_event_name": "UserPromptSubmit", "prompt": "Go on."}) == (None, b"")
+assert t0 <= busy_since("hal") <= time.time()
+assert hook("hal", {"hook_event_name": "Stop"}) == (None, b"") and busy_since("hal") == 0  # nothing waits: idle
+agon.post("human", "hal", "One more thing.")
+assert hook("hal", {"hook_event_name": "Stop"})[0]["decision"] == "block" and busy_since("hal") > 0  # it goes on
+hook("hal", {"hook_event_name": "Stop"})
+assert busy_since("hal") == 0
+agon.call_tool(agon.Session("hal", None), {"name": "board", "arguments": {"action": "list"}})
+assert busy_since("hal") > 0  # its model called a tool
+first = busy_since("hal")
+agon.call_tool(agon.Session("hal", None), {"name": "board", "arguments": {"action": "list"}})
+assert busy_since("hal") == first  # since the first sign, not the latest
+hook("hal", {"hook_event_name": "Stop"})
+with settings(AGON_AUTOPILOT="1"):  # a headless app autopilot runs: neither its tool calls nor its hooks
+    agon.call_tool(agon.Session("hal", None), {"name": "board", "arguments": {"action": "list"}})
+    hook("hal", {"hook_event_name": "UserPromptSubmit", "prompt": "Go on."})
+assert busy_since("hal") == 0
+
 agon.close_db()
 agon.DB = test_db
 

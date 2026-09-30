@@ -315,6 +315,29 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     "CREATE TABLE live(pid INTEGER PRIMARY KEY, agent TEXT NOT NULL, client TEXT, socket TEXT, busy REAL NOT NULL"
     " DEFAULT 0, beat REAL NOT NULL, wake INTEGER NOT NULL DEFAULT 0, pushed INTEGER NOT NULL DEFAULT 0)",
     "CREATE TABLE state(key TEXT PRIMARY KEY, value TEXT NOT NULL)",  # autopilot's heartbeat: one autopilot at a time
+    # Phase 6, the arena. Every ask: who asked whom, for a review or a task (and the board task of an automatic review),
+    # in which project, when, who answered in the end, the verdict, what came of the tests, the branch, why it failed
+    "CREATE TABLE asks(id INTEGER PRIMARY KEY, asker TEXT NOT NULL, agent TEXT NOT NULL, mode TEXT NOT NULL, task"
+    " INTEGER, project TEXT, started REAL NOT NULL, ended REAL, answered TEXT, verdict TEXT, tests TEXT, branch TEXT,"
+    " problem TEXT)",
+    # every verdict on a board task, for the scoreboard: whose work, by whom, approve or changes, and what the tests Agon
+    # ran at done showed
+    "CREATE TABLE reviews(id INTEGER PRIMARY KEY, task INTEGER NOT NULL, owner TEXT NOT NULL, reviewer TEXT NOT NULL,"
+    " verdict TEXT NOT NULL, tests TEXT, at REAL NOT NULL)",
+    "ALTER TABLE tasks ADD COLUMN project TEXT",  # where the task was done: its repository's top folder, when known
+    # duels: the same task for two or three agents, each on a branch of its own from one commit (base), blind (entries
+    # a, b, c) until the human picks the winner. baseline is what came of the tests at base, report their report
+    "CREATE TABLE duels(id INTEGER PRIMARY KEY, project TEXT NOT NULL, prompt TEXT NOT NULL, base TEXT NOT NULL, state"
+    " TEXT NOT NULL DEFAULT 'running', started REAL NOT NULL, ended REAL, winner TEXT, baseline TEXT, report TEXT, note"
+    " TEXT NOT NULL DEFAULT '')",
+    "CREATE TABLE entries(duel INTEGER NOT NULL, label TEXT NOT NULL, agent TEXT NOT NULL, branch TEXT, state TEXT NOT"
+    " NULL DEFAULT 'waiting', started REAL, ended REAL, tests TEXT, report TEXT, stat TEXT, files TEXT NOT NULL DEFAULT"
+    " '[]', answer TEXT, problem TEXT, reviewer TEXT, verdict TEXT, review TEXT, PRIMARY KEY(duel, label))",
+    # a plan's usage, from Claude Code's status line (python agon.py statusline): per window only the percentage used,
+    # when it resets, the session that reported it and when. Nothing else of the status line's input is kept
+    "CREATE TABLE gauges(agent TEXT NOT NULL, window TEXT NOT NULL, used REAL NOT NULL, resets REAL, session TEXT, seen"
+    " REAL NOT NULL, PRIMARY KEY(agent, window))",
+    "ALTER TABLE agents ADD COLUMN busy REAL NOT NULL DEFAULT 0",  # since when its app works, from its hooks; 0: idle
 ]
 _local = threading.local()
 
@@ -654,6 +677,28 @@ def project_folder(cwd):
     if not isinstance(cwd, str) or not os.path.isabs(cwd) or not os.path.isdir(cwd):
         raise ToolError("`cwd` must be the absolute path of your project folder.")
     return cwd
+
+
+def toplevel(folder):
+    """The project that work in `folder` belongs to, for the scoreboard, which counts per project: the top folder of its
+    git repository, else the folder itself. Best effort: never an error."""
+    try:
+        p = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=folder, env=environment(), capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=30,
+                           creationflags=NO_WINDOW)
+        top = p.stdout.strip() if p.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        top = ""
+    return os.path.normpath(top or os.path.abspath(folder))
+
+
+def project_of(cwd):
+    """The project of a tool call with `cwd` (see project_folder() and toplevel()), or None when Agon can't tell: an app
+    that starts Agon in Agon's own folder and passed no cwd."""
+    try:
+        return toplevel(project_folder(cwd))
+    except ToolError:
+        return None
 
 
 def seconds(var, default):
@@ -1270,6 +1315,21 @@ def ask_once(asker, name, mode, prompt, cwd, top, end, stopped, tests, tested):
     return answer, problem, limit, (branch if stat else None), stat, tested
 
 
+def begin_ask(asker, agent, mode, cwd, task=None):
+    """Record an ask as it starts, for the arena (which also shows who works on it) and the scoreboard: its row's id."""
+    return db().execute("INSERT INTO asks(asker, agent, mode, task, project, started) VALUES (?, ?, ?, ?, ?, ?)",
+                        (asker, agent, mode, task, toplevel(cwd), time.time())).lastrowid
+
+
+def end_ask(ask, answered=None, verdict=None, tests=None, branch=None, problem=None):
+    """Record how ask `ask` ended: who answered, the verdict, what came of the tests, the branch, or why it failed. Once:
+    a later call changes nothing. Best effort: the ask's own answer matters more than its record."""
+    with contextlib.suppress(sqlite3.Error):
+        db().execute("UPDATE asks SET ended = ?, answered = COALESCE(?, answered), verdict = ?, tests = ?, branch = ?,"
+                     " problem = ? WHERE id = ? AND ended IS NULL", (time.time(), answered, verdict, tests, branch,
+                                                                    problem and clip(problem, 1000), ask))
+
+
 def tool_ask(session, args):
     agent, prompt, mode, cwd = ask_args(session, args)
     if paused():
@@ -1279,6 +1339,17 @@ def tool_ask(session, args):
     except ToolError as e:
         raise ToolError(f"Nothing asked: a task works on a new branch from your last commit, and {e}.") from None
     tests = test_command()  # a bad setting stops the ask before anything runs
+    ask = begin_ask(session.me, agent, mode, cwd)
+    try:
+        return ask_rounds(session, ask, agent, prompt, mode, cwd, top, tests)
+    except BaseException as e:  # its end is recorded, unless it was already
+        end_ask(ask, problem=str(e) or type(e).__name__)
+        raise
+
+
+def ask_rounds(session, ask, agent, prompt, mode, cwd, top, tests):
+    """The rounds of ask `ask` (its row in asks): `agent` answers, or the next agent in AGON_FALLBACK while one is out of
+    quota. The row says who is trying, and how it ended."""
     me, started = session.me, time.monotonic()
     end, head, skipped = started + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT), f"{me} asked {agent} for a {mode}", []
     tested = None  # a review's tests: run once, in the project folder, before the first reviewer starts
@@ -1304,6 +1375,8 @@ def tool_ask(session, args):
                 branch = None
                 break
             tested = outcome, report
+        with contextlib.suppress(sqlite3.Error):  # the arena shows who works on it now
+            db().execute("UPDATE asks SET answered = ? WHERE id = ?", (name, ask))
         try:
             answer, problem, limit, branch, stat, tested = ask_once(me, name, mode, prompt, cwd, top, end, halt, tests,
                                                                     tested)
@@ -1323,21 +1396,25 @@ def tool_ask(session, args):
     if problem:
         if branch:
             problem += f"\nWhat it changed is on branch {branch}:\n{stat}"
+        end_ask(ask, answered=name, branch=branch, problem=problem)
         post("agon", "human", f"{head}: {lead if name else ''}{problem}")  # every ask shows in the arena, wakes no one
         raise ToolError(f"{lead if name else ''}{problem}")
     outcome, report = tested  # what Agon's own run of the tests showed, whatever the agent says
     summary = clip(answer, max(2000, MAX_INBOX - 500 - len(report)))  # a long PATH in the report can't wipe it out
     if branch:
+        end_ask(ask, answered=name, tests=outcome, branch=branch)
         post("agon", "human", f"{head}: {lead}{name} finished in {spent} on branch {branch} ({outcome}):"
                               f" {stat.splitlines()[-1].strip()}.")
         return (f"{lead}{name} finished the task in {spent} on branch {branch} ({outcome}):\n{stat}\nMerge it if you"
                 f" want it: git merge {branch} (or drop it: git branch -D {branch}).\n\n{report}\n\nIts summary:\n"
                 f"{summary}"), None
     if top:
+        end_ask(ask, answered=name, tests=outcome)
         post("agon", "human", f"{head}: {lead}{name} finished in {spent} without changing any file ({outcome}).")
         return (f"{lead}{name} finished the task in {spent} without changing any file ({outcome}).\n\n{report}\n\n"
                 f"Its summary:\n{summary}"), None
     seal = (f"VERDICT: {verdict(answer)}" if verdict(answer) else "no verdict") + f" ({outcome})"
+    end_ask(ask, answered=name, verdict=verdict(answer), tests=outcome)
     post("agon", "human", f"{head}: {lead}{name} answered in {spent}, {seal}.")
     return f"{lead}{name} answered in {spent}, {seal}.\n\n{report}\n\nIts review:\n{summary}", None
 
@@ -1734,6 +1811,7 @@ def board_done(session, args):
     outcome, report, problem = run_tests(tests, folder, time.monotonic() + (tests[1] + 60 if tests else 0), halt)
     if problem:
         raise ToolError(problem)
+    project = toplevel(folder) if folder else project_of(args.get("cwd"))  # the scoreboard counts per project
     now = time.time()
     with transaction() as con:
         t = board_task(tid)
@@ -1741,7 +1819,8 @@ def board_done(session, args):
         online = reviewers(t, now)  # after changes, the one who asked for them looks again
         reviewer = t["reviewer"] if t["reviewer"] in online else next(iter(online), None)
         con.execute("UPDATE tasks SET state = 'review', reviewer = ?, note = ?, tests = ?, report = ?, updated = ?,"
-                    " version = version + 1 WHERE id = ?", (reviewer, note, outcome, report, now, tid))
+                    " version = version + 1, project = COALESCE(?, project) WHERE id = ?",
+                    (reviewer, note, outcome, report, now, project, tid))
         version = t["version"] + 1  # what an automatic review must still find: nothing else wrote meanwhile
         said = f"\n{me}'s note:\n{indented(clip(note.strip(), 1000))}" if note.strip() else ""
         if reviewer:
@@ -1790,6 +1869,8 @@ def settle(t, reviewer, verdict, evidence, sender, by):
     tasks it frees (else only its owner hears); changes send it back to its owner, or to the board when the owner is
     away. `sender` posts the message, which quotes the `evidence` as `by`'s. Returns what the reviewer is told."""
     con, now, tid, owner, tests = db(), time.time(), t["id"], t["owner"], t["tests"] or NO_TESTS
+    con.execute("INSERT INTO reviews(task, owner, reviewer, verdict, tests, at) VALUES (?, ?, ?, ?, ?, ?)",
+                (tid, owner, reviewer, verdict, tests, now))  # the scoreboard's history: the task's own row changes
     said = f"\n{by}:\n{indented(clip(evidence.strip(), 1500))}"
     if verdict == "approve":
         con.execute("UPDATE tasks SET state = 'done', reviewer = ?, note = ?, updated = ?, version = version + 1 WHERE"
@@ -1831,6 +1912,7 @@ def auto_review(session, tid, owner, cwd, tested, version):
         if paused():
             return "the human paused the team"
 
+    ask = None
     try:
         started, end = time.monotonic(), time.monotonic() + seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
         t, skipped, answer, problem = board_task(tid), [], None, None
@@ -1838,13 +1920,17 @@ def auto_review(session, tid, owner, cwd, tested, version):
                   f"What was asked:\n{indented(clip(t['spec'], 3000)) or '    (no spec)'}\n{owner}'s note:\n"
                   f"{indented(clip(t['note'], 3000)) or '    (none)'}\nThe work is in the project folder as it is now.")
         before = had_it(tid)
-        for name in sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before):  # the other companies
+        names = sorted(fallbacks(vendor(owner), owner), key=lambda name: name in before)  # the other companies
+        ask = begin_ask("agon", names[0] if names else "nobody", "review", cwd, tid)  # the arena shows it as an ask
+        for name in names:
             if until := quota_until(name):
                 skipped.append(f"{name} is out of quota until ~{reset_clock(until, time.time())}")
                 continue
             if why := barred(name):
                 skipped.append(why)
                 continue
+            with contextlib.suppress(sqlite3.Error):
+                db().execute("UPDATE asks SET answered = ? WHERE id = ?", (name, ask))
             try:
                 answer, problem, limit, _, _, _ = ask_once(owner, name, "review", prompt, cwd, None, end, halt, None,
                                                            tested)
@@ -1859,9 +1945,11 @@ def auto_review(session, tid, owner, cwd, tested, version):
         else:
             name, problem = None, f"nobody could review it: {'; '.join(skipped) or 'AGON_FALLBACK names nobody else'}"
         if problem:
+            end_ask(ask, answered=name, problem=problem)
             return post("agon", "human", f"Agon's automatic review of task #{tid} failed: {problem.rstrip('.')}. It"
                                          " still waits for a review.")
         found = verdict(answer)
+        end_ask(ask, answered=name, verdict=found, tests=tested[0])
         by = f"{name}, reviewing headless on the user's plan (AGON_AUTO_REVIEW, {took(time.monotonic() - started)})"
         with transaction():
             t = board_task(tid)
@@ -1871,6 +1959,8 @@ def auto_review(session, tid, owner, cwd, tested, version):
                                            f"{indented(clip(answer.strip(), 3000))}")
             settle(t, name, found, answer, "agon", by)
     except Exception as e:  # a bad setting, agon.db locked...: the human hears of it, the task still waits
+        if ask:
+            end_ask(ask, problem=str(e))
         post("agon", "human", f"Agon's automatic review of task #{tid} failed: {e}")
     finally:
         close_db()
@@ -1961,6 +2051,9 @@ def call_tool(session, params):
     try:  # its model called a tool, so it isn't out of quota (any more): it may review, and it is asked again
         db().execute("UPDATE agents SET out_of_quota_until = NULL WHERE name = ? AND out_of_quota_until IS NOT NULL",
                      (session.me,))
+        if not session.headless:  # and it works: since now, unless a hook said so already (see mark())
+            now = time.time()
+            db().execute("UPDATE agents SET busy = ? WHERE name = ? AND busy <= ?", (now, session.me, now - BUSY))
     except sqlite3.Error:
         pass  # best effort, as for presence
     try:
@@ -2424,11 +2517,13 @@ def write_json(out, decision):
 
 
 def mark(me, busy):
-    """A hook of agent `me`'s Claude Code session says since when the session works (`busy`), or that it is idle (0). Its
-    MCP server's row in `live` has the same inbox socket path (see register()): the session's own, whatever /clear or
-    /resume did to its id. Best effort, like presence."""
-    if path := os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"):
-        with contextlib.suppress(sqlite3.Error):
+    """A hook of agent `me`'s app says since when the app works (`busy`), or that it is idle (0): the arena's roster shows
+    it. In Claude Code, the row in `live` of the session's MCP server too, found by its inbox socket path (see
+    register()): the session's own, whatever /clear or /resume did to its id; autopilot posts only to an idle session.
+    Best effort, like presence."""
+    with contextlib.suppress(sqlite3.Error):
+        db().execute("UPDATE agents SET busy = ? WHERE name = ?", (busy, me))
+        if path := os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"):
             db().execute("UPDATE live SET busy = ? WHERE agent = ? AND socket = ?", (busy, me, path))
 
 
