@@ -9,12 +9,15 @@ python agon.py stats         what autopilot's wakes took: per agent and per comp
 python agon.py statusline    Claude Code's status line: keeps the plan's usage for the arena, prints a usual line
 python agon.py watch         the team's chat in the terminal, live
 python agon.py say TEXT      post as the human from a terminal (--to NAME; - reads stdin, --file PATH a file)
+python agon.py export replay|scorecard   one HTML file to share, with what looks private masked (--help for options)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
+import base64
 import contextlib
 import datetime
 import functools
+import hashlib
 import json
 import os
 import posixpath
@@ -3881,9 +3884,9 @@ def duel_view(d, full=False):
         "entries": shown} | ({"report": d["report"]} if full else {})
 
 
-def duels_state():
+def duels_state(limit=5):
     """The latest duels for the arena's snapshot, newest first (see duel_view())."""
-    cur = db().execute("SELECT * FROM duels ORDER BY id DESC LIMIT 5")
+    cur = db().execute("SELECT * FROM duels ORDER BY id DESC LIMIT ?", (limit,))
     names = [column[0] for column in cur.description]
     return [duel_view(dict(zip(names, row))) for row in cur.fetchall()]
 
@@ -3934,8 +3937,9 @@ def kind_of(path):
     return os.path.splitext(name)[1].lower() or name
 
 
-def scoreboard():
-    """The scoreboard, per project (the top folder of its repository), newest activity first. For each agent: the duels it
+def scoreboard(limit=10):
+    """The scoreboard, per project (the top folder of its repository), the `limit` with the newest activity first (all:
+    None). For each agent: the duels it
     won of the picked ones it worked in (not when the setup failed in its worktree); the runs of the human's tests on its work that passed (at board done, in task asks,
     in duels); and its work that reviewers approved: board tasks (per task, its first verdict or after changes) and duel
     entries. Hints: for each kind of file, the agents with at least HINT_MIN results in it, where a result is a board
@@ -3992,7 +3996,7 @@ def scoreboard():
             counts["duels"][1] += 1
             result(project, name, json.loads(files), label == winner)
     shown = []
-    for project, p in sorted(projects.items(), key=lambda item: -item[1]["at"])[:10]:
+    for project, p in sorted(projects.items(), key=lambda item: -item[1]["at"])[:limit]:
         hints = []
         for kind, per in sorted(p["kinds"].items()):
             enough = sorted(([name, good, of] for name, (good, of) in per.items() if of >= HINT_MIN),
@@ -4180,7 +4184,9 @@ ARENA_MAIN = """<nav id="tabs">
 <section id="board" class="panel side"><div id="tasks"></div></section>
 <section id="duels" class="panel side"><div id="duel-form"></div><div id="duel-list"></div></section>
 <section id="score" class="panel side"><select id="score-project" aria-label="Project" hidden></select>
-<div id="scores"></div></section>
+<div id="scores"></div><h2>Share</h2><div class="row"><button type="button" id="export-replay">Export the replay</button>
+<button type="button" id="export-scorecard">Export the scorecard</button></div>
+<div class="small">One HTML file each, to open anywhere: it loads nothing.</div></section>
 </main>
 <div id="detail" hidden><div class="sheet"><div class="row"><span class="grow"></span>
 <button type="button" id="close">Close</button></div><div id="detail-body"></div></div></div>"""
@@ -4556,6 +4562,23 @@ async function duelAct(what, id, label) {
 }
 const drawForm = duelForm($('#duel-form'));
 panels.push(s => { drawForm(s); renderDuels(s.duels, $('#duel-list'), duelAct); });
+async function exportFile(kind) {  // the file comes back as JSON, and the page saves it
+  if (!confirm('Export the ' + kind + ' as one HTML file? It may contain code, file paths and whatever the agents wrote.'
+    + ' Agon masks keys, e-mail addresses and your home folder; check the file before you share it.')) return;
+  const r = await fetch('/export', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify({kind: kind})});
+  if (!r.ok) return alert(await r.text());
+  const got = await r.json(), link = el('a');
+  link.href = URL.createObjectURL(new Blob([got.html], {type: 'text/html'}));
+  link.download = got.name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(link.href), 60000);
+  alert('Saved ' + got.name + '. ' + got.said);
+}
+$('#export-replay').addEventListener('click', () => exportFile('replay'));
+$('#export-scorecard').addEventListener('click', () => exportFile('scorecard'));
 const scoreProject = $('#score-project');  // which project's scores: the latest one, unless the human picks another
 scoreProject.addEventListener('change', () => { if (shown) renderScores(shown.score, $('#scores'), scoreProject.value); });
 panels.push(s => {
@@ -4581,6 +4604,191 @@ PAGE = ("""<!doctype html>
 """ + ARENA_MAIN.replace("{composer}", COMPOSER) + """
 <script nonce="{nonce}">""" + ARENA_RENDER + ARENA_LIVE + """</script>
 """)
+
+
+# Export (python agon.py export, or the arena's buttons): a replay (the chat on a timeline, with the board, the duels and
+# the score as they are) or a scorecard (the score and the duels), as one HTML file that loads nothing: its own
+# Content-Security-Policy comes first and lets only its own script and style run (by their hashes), and its data sits
+# in a JSON data block where nothing can end it early. What looks private is masked unless the human says otherwise:
+# keys and tokens in known formats, e-mail addresses, and the home folder's path (as ~)
+EXPORT_MAX = 10000  # messages a replay has at most: the latest ones
+KEYS = re.compile("|".join((  # known formats of keys and tokens
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",  # PEM private keys
+    r"\bsk-(?:ant-|proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}",  # Anthropic, OpenAI
+    r"\bAIza[0-9A-Za-z_-]{35}",  # Google
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})",  # GitHub
+    r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",  # AWS access key ids
+    r"\bxox[abprs]-[A-Za-z0-9-]{10,}",  # Slack
+    r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}",  # Stripe
+    r"\bhf_[A-Za-z0-9]{30,}",  # Hugging Face
+    r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",  # JSON Web Tokens
+)))
+EMAILS = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
+MASKS = (("key", "keys"), ("e-mail address", "e-mail addresses"), ("path into your home folder (now ~)",
+                                                                   "paths into your home folder (now ~)"))
+EXPORT_STYLE = r"""
+body.export main { grid-template-columns: minmax(0, 1fr); }
+#timeline { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: var(--panel);
+  border-bottom: 1px solid var(--line); }
+#at { flex: 1; min-width: 0; padding: 0; }
+body.scorecard main { display: block; overflow: auto; }
+body.scorecard .panel { display: block; max-width: 900px; margin: 0 auto; }
+@media (min-width: 1100px) {
+  body.export main { grid-template-columns: minmax(0, 1fr) 460px; }
+  body.scorecard main { display: block; }
+}
+"""
+# What both exports run: when, what was masked, every project's scores, the duels
+EXPORT_JS = r"""
+const shared = JSON.parse($('#data').textContent);
+skew = shared.at - Date.now() / 1000;  // "for 5 min" as it was at export
+$('#when').textContent = 'exported ' + new Date(shared.at * 1000).toLocaleString() + (shared.masked === null ?
+  ', nothing masked' : ', keys, e-mail addresses and the home folder masked (' + shared.masked + ')')
+  + (shared.older ? ', without the ' + shared.older + ' oldest messages' : '');
+if (!shared.score.length) renderScores([], $('#scores'));
+for (const p of shared.score) {  // every project's scores, one after another
+  const box = el('div');
+  renderScores([p], box);
+  $('#scores').append(box);
+}
+renderDuels(shared.duels, $('#duel-list'));
+"""
+# The replay: the chat up to the timeline's point, played at the chosen speed (long pauses shortened)
+REPLAY_JS = r"""
+const msgs = shared.msgs, log = $('#log'), at = $('#at');
+let count = 0, timer = null;
+const seconds = ts => Date.parse(String(ts).replace(' ', 'T')) / 1000;
+function show(k) {  // the chat up to message k
+  if (k < count) while (log.children.length > k) log.lastChild.remove();
+  else log.append(...msgs.slice(count, k).map(message));
+  count = k;
+  at.value = k;
+  $('#clock').textContent = (k ? String(msgs[k - 1][4]).slice(0, 16) : 'the start') + ' · ' + k + ' of ' + msgs.length;
+  log.scrollTop = log.scrollHeight;
+}
+function pause() { clearTimeout(timer); timer = null; $('#play').textContent = 'Play'; }
+function step() {
+  if (count >= msgs.length) return pause();
+  show(count + 1);
+  const gap = count < msgs.length ? seconds(msgs[count][4]) - seconds(msgs[count - 1][4]) : 0;
+  timer = setTimeout(step, Math.min(1500, Math.max(60, (gap || 0) * 1000 / Number($('#speed').value))));
+}
+$('#play').addEventListener('click', () => {
+  if (timer) return pause();
+  if (count >= msgs.length) show(0);
+  $('#play').textContent = 'Pause';
+  step();
+});
+at.max = msgs.length;
+at.addEventListener('input', () => { pause(); show(Number(at.value)); });
+show(msgs.length);
+tabs('chat');
+renderBoard(shared.tasks, shared.done, $('#tasks'));
+"""
+EXPORT_BODY = {
+    "replay": """<header><h1>Agon replay</h1><span id="when" class="small grow"></span>
+<button type="button" id="play">Play</button><select id="speed" aria-label="Speed"><option value="10">10×</option>
+<option value="60" selected>60×</option><option value="600">600×</option></select></header>
+<div id="timeline"><input type="range" id="at" min="0" value="0" aria-label="Where in the chat">
+<span id="clock" class="small"></span></div>
+<nav id="tabs"><button type="button" class="main" data-panel="chat">Chat</button>
+<button type="button" data-panel="board">Board</button><button type="button" data-panel="duels">Duels</button>
+<button type="button" data-panel="score">Score</button></nav>
+<main><section id="chat" class="panel"><div id="log"></div></section>
+<section id="board" class="panel side"><h2>The board at export</h2><div id="tasks"></div></section>
+<section id="duels" class="panel side"><h2>Duels</h2><div id="duel-list"></div></section>
+<section id="score" class="panel side"><div id="scores"></div></section></main>""",
+    "scorecard": """<header><h1>Agon scorecard</h1><span id="when" class="small grow"></span></header>
+<main><section id="score" class="panel"><div id="scores"></div><h2>Duels</h2><div id="duel-list"></div></section></main>""",
+}
+
+
+def csp_hash(text):
+    return "'sha256-" + base64.b64encode(hashlib.sha256(text.encode()).digest()).decode() + "'"
+
+
+def data_block(data):
+    """`data` as the text of a <script type="application/json">: nothing in it ends the element or starts a comment."""
+    text = json.dumps(data, ensure_ascii=False)
+    for char, escape in (("&", "\\u0026"), ("<", "\\u003c"), (">", "\\u003e"), (" ", "\\u2028"),
+                         (" ", "\\u2029")):
+        text = text.replace(char, escape)
+    return text
+
+
+def masked(value, counts, home):
+    """`value` (JSON data) with what looks private masked in every string: keys and tokens in known formats, e-mail
+    addresses, and paths into the home folder (`home`, a pattern) as ~. `counts` adds up what was masked."""
+    if isinstance(value, str):
+        value, n = KEYS.subn("[key hidden]", value)
+        counts[0] += n
+        value, n = EMAILS.subn("[e-mail hidden]", value)
+        counts[1] += n
+        if home:
+            value, n = home.subn("~", value)
+            counts[2] += n
+        return value
+    if isinstance(value, (list, tuple)):  # the chat's rows come from SQLite as tuples
+        return [masked(item, counts, home) for item in value]
+    if isinstance(value, dict):
+        return {key: masked(item, counts, home) for key, item in value.items()}
+    return value
+
+
+def home_folder():
+    """A pattern for the home folder's path in either slash, a whole folder name only (/home/me, not /home/meg), or
+    None when the home folder is a drive or the root."""
+    home = Path.home()
+    if len(home.parts) < 2:
+        return None
+    forms = dict.fromkeys((str(home), home.as_posix()))
+    return re.compile(rf"(?<![\w.-])(?:{'|'.join(map(re.escape, forms))})(?![\w-]|\.[\w-])",
+                      re.I if os.name == "nt" else 0)
+
+
+def export(kind, project=None, redact=True):
+    """A replay or a scorecard, as (the file's name, its HTML, what the human reads: what's in it, what was masked).
+    `project` (a folder) keeps a scorecard to that project."""
+    now = time.time()
+    if kind == "replay":
+        rows = db().execute("SELECT * FROM (SELECT id, sender, rcpt, text, ts FROM msgs ORDER BY id DESC LIMIT ?) ORDER"
+                            " BY id", (EXPORT_MAX,)).fetchall()
+        state = arena_state(now)
+        data = {"kind": kind, "at": now, "msgs": rows, "older": max(0, db().execute(
+            "SELECT COUNT(*) FROM msgs").fetchone()[0] - len(rows)), "tasks": state["tasks"], "done": state["done"],
+                "duels": duels_state(50), "score": scoreboard(None)}
+        what = f"A replay of {len(rows):,} messages, with the board, the duels and the score."
+    else:
+        if project and not os.path.isdir(project):
+            raise ToolError(f"{project} isn't a folder: give a project's folder, or no --project for every project.")
+        top = toplevel(project) if project else None
+        data = {"kind": kind, "at": now, "older": 0,
+                "score": [p for p in scoreboard(None) if top in (None, p["project"])],
+                "duels": [d for d in duels_state(50) if top in (None, d["project"])]}
+        what = f"A scorecard of {top or 'every project'}: " + ("the score and the duels." if data["score"] or data[
+            "duels"] else "Agon has no scores or duels for it yet.")
+    counts = [0, 0, 0]  # keys, e-mail addresses, paths into the home folder
+    if redact:
+        data = masked(data, counts, home_folder())
+    data["masked"] = sum(counts) if redact else None
+    style, script = ARENA_STYLE + EXPORT_STYLE, ARENA_RENDER + EXPORT_JS + (REPLAY_JS if kind == "replay" else "")
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
+    html = (f'<!doctype html>\n<html lang="en"><head><meta http-equiv="Content-Security-Policy" content="default-src'
+            f" 'none'; script-src {csp_hash(script)}; style-src {csp_hash(style)}; img-src data:; base-uri 'none';"
+            f""" form-action 'none'"><meta charset="utf-8"><meta name="viewport" content="width=device-width,"""
+            f""" initial-scale=1"><title>Agon {kind}, {stamp}</title><style>{style}</style></head>"""
+            f"""<body class="export {kind}">{EXPORT_BODY[kind]}<script type="application/json" id="data">"""
+            f"{data_block(data)}</script><script>{script}</script></body></html>\n")
+    name = f"agon-{kind}-{time.strftime('%Y%m%d-%H%M%S', time.localtime(now))}.html"
+    if not redact:
+        hidden = "Nothing is masked (--no-redact): keys, e-mail addresses and your home folder stay as they were."
+    elif data["masked"]:
+        hidden = "Agon masked what looked private: " + listed([f"{n} {words[n != 1]}" for n, words in zip(counts, MASKS)
+                                                               if n]) + "."
+    else:
+        hidden = "Agon found nothing to mask: no keys, e-mail addresses or paths into your home folder."
+    return name, html, (f"{what} It may contain code, file paths and whatever the agents wrote: check it before you"
+                        f" share it. {hidden}")
 
 
 HEARTBEAT = 15  # seconds between the comments that keep an event stream open (proxies and phones drop quiet ones)
@@ -4759,8 +4967,8 @@ class Web(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
         except Exception:
             body = None
-        handler = {"/msgs": self.say, "/duel": self.duel, "/duel/pick": self.pick, "/duel/stop": self.stop}.get(
-            urlsplit(self.path).path)
+        handler = {"/msgs": self.say, "/duel": self.duel, "/duel/pick": self.pick, "/duel/stop": self.stop,
+                   "/export": self.export}.get(urlsplit(self.path).path)
         if handler is None:
             return self.answer(404, "Nothing here.")
         handler(body if isinstance(body, dict) else {})
@@ -4788,6 +4996,14 @@ class Web(BaseHTTPRequestHandler):
     def stop(self, body):
         """POST /duel/stop: the human stops a running duel, as {"duel": 3}."""
         self.act(lambda: {"text": stop_duel(duel_number(body))})
+
+    def export(self, body):
+        """POST /export: a replay or a scorecard to download, as {"kind": "replay"}, always masked (see export()):
+        {"name": its file name, "html": the file, "said": what the human reads}."""
+        if body.get("kind") not in ("replay", "scorecard"):
+            return self.answer(400, 'Send JSON like {"kind": "replay"} or {"kind": "scorecard"}.')
+        name, html, said = export(body["kind"])
+        self.json({"name": name, "html": html, "said": said})
 
     def act(self, do):
         """Answer with what do() returns, as JSON, or with why Agon did nothing."""
@@ -5086,6 +5302,24 @@ def main(argv):
         except (ToolError, OSError, UnicodeDecodeError) as e:
             print(f"agon say: {e}", file=sys.stderr)
             return 1
+    elif argv[:1] == ["export"]:
+        cli = Args(prog="agon.py export", description="A replay (the chat on a timeline, with the board, the duels and"
+                   " the score) or a scorecard (the score and the duels), as one HTML file that loads nothing. It may"
+                   " contain code, file paths and whatever the agents wrote: Agon masks keys and tokens in known"
+                   " formats, e-mail addresses and your home folder's path, and says how many.")
+        cli.add_argument("kind", choices=("replay", "scorecard"))
+        cli.add_argument("-o", "--output", metavar="FILE", help="the file to write (default: agon-KIND-DATE.html here)")
+        cli.add_argument("--project", metavar="FOLDER", help="a scorecard of this project only")
+        cli.add_argument("--no-redact", action="store_true", help="mask nothing: keys, e-mail addresses and your home"
+                         " folder stay as they are")
+        args = cli.parse_args(argv[1:])
+        try:
+            name, html, said = export(args.kind, args.project, not args.no_redact)
+            Path(args.output or name).write_bytes(html.encode("utf-8"))  # bytes: a script's text must stay as hashed
+        except (ToolError, OSError) as e:
+            print(f"agon export: {e}", file=sys.stderr)
+            return 1
+        print(f"Saved {args.output or name}. {said}")
     elif argv[:1] == ["statusline"]:
         cli = Args(prog="agon.py statusline", description="Claude Code's status line command: prints the model, the"
                    " folder, the context and the plan's usage, and keeps only the plan's usage (the percentage of each"

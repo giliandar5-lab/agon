@@ -1,7 +1,9 @@
 """Self-check: python test_agon.py  (runs three fake agents against a temporary database)"""
+import base64
 import contextlib
 import datetime
 import faulthandler
+import hashlib
 import http.client
 import io
 import json
@@ -4158,6 +4160,102 @@ assert hints[".ts"] == {"kind": ".ts", "best": None, "agents": [{"name": "claude
 assert agon.kind_of("docs\\Guide.MD") == ".md" and agon.kind_of("Dockerfile") == "Dockerfile" and agon.kind_of(
     ".gitignore") == ".gitignore"
 assert agon.arena_state()["score"] == agon.scoreboard()
+
+# Export: a replay (the chat on a timeline, the board, the duels, the score) or a scorecard (the score and the duels) as
+# one HTML file that loads nothing: its Content-Security-Policy comes first and allows only its own script and style, by
+# their hashes; its data is a JSON block that nothing in the chat can end. Keys and tokens in known formats, e-mail
+# addresses and the home folder's path are masked and counted, unless the human says otherwise (--no-redact)
+home = Path(TMP, "home", "me")
+secrets_ = {"sk-ant-api03-" + "A1b2" * 10: "anthropic", "sk-proj-" + "Zx9_" * 8: "openai", "AIza" + "B" * 35: "google",
+            "ghp_" + "c" * 36: "github", "github_pat_" + "d" * 30: "github", "AKIA" + "E" * 16: "aws",
+            "xoxb-" + "1234567890-abcdef": "slack", "sk_live_" + "f" * 24: "stripe", "hf_" + "g" * 34: "hugging face",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U": "jwt",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAA\n-----END OPENSSH PRIVATE KEY-----": "pem"}
+kept = ("task-1234567890123456789012345 stays", "risk-free-assessment-of-the-whole-thing stays", "agon@localhost stays",
+        str(Path(TMP, "home", "meg", "x.txt")) + " stays")
+tricky = "</script><script>alert(1)</script> <!--     & <b>"
+agon.post("gpt", "all", "keys: " + " ".join(secrets_) + f" mail bob.smith+x@mail.example.co.uk; files {home / 'p' / 'a.py'}"
+          f" and {home.as_posix()}/b.py and {home}; " + " / ".join(kept) + " " + tricky)
+with settings(HOME=str(home), USERPROFILE=str(home)):
+    name, html, said = agon.export("replay")
+    raw_name, raw_html, raw_said = agon.export("replay", redact=False)
+assert re.fullmatch(r"agon-replay-\d{8}-\d{6}\.html", name), name
+assert html.startswith('<!doctype html>\n<html lang="en"><head><meta http-equiv="Content-Security-Policy" content="'
+                       "default-src 'none'; script-src 'sha256-"), html[:200]  # before anything that could load
+csp = re.search(r'Content-Security-Policy" content="([^"]+)"', html)[1]
+style = re.search(r"<style>(.*?)</style>", html, re.S)[1]
+script = re.search(r"<script>(.*?)</script></body>", html, re.S)[1]
+for text, kind in ((script, "script-src"), (style, "style-src")):  # only these run: their hashes are the policy's
+    digest = base64.b64encode(hashlib.sha256(text.encode()).digest()).decode()
+    assert f"{kind} 'sha256-{digest}'" in csp, kind
+block = re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)[1]
+assert html.count("</script>") == 2 and " " not in html and " " not in html  # the chat's text can't end it
+page_only = html.replace(block, "")
+assert not re.search(r"(?i)https?:|//[a-z0-9]|url\(|@import|\bsrc=|\bhref=", page_only), re.search(
+    r"(?i)https?:|//[a-z0-9]|url\(|@import|\bsrc=|\bhref=", page_only)  # it loads nothing from anywhere
+data = json.loads(block)
+last = data["msgs"][-1][3]
+assert data["kind"] == "replay" and data["msgs"][-1][:3] == [agon.newest_id(), "gpt", "all"] and tricky in last, last
+assert not any(secret in last for secret in secrets_) and last.count("[key hidden]") == len(secrets_), last
+assert "[e-mail hidden]" in last and "bob.smith" not in last and all(k in last for k in kept), last
+assert f"files {Path('~', 'p', 'a.py')} and ~/b.py and ~;" in last and not re.search(
+    re.escape(str(home)) + r"(?![\w-])", last), last  # /home/meg isn't /home/me
+assert data["masked"] == len(secrets_) + 4 and said == (
+    f"A replay of {len(data['msgs'])} messages, with the board, the duels and the score. It may contain code, file paths"
+    f" and whatever the agents wrote: check it before you share it. Agon masked what looked private: {len(secrets_)}"
+    " keys, 1 e-mail address and 3 paths into your home folder (now ~)."), (data["masked"], said)
+raw = json.loads(re.search(r'<script type="application/json" id="data">(.*?)</script>', raw_html, re.S)[1])
+assert raw["msgs"][-1][3].startswith("keys: " + " ".join(secrets_)) and raw["masked"] is None and raw_said.endswith(
+    "Nothing is masked (--no-redact): keys, e-mail addresses and your home folder stay as they were."), raw_said
+assert data["tasks"] == agon.arena_state()["tasks"] and data["score"] == agon.scoreboard(None) and [
+    d["id"] for d in data["duels"]] == [d["id"] for d in agon.duels_state(50)]
+# the scorecard: every project, or one (a folder in it will do); a folder that isn't one says so
+(duelrepo / "sub").mkdir()
+name, html, said = agon.export("scorecard", str(duelrepo / "sub"))
+data = json.loads(re.search(r'<script type="application/json" id="data">(.*?)</script>', html, re.S)[1])
+assert name.startswith("agon-scorecard-") and [p["project"] for p in data["score"]] == [here] and {
+    d["project"] for d in data["duels"]} == {here} and "msgs" not in data, data["score"]
+assert said.startswith(f"A scorecard of {here}: the score and the duels. It may contain code"), said
+assert agon.export("scorecard", str(plain))[2].startswith(f"A scorecard of {plain}: Agon has no scores or duels for it"
+                                                          " yet.")
+try:
+    agon.export("scorecard", str(Path(TMP, "no-such-folder")))
+    raise AssertionError("a missing folder")
+except agon.ToolError as e:
+    assert "no-such-folder isn't a folder" in str(e), e
+# python agon.py export writes the file as UTF-8 bytes (a Windows newline would change the script its hash allows)
+out = Path(TMP, "export", "replay.html")
+out.parent.mkdir()
+p = subprocess.run([sys.executable, SERVER, "export", "replay", "-o", str(out)], capture_output=True, text=True,
+                   env=ARENA_DB | {"HOME": str(home), "USERPROFILE": str(home)}, timeout=60)
+assert p.returncode == 0 and p.stdout.startswith(f"Saved {out}. A replay of ") and "Agon masked what looked private: " \
+       in p.stdout and b"\r\n" not in out.read_bytes() and out.read_bytes().startswith(b"<!doctype html>\n"), p
+p = subprocess.run([sys.executable, SERVER, "export", "scorecard", "--no-redact", "-o", str(out.with_name("s.html"))],
+                   capture_output=True, text=True, env=ARENA_DB, timeout=60, cwd=str(out.parent))
+assert p.returncode == 0 and "Nothing is masked (--no-redact)" in p.stdout and out.with_name("s.html").exists(), p
+for args, why in ((["scorecard", "--project", str(Path(TMP, "nope"))], "isn't a folder"),
+                  (["replay", "-o", str(Path(TMP, "no-dir", "x.html"))], "agon export: [Errno 2]"),
+                  (["movie"], "invalid choice: 'movie'")):
+    p = subprocess.run([sys.executable, SERVER, "export", *args], capture_output=True, text=True, env=ARENA_DB,
+                       timeout=60)
+    assert p.returncode != 0 and why in p.stderr, (args, p)
+# In the arena: POST /export from its own page gets the file (always masked) to save, and the page says what's in it
+arena = agon.Arena(("127.0.0.1", 0), agon.Web)
+agon.PORT = arena.server_port
+threading.Thread(target=arena.serve_forever, daemon=True).start()
+with settings(HOME=str(home), USERPROFILE=str(home)):
+    code_, text = arena_post(json.dumps({"kind": "replay"}), path="/export")
+got = json.loads(text)
+assert code_ == 200 and re.fullmatch(r"agon-replay-\d{8}-\d{6}\.html", got["name"]) and got["html"].startswith(
+    "<!doctype html>") and "Agon masked what looked private: " in got["said"] and "[key hidden]" in got["html"], got["said"]
+assert arena_post(json.dumps({"kind": "replay"}), path="/export", origin="http://evil.example")[0] == 403
+assert arena_post(json.dumps({"kind": "movie"}), path="/export") == (
+    400, 'Send JSON like {"kind": "replay"} or {"kind": "scorecard"}.')
+page = arena_get("/")[1]
+for needed in ('id="export-replay"', 'id="export-scorecard"', "exportFile(", "URL.createObjectURL", "confirm('Export"):
+    assert needed in page, needed
+arena.shutdown()
+arena.server_close()
 
 agon.close_db()
 agon.DB = test_db
