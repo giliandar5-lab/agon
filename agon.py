@@ -5378,8 +5378,8 @@ def main(argv):
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
-        for name in ("SIGTERM", "SIGBREAK"):  # like Ctrl+C (SIGBREAK: Ctrl+Break, a closed console on Windows): a
-            if hasattr(signal, name):  # running duel stops its apps and leaves nothing behind
+        for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):  # like Ctrl+C (SIGHUP: its terminal closed; SIGBREAK: Ctrl+Break
+            if hasattr(signal, name):  # on Windows): a running duel stops its apps and leaves nothing behind
                 signal.signal(getattr(signal, name), lambda *_: sys.exit(0))
         return arena()
     return 0

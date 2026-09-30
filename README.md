@@ -492,9 +492,10 @@ tab: the task, the agents, and your project's folder (its git repository).
   is whose: every duelist shows as working until the duel ends, and an error's words name no agent. Pick the winner:
   the arena shows whose each entry was, and the chat says how to merge it (`git merge agon/duel-3-a`) and drop the
   others (`git branch -D ...`). Agon never merges. Code style may still give an agent away.
-- **Stop:** the duel's **Stop** button, `STOP`, and closing the arena (Ctrl+C, SIGTERM, or a closed console window on
-  Windows) end its apps with everything they started, and remove its worktrees and branches. If the arena dies (a
-  crash), the next arena start does that cleanup and says so in the chat.
+- **Stop:** the duel's **Stop** button, `STOP`, and closing the arena (Ctrl+C, Ctrl+Break, SIGTERM, or its terminal
+  closing on macOS and Linux) end its apps with everything they started, and remove its worktrees and branches. If the
+  arena dies at once instead (a crash, or its console window closed on Windows, where the apps end with it), the next
+  arena start removes what the duel left and says so in the chat.
 
 ## Scoreboard
 

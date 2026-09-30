@@ -4073,8 +4073,8 @@ with duel_env(AGON_TEST_CMD=GREP, AGON_PROJECT=str(duelrepo)):
         assert needed in page, needed
 arena.shutdown()
 arena.server_close()
-if os.name != "nt":  # SIGTERM ends `python agon.py` like Ctrl+C: its running duel stops and leaves nothing behind
-    free = socket.socket()
+for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHUP: its terminal closed) ends
+    free = socket.socket()  # `python agon.py` like Ctrl+C: its running duel stops and leaves nothing behind
     free.bind(("127.0.0.1", 0))
     agon.PORT = free.getsockname()[1]
     free.close()
@@ -4089,17 +4089,17 @@ if os.name != "nt":  # SIGTERM ends `python agon.py` like Ctrl+C: its running du
                                  path="/duel")
         duel = json.loads(text)["duel"]
         until(lambda: all(e["state"] == "working" for e in agon.entries_of(duel)) and beating(), 30)
-        server.send_signal(signal.SIGTERM)
+        server.send_signal(sig)
         out, err = server.communicate(timeout=90)
     finally:
         if server.poll() is None:
             server.kill()
             server.communicate()
     assert server.returncode == 0 and "agon: the duel stops: its apps end, and its worktrees and branches go" in err, (
-        server.returncode, out, err)
-    assert duel_of(duel)["state"] == "stopped" and duel_of(duel)["note"] == "the arena closed" and not beating()
-    assert not [b for b in duel_branches() if b.startswith(f"agon/duel-{duel}-")]
-    assert git_in(duelrepo, "worktree", "list", "--porcelain").count("worktree ") == 1
+        sig, server.returncode, out, err)
+    assert duel_of(duel)["state"] == "stopped" and duel_of(duel)["note"] == "the arena closed" and not beating(), sig
+    assert not [b for b in duel_branches() if b.startswith(f"agon/duel-{duel}-")], sig
+    assert git_in(duelrepo, "worktree", "list", "--porcelain").count("worktree ") == 1, sig
 
 # The scoreboard, per project: for each agent the duels it won of the picked ones it worked in, the runs of the human's
 # tests on its work that passed, and its work that reviewers approved (and how much at the first review). A duel counts
