@@ -7,6 +7,8 @@ python agon.py setup         prints how to connect Claude Code, Codex and Antigr
 python agon.py autopilot     wakes the agents when messages come for them, with no app open (--help for options)
 python agon.py stats         what autopilot's wakes took: per agent and per completed task
 python agon.py statusline    Claude Code's status line: keeps the plan's usage for the arena, prints a usual line
+python agon.py watch         the team's chat in the terminal, live
+python agon.py say TEXT      post as the human from a terminal (--to NAME; - reads stdin, --file PATH a file)
 python agon.py               browser arena at http://127.0.0.1:8765
 """
 import argparse
@@ -4035,6 +4037,82 @@ class Web(BaseHTTPRequestHandler):
         pass
 
 
+SENDER_COLORS = {"claude": "33", "gpt": "32", "gemini": "94", "human": "1", "agon": "2"}  # others: cyan
+
+
+def windows_colors():
+    """Windows: turn on the console's virtual-terminal processing, which colors need (Python doesn't for a script).
+    False when stdout isn't a console, or when this Windows can't."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle, mode = k32.GetStdHandle(-11 & 0xFFFFFFFF), wintypes.DWORD()  # STD_OUTPUT_HANDLE
+        # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(k32.GetConsoleMode(handle, ctypes.byref(mode)) and k32.SetConsoleMode(handle, mode.value | 0x0005))
+    except Exception:  # no ctypes, not Windows...
+        return False
+
+
+def colors(stream):
+    """Whether `python agon.py watch` colors what it prints: never with NO_COLOR (set and not empty: no-color.org), which comes before
+    FORCE_COLOR (as in Python itself), always with FORCE_COLOR; else on a terminal that shows colors."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    if os.environ.get("TERM") == "dumb" or not stream.isatty():
+        return False
+    return os.name != "nt" or windows_colors()
+
+
+def watch_line(row, color):
+    """One message as `python agon.py watch` prints it: its time, id, sender and recipient, then its text, every further line indented.
+    Only plain text reaches the terminal: an agent's escape sequences could retitle it or write the clipboard."""
+    i, sender, rcpt, text, ts = row
+    head = f"{str(ts)[11:16]} #{i} {plain(str(sender))} → {plain(str(rcpt))}:"
+    if color:
+        head = f"\x1b[{SENDER_COLORS.get(sender, '36')}m{head}\x1b[0m"
+    return head + " " + "\n    ".join(plain(str(text)).splitlines() or [""]) + "\n"
+
+
+def chat_feed(out=None, show=20):
+    """`python agon.py watch`: the team's chat in the terminal: the last `show` messages, then each one as it comes,
+    until Ctrl+C."""
+    out = out or sys.stdout
+    if hasattr(out, "reconfigure"):  # a file or a pipe gets UTF-8, where Windows would use the ANSI code page
+        out.reconfigure(errors="replace", **({} if out.isatty() else {"encoding": "utf-8"}))
+    color, since = colors(out), max(0, newest_id() - show)
+    while True:
+        version = data_version()
+        rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id LIMIT 500",
+                            (since,)).fetchall()
+        for row in rows:
+            out.write(watch_line(row, color))
+            since = row[0]
+        out.flush()
+        if not rows:
+            wait_for_change(version, 3600)
+
+
+def human_says(to, text):
+    """`python agon.py say`: the human's message from a terminal, checked as the arena checks it. STOP pauses the team, and
+    the next message resumes it. Returns what to print; a ToolError says why nothing was sent."""
+    if not isinstance(text, str) or not text.strip():
+        raise ToolError("Nothing sent: give the text (or - to read it from stdin, --file to read a file).")
+    if problem := bad_recipient(to) or too_long(text):
+        raise ToolError(f"Nothing sent: {problem}")
+    was = paused()
+    post("human", to.strip(), text)
+    if text.strip() == "STOP":
+        return "Sent: the team is paused until your next message."
+    return "Sent: the team goes on." if was else "Sent."
+
+
 def command_line(args):
     """`args` quoted for a terminal on this system (PowerShell and cmd take Windows quoting)."""
     return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
@@ -4203,6 +4281,30 @@ def main(argv):
         return autopilot(args.agents, args.lead, args.project)
     elif argv == ["stats"]:
         stats()
+    elif argv[:1] == ["watch"]:
+        Args(prog="agon.py watch", description="The team's chat in the terminal, live: the last 20 messages, then each"
+             " new one, until Ctrl+C. One color per sender on a terminal; NO_COLOR turns them off, FORCE_COLOR on."
+             ).parse_args(argv[1:])
+        chat_feed()
+    elif argv[:1] == ["say"]:
+        cli = Args(prog="agon.py say", description="Post a message to the team as the human, as the arena does: STOP"
+                   " pauses the team, the next message resumes it.")
+        cli.add_argument("--to", default="all", metavar="NAME", help="all (the default) or one agent: claude, gpt, ...")
+        cli.add_argument("--file", metavar="PATH", help="read the text from this file (UTF-8)")
+        cli.add_argument("text", nargs="*", help="the text; - reads it from stdin (UTF-8). PowerShell 5.1, and any call"
+                         " through agon.cmd, drop the quotes inside an argument: use - or --file for such text")
+        args = cli.parse_args(argv[1:])
+        try:
+            if args.file:
+                text = Path(args.file).read_bytes().decode("utf-8-sig")
+            elif args.text == ["-"]:
+                text = sys.stdin.buffer.read().decode("utf-8-sig")
+            else:
+                text = " ".join(args.text)
+            print(human_says(args.to, text))
+        except (ToolError, OSError, UnicodeDecodeError) as e:
+            print(f"agon say: {e}", file=sys.stderr)
+            return 1
     elif argv[:1] == ["statusline"]:
         cli = Args(prog="agon.py statusline", description="Claude Code's status line command: prints the model, the"
                    " folder, the context and the plan's usage, and keeps only the plan's usage (the percentage of each"

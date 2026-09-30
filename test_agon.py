@@ -3592,6 +3592,76 @@ bad_hosts = subprocess.run([sys.executable, SERVER], capture_output=True, text=T
                            env=ARENA_DB | {"AGON_ARENA_HOSTS": "*.ts.net"})
 assert bad_hosts.returncode == 1 and "AGON_ARENA_HOSTS must list exact host names" in bad_hosts.stderr, bad_hosts
 
+
+# The terminal. python agon.py say posts as the human, checked as the arena checks it: the text from its arguments, from
+# stdin (-) or from a file (UTF-8, a BOM dropped), for text PowerShell 5.1 or agon.cmd would mangle. STOP pauses the team
+def say_cli(*args, stdin=b""):  # (exit code, stdout, stderr)
+    p = subprocess.run([sys.executable, SERVER, "say", *args], input=stdin, capture_output=True, env=ARENA_DB, timeout=60)
+    return p.returncode, p.stdout.decode("utf-8"), p.stderr.decode("utf-8")
+
+
+def human_said():
+    return agon.db().execute("SELECT rcpt, text FROM msgs WHERE sender = 'human' ORDER BY id DESC LIMIT 1").fetchone()
+
+
+assert say_cli("hello", "team 🙂") == (0, "Sent.\n", "") and human_said() == ("all", "hello team 🙂")
+assert say_cli("--to", "gpt", "just", "you")[0] == 0 and human_said() == ("gpt", "just you")
+assert say_cli("-", stdin="it's \"quoted\"\nline two ё".encode("utf-8-sig"))[0] == 0
+assert human_said() == ("all", "it's \"quoted\"\nline two ё"), human_said()
+Path(TMP, "say.txt").write_bytes("from a file 🙂\n".encode("utf-8-sig"))
+assert say_cli("--file", str(Path(TMP, "say.txt")))[0] == 0 and human_said() == ("all", "from a file 🙂\n")
+count = agon.newest_id()
+for args, why in (((), "Nothing sent: give the text"), (("   ",), "Nothing sent: give the text"),
+                  (("x" * 8001,), "Nothing sent: The message is 8,001 characters"),
+                  (("--to", "a b", "hi"), "Nothing sent: `to` must be all, human or one agent's name"),
+                  (("--file", str(Path(TMP, "nowhere.txt"))), "agon say: [Errno 2]")):
+    code_, out, err = say_cli(*args)
+    assert code_ == 1 and out == "" and why in err, (args, code_, out, err)
+assert agon.newest_id() == count  # nothing was sent
+assert say_cli("STOP") == (0, "Sent: the team is paused until your next message.\n", "") and agon.paused()
+assert say_cli("go", "on") == (0, "Sent: the team goes on.\n", "") and not agon.paused()
+# python agon.py watch: the last 20 messages, then each one as it comes. One color per sender, on a terminal or with
+# FORCE_COLOR, never with NO_COLOR (it comes first); only plain text: an agent's escape sequences (a new window title, a
+# cleared screen) never reach the terminal; UTF-8 when it prints to a file or a pipe
+for i in range(25):
+    agon.post("gemini", "all", f"filler {i}")
+agon.post("gpt", "all", "tricky \x1b]0;pwned\x07title\x1b[2J and 🙂\nsecond line")
+tricky = agon.newest_id()
+
+
+def watching(**env):  # a running watch and the lines it printed so far, as they come
+    p = subprocess.Popen([sys.executable, SERVER, "watch"], stdout=subprocess.PIPE, env=ARENA_DB | env)
+    lines = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(row.decode("utf-8")) for row in p.stdout], daemon=True).start()
+    return p, lines
+
+
+def upto(lines, text, seconds=15):  # the lines until one with `text`
+    got, end = [], time.monotonic() + seconds
+    while not got or text not in got[-1]:
+        got.append(lines.get(timeout=max(0.1, end - time.monotonic())))
+    return got
+
+
+for env, colored in (({}, False), ({"FORCE_COLOR": "1"}, True), ({"FORCE_COLOR": "1", "NO_COLOR": "1"}, False)):
+    first = agon.newest_id() - 19  # the last 20 messages when it starts
+    watcher, lines = watching(**env)
+    try:
+        history = upto(lines, "tricky")
+        assert f" #{first} gemini " in history[0] and len(history) == tricky - first + 1, history[:2]
+        ts = agon.db().execute("SELECT ts FROM msgs WHERE id = ?", (tricky,)).fetchone()[0][11:16]
+        head = f"{ts} #{tricky} gpt \u2192 all:"
+        assert history[-1] == (f"\x1b[32m{head}\x1b[0m" if colored else head) + " tricky title and 🙂\n", history[-1]
+        assert lines.get(timeout=5) == "    second line\n"
+        agon.post("claude", "gpt", f"live {len(env)}")
+        live = upto(lines, f"live {len(env)}", 10)[-1]
+        assert live.endswith(f"claude \u2192 gpt:{chr(27) + '[0m' if colored else ''} live {len(env)}\n"), live
+        assert ("\x1b[33m" in live) == colored and all("\x1b]" not in row for row in history), live
+    finally:  # else a failed check leaves it running, holding the pipe of whatever runs these tests
+        watcher.terminate()
+        watcher.wait(10)
+        watcher.stdout.close()
+
 agon.close_db()
 agon.DB = test_db
 
