@@ -19,6 +19,7 @@ import json
 import os
 import posixpath
 import queue
+import random
 import re
 import secrets
 import shlex
@@ -1032,46 +1033,52 @@ def verdict(answer):
     return found[-1].lower() if found else None
 
 
-def run_tests(tests, folder, end, stopped):
+CHECKS = {"tests": ("Test results, run by Agon", "AGON_TEST_TIMEOUT"),  # what Agon runs as the human: its title, its
+          "setup": ("Setup, run by Agon", "AGON_SETUP_TIMEOUT")}  # time limit
+
+
+def run_tests(tests, folder, end, stopped, kind="tests", add=None):
     """Run the human's test command, `tests` from test_command(), in `folder` the way ask runs an app: found with
     shutil.which, so that npm finds npm.cmd (a relative path is taken from `folder`), run without a shell, with its
     own stdin and no console window, and stopped with all it started at AGON_TEST_TIMEOUT, at the ask's `end`, when
     stopped() gives a reason, and when it exits. Agon's own settings stay out of its environment, so the tests run as
     in a terminal and never start an ask of their own. Returns (what came of it: tests passed, tests failed, tests
     timed out, tests could not start or NO_TESTS, only from what Agon saw itself; the report that the reviewer and the
-    asker read; why the ask must end now, or None)."""
+    asker read; why the ask must end now, or None). A duel's setup command runs the same way (`kind` setup: setup
+    passed, setup failed...), with `add` in its environment."""
     if tests is None:
         return NO_TESTS, "Test results, run by Agon: none, because the human hasn't set AGON_TEST_CMD.", None
     argv, limit = tests
-    started, head = time.monotonic(), f"Test results, run by Agon: `{command_line(argv)}`"
+    title, var = CHECKS[kind]
+    started, head = time.monotonic(), f"{title}: `{command_line(argv)}`"
     path = os.path.normpath(os.path.join(folder, argv[0])) if os.path.dirname(argv[0]) else argv[0]
     if (program := shutil.which(path)) is None:
-        return "tests could not start", f"{head} could not start: {missing(path)}.", None
+        return f"{kind} could not start", f"{head} could not start: {missing(path)}.", None
     if os.path.normcase(program) != os.path.normcase(argv[0]):  # which one ran: python may be the Microsoft Store stub
         head += f" ({program})"
     if os.name == "nt" and program.lower().endswith((".bat", ".cmd")) and any(set(a) & set('&|<>^%"\r\n')
                                                                                  for a in argv[1:]):
-        return "tests could not start", (  # Windows runs a batch file through cmd.exe, which parses its arguments
+        return f"{kind} could not start", (  # Windows runs a batch file through cmd.exe, which parses its arguments
             f"{head} could not start: {program} is a batch file, so cmd.exe would read &, |, <, >, ^, % and quotes in"
             " its arguments as its own. Put the command in a script, or call the program it starts (such as node)"
             " directly."), None
-    env = environment(("AGON_", "CLAUDE_PLUGIN_OPTION_"))
+    env = environment(("AGON_", "CLAUDE_PLUGIN_OPTION_"), **(add or {}))
     try:
         code, out, _, reason = run_cli([program, *argv[1:]], None, folder, env, min(started + limit, end), stopped,
                                        tests=True)
     except OSError as e:  # not a program this system can start, no permission...
-        return "tests could not start", f"{head} could not start: {e}.", None
+        return f"{kind} could not start", f"{head} could not start: {e}.", None
     spent = took(time.monotonic() - started)
     if code is None and reason:
-        return None, None, f"Agon stopped the tests after {spent}: {reason}."
+        return None, None, f"Agon stopped the {kind} after {spent}: {reason}."
     if code is None and started + limit < end:
-        outcome, how = "tests timed out", f"didn't finish in {took(limit)} (AGON_TEST_TIMEOUT), so Agon stopped it"
+        outcome, how = f"{kind} timed out", f"didn't finish in {took(limit)} ({var}), so Agon stopped it"
     elif code is None:
-        outcome, how = "tests timed out", f"ran {spent} until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it"
+        outcome, how = f"{kind} timed out", f"ran {spent} until the ask's time was up (AGON_ASK_TIMEOUT); Agon stopped it"
     elif code:
-        outcome, how = "tests failed", f"failed with exit code {code} after {spent}"
+        outcome, how = f"{kind} failed", f"failed with exit code {code} after {spent}"
     else:
-        outcome, how = "tests passed", f"passed (exit code 0) in {spent}"
+        outcome, how = f"{kind} passed", f"passed (exit code 0) in {spent}"
     if not (output := "\n".join("    " + row for row in out.strip().splitlines())):
         return outcome, f"{head} {how}. It printed nothing.", None
     if len(output) > TEST_TAIL:  # its end, cut after the indents so that short lines can't make it longer
@@ -1174,11 +1181,11 @@ def repath(text, olds, new):
                   flags=re.I if os.name == "nt" else 0)
 
 
-def new_worktree(top, name):
-    """A new branch for agent `name`'s task at the last commit, checked out in a temporary git worktree: (the
-    worktree's folder, the branch, the commit it starts from)."""
-    base = git(top, "rev-parse", "HEAD")
-    branch = f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
+def new_worktree(top, name, branch=None, base=None):
+    """A new branch for agent `name`'s task at the last commit (or at `base`), checked out in a temporary git worktree:
+    (the worktree's folder, the branch, the commit it starts from)."""
+    base = base or git(top, "rev-parse", "HEAD")
+    branch = branch or f"agon/{name}-{time.strftime('%Y%m%d-%H%M%S')}"
     taken = git(top, "branch", "--list", "--format=%(refname:short)", f"{branch}*").splitlines()
     branch = next(b for b in (branch, *(f"{branch}-{i}" for i in range(2, 1000))) if b not in taken)
     path = tempfile.mkdtemp(prefix=f"agon-{name}-")
@@ -3334,12 +3341,10 @@ def team_state(now):
             "SELECT COALESCE(answered, agent), asker, mode, task, started FROM asks WHERE ended IS NULL AND started > ?"
             " ORDER BY id", (now - ASK_STALE,)):
         asks.setdefault(worker, (asker, mode, task, started))
-    duels = {}  # an agent that works in a running duel: its entry's app, or the review it was asked for
-    for duel, agent, reviewer, state, since in con.execute(
-            "SELECT duel, agent, reviewer, entries.state, COALESCE(entries.started, duels.started) FROM entries JOIN"
-            " duels ON duels.id = entries.duel WHERE duels.state = 'running' AND entries.state IN ('working',"
-            " 'reviewing')"):
-        duels.setdefault(reviewer if state == "reviewing" else agent, (duel, since))
+    duels = {}  # a duelist works until the duel ends: when its entry is done would tell whose entry is whose
+    for duel, agent, since in con.execute("SELECT duel, agent, duels.started FROM entries JOIN duels ON duels.id ="
+                                          " entries.duel WHERE duels.state = 'running'"):
+        duels.setdefault(agent, (duel, since))
     live = {}
     for agent, busy in con.execute("SELECT agent, busy FROM live WHERE beat > ?", (now - LIVE,)):
         live[agent] = max(live.get(agent, 0), busy)
@@ -3394,7 +3399,8 @@ def team_state(now):
 
 def arena_state(now=None):
     """What the arena shows, as JSON: whether the team is paused, autopilot, the roster (see team_state()), the open
-    tasks and the latest done ones (without their long texts: GET /board?id=N has one in full), and the latest asks."""
+    tasks and the latest done ones (without their long texts: GET /board?id=N has one in full), the latest asks, the
+    latest duels (GET /board?duel=N has one in full), the commands a duel runs and the folder its form starts with."""
     now = now or time.time()
     everything = board_tasks()
     states = {t["id"]: t["state"] for t in everything}
@@ -3409,8 +3415,10 @@ def arena_state(now=None):
                        " FROM asks ORDER BY id DESC LIMIT 20")
     names = [column[0] for column in cur.description]
     asks = [dict(zip(names, row)) | {"problem": row[-1] and clip(row[-1], 300)} for row in cur]
-    return {"now": now, "paused": paused(), "autopilot": autopilot_state(now), "team": team_state(now), "tasks": tasks,
-            "done": len(done), "asks": asks}
+    auto = autopilot_state(now)
+    return {"now": now, "paused": paused(), "autopilot": auto, "team": team_state(now), "tasks": tasks,
+            "done": len(done), "asks": asks, "duels": duels_state(), "checks": checks_state(),
+            "project": default_project(auto)}
 
 
 def task_state(tid):
@@ -3419,6 +3427,497 @@ def task_state(tid):
     t["reviews"] = [dict(zip(("reviewer", "verdict", "tests", "at"), row)) for row in db().execute(
         "SELECT reviewer, verdict, tests, at FROM reviews WHERE task = ? ORDER BY id", (tid,))]
     return t
+
+
+# Duels: the same task for two or three agents, each on a branch of its own from one commit, in a temporary git worktree
+# (the project's own folder and its test runs stay untouched). Agon runs the human's setup command in each worktree and
+# the tests on each entry and on the commit they all start from (the baseline), one run at a time; then another
+# duelist's company reviews each entry, read-only. The entries are A, B and C, in a random order, and whose is whose
+# stays hidden until the human picks the winner. Agon shows how to merge it, and never merges
+SETUP_TIMEOUT = 600  # seconds a duel's setup command may take in each worktree (AGON_SETUP_TIMEOUT)
+DUEL = """The human asks you to do a task through Agon, where AI agents from different companies build one project.
+You work in a git worktree of your own. When you finish, Agon {tests}commits what you changed to branch {branch}, and
+the human decides whether to merge it: don't commit yourself, and don't use Agon's tools (send, inbox, board, ask).
+End with a short summary of what you changed.
+
+The task:
+{prompt}"""
+DUEL_REVIEW = """The human asks you for a code review through Agon, where AI agents from different companies build one project.
+Review only: don't change any files.{copy} An agent did the task below in this folder, a git worktree: its work is the
+commit on top of {base} (git diff {base} HEAD shows it). Don't run the tests: Agon ran them on the work and on {base},
+before it, and their results are below. Approve only if the work does the task well: tests that fail or don't finish
+mean changes, unless they failed on {base} too and the task didn't ask to fix them. If no tests ran (they couldn't
+start, or the human hasn't set a test command), or their output shows that none ran, say so and review by reading the
+code. The tests can be changed too: look at changes to tests and their settings with extra care. Your final message is
+the answer; don't use Agon's tools (send, inbox, board, ask).
+End it with one line: VERDICT: approve, or VERDICT: changes.
+
+{tests}
+
+The task:
+{prompt}"""
+LABELS = "abc"
+IDENTITY = {"claude": ("claude code", "claude", "anthropic"), "gpt": ("gpt", "codex", "openai"),  # what names an
+            "gemini": ("gemini", "antigravity", "agy", "google")}  # entry's agent in its errors while the duel is blind
+DUELS = {}  # duel id -> the thread that runs it, in this arena: the only one (it holds the port)
+DUEL_STOPS = {}  # duel id -> why the human stopped it
+CHECKS_LOCK = threading.Lock()  # a duel's setup and test runs go one at a time: they may share ports, files, a database
+SETTLED = ("done", "failed", "setup failed")  # an entry that ended on its own
+
+
+class Stopped(Exception):
+    """A duel that must stop now: STOP, the human's stop, the arena closing."""
+
+
+def setup_command():
+    """The human's setup command for a duel's worktrees, which have only what git tracks (no node_modules, .venv or
+    .env): AGON_SETUP_CMD, as (its arguments, the seconds it may take: AGON_SETUP_TIMEOUT, 600), or None. Like
+    AGON_TEST_CMD, from the environment only, never from a tool's arguments or the arena, and run the same way (see
+    run_tests()), with AGON_ROOT, the project's own folder, to copy an .env from."""
+    raw = os.environ.get("AGON_SETUP_CMD", "").strip()
+    return (split_command(raw, "AGON_SETUP_CMD", ["npm", "ci"]), seconds("AGON_SETUP_TIMEOUT", SETUP_TIMEOUT)) if raw \
+        else None
+
+
+def listed(words):
+    """claude, gpt and gemini."""
+    return " and ".join(filter(None, [", ".join(words[:-1]), words[-1]]))
+
+
+def cannot_run(agent, now):
+    """Why agent `agent`'s app can't work for a duel now, or None: out of quota, not found, or barred (see barred())."""
+    if until := quota_until(agent):
+        return f"Can't run {agent} now: it is out of quota until ~{reset_clock(until, now)}"
+    try:
+        ask_command(agent, "task", "", "")
+    except ToolError as e:
+        return str(e).rstrip(".")
+    return barred(agent)
+
+
+def compared(baseline, tests):
+    """What an entry's tests showed, next to the same tests on the commit the duel started from."""
+    both = baseline, tests
+    if both == ("tests passed", "tests failed"):
+        return "tests failed: they passed before it"
+    if both == ("tests failed", "tests passed"):
+        return "tests passed: they failed before it"
+    if both == ("tests failed", "tests failed"):
+        return "tests failed, as before it"
+    return tests or ""
+
+
+def entries_of(duel):
+    """A duel's entries, as dicts, in label order."""
+    cur = db().execute("SELECT * FROM entries WHERE duel = ? ORDER BY label", (duel,))
+    names = [column[0] for column in cur.description]
+    return [dict(zip(names, row)) for row in cur]
+
+
+def enter(duel, label, **fields):
+    """Record what happened to entry `label` of duel `duel`."""
+    db().execute(f"UPDATE entries SET {', '.join(f'{key} = ?' for key in fields)} WHERE duel = ? AND label = ?",
+                 (*fields.values(), duel, label))
+
+
+def end_duel(duel, state, note=""):
+    db().execute("UPDATE duels SET state = ?, ended = ?, note = ? WHERE id = ?", (state, time.time(), note, duel))
+
+
+def start_duel(prompt, agents, folder):
+    """A duel the human starts in the arena: `prompt` for `agents` (two or three of claude, gpt and gemini), in the git
+    repository of `folder`, from its last commit; one duel at a time. An agent that can't work now stays out, if two
+    can. Checked here, then run in a thread of its own (see run_duel()); returns its id. The agents' tools can't start
+    one: they stay four."""
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ToolError("Nothing started: give the task.")
+    if problem := too_long(prompt, "task"):
+        raise ToolError(f"Nothing started: {problem}")
+    if not isinstance(agents, list) or not all(isinstance(agent, str) for agent in agents):
+        agents = []
+    agents = list(dict.fromkeys(agent.strip() for agent in agents))
+    if not 2 <= len(agents) <= 3 or any(agent not in COMMANDS for agent in agents):
+        raise ToolError("Nothing started: a duel is between two or three of claude, gpt and gemini.")
+    folder = folder.strip() if isinstance(folder, str) else ""
+    if not os.path.isabs(folder) or not os.path.isdir(folder):
+        raise ToolError("Nothing started: the project folder must be the full path of a folder.")
+    if paused():
+        raise ToolError(f"Nothing started: {PAUSED}")
+    try:
+        top = os.path.normpath(repository(folder))
+    except ToolError as e:
+        raise ToolError(f"Nothing started: the entries start from your last commit, and {e}.") from None
+    test_command(), setup_command()  # a bad setting stops it before anything runs
+    now = time.time()
+    out = {agent: why for agent in agents if (why := cannot_run(agent, now))}
+    agents = [agent for agent in agents if agent not in out]
+    if len(agents) < 2:
+        raise ToolError(f"Nothing started: a duel needs two agents that can work now. {'. '.join(out.values())}.")
+    base = git(top, "rev-parse", "HEAD")
+    labels = random.sample(LABELS[:len(agents)], len(agents))  # A isn't the first one ticked: the order tells nothing
+    with transaction() as con:
+        if row := con.execute("SELECT id FROM duels WHERE state = 'running'").fetchone():
+            raise ToolError(f"Nothing started: duel #{row[0]} still runs, and duels go one at a time.")
+        duel = con.execute("INSERT INTO duels(project, prompt, base, started) VALUES (?, ?, ?, ?)",
+                           (top, prompt, base, now)).lastrowid
+        con.executemany("INSERT INTO entries(duel, label, agent) VALUES (?, ?, ?)",
+                        [(duel, label, agent) for label, agent in zip(labels, agents)])
+    post("agon", "human", f"Duel #{duel} started: {listed(agents)} do the same task, each on a branch of its own from"
+                          f" {base[:7]}" + (" (without your uncommitted changes)" if git(top, "status", "--porcelain")
+                                            else "") + f", as entries {listed(sorted(LABELS[:len(agents)].upper()))};"
+                          " whose is whose stays hidden until you pick the winner."
+                          + (f" Left out: {'. '.join(out.values())}." if out else ""))
+    DUELS[duel] = threading.Thread(target=run_duel, args=(duel,), name=f"duel-{duel}", daemon=True)
+    DUELS[duel].start()
+    return duel
+
+
+def together(threads):
+    """Start `threads` and wait for them all."""
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+def run_duel(duel):
+    """A duel's thread, from start_duel(). One at a time: each entry's worktree (git locks the repository's shared files)
+    and the baseline's, then the setup command in each. Then the agents, all at once, headless as ask runs a task, while
+    the tests run on the baseline; each entry's tests once its agent is done, one run at a time, and its commit, by
+    "Agon duel A". Then the reviews, all at once. The worktrees go; the branches with work wait for the human's pick.
+    STOP, the human's stop and the arena closing stop it with its apps, and a stopped duel leaves nothing behind."""
+    trees, top = {}, None  # trees: an entry's label, or base -> its worktree
+    try:
+        top, prompt, base = db().execute("SELECT project, prompt, base FROM duels WHERE id = ?", (duel,)).fetchone()
+        tests, setup, limit = test_command(), setup_command(), seconds("AGON_ASK_TIMEOUT", ASK_TIMEOUT)
+
+        def halt():  # why the duel's apps must stop now, if they must
+            if ARENA_CLOSING.is_set():
+                return "the arena closed"
+            if why := DUEL_STOPS.get(duel):
+                return why
+            if paused():
+                return "the human paused the team"
+
+        labels = [e["label"] for e in entries_of(duel)]
+        for label in labels:
+            trees[label], branch, _ = new_worktree(top, f"duel-{duel}{label}", f"agon/duel-{duel}-{label}", base)
+            enter(duel, label, branch=branch)
+        if tests:  # the commit they all start from, for the baseline's run
+            trees["base"] = tempfile.mkdtemp(prefix=f"agon-duel-{duel}-base-")
+            git(top, "worktree", "add", "-q", "--detach", trees["base"], base)
+        for label in [*(["base"] if tests else []), *labels] if setup else []:
+            if why := halt():
+                raise Stopped(why)
+            if label != "base":
+                enter(duel, label, state="setup")
+            with CHECKS_LOCK:
+                outcome, report, problem = run_tests(setup, trees[label], time.monotonic() + setup[1] + 60, halt,
+                                                     "setup", {"AGON_ROOT": top})
+            if problem:
+                raise Stopped(problem)
+            if label == "base":
+                if outcome != "setup passed":  # then no tests run there: the setup's report says why
+                    db().execute("UPDATE duels SET baseline = ?, report = ? WHERE id = ?", (outcome, report, duel))
+            elif outcome == "setup passed":
+                enter(duel, label, state="waiting")
+            else:
+                enter(duel, label, state="setup failed", tests=outcome, report=report)
+        ready = [e for e in entries_of(duel) if e["state"] == "waiting"]
+        if not ready:
+            raise ToolError("the setup command (AGON_SETUP_CMD) failed in every worktree: each entry shows how")
+        workers = [threading.Thread(target=duel_entry, args=(duel, e, trees[e["label"]], base, prompt, tests, limit,
+                                                              halt)) for e in ready]
+        if tests and not db().execute("SELECT baseline FROM duels WHERE id = ?", (duel,)).fetchone()[0]:
+            workers.append(threading.Thread(target=duel_baseline, args=(duel, trees["base"], tests, halt)))
+        together(workers)
+        if why := halt():
+            raise Stopped(why)
+        baseline, entries, reviews = db().execute("SELECT baseline, report FROM duels WHERE id = ?",
+                                                  (duel,)).fetchone(), entries_of(duel), []
+        for i, e in enumerate(entries):
+            if e["state"] != "done" or not e["stat"]:
+                continue
+            # the next duelist reviews it, in label order (A by B, B by C, C by A), or the one after when it can't
+            others = [entries[(i + k) % len(entries)]["agent"] for k in range(1, len(entries))]
+            if reviewer := next((agent for agent in others if not cannot_run(agent, time.time())), None):
+                reviews.append(threading.Thread(target=duel_review, args=(duel, e, reviewer, trees[e["label"]], base,
+                                                                           prompt, baseline, tests, limit, halt)))
+            else:
+                enter(duel, e["label"], problem="No other duelist could review it: out of quota, or unable to run.")
+        together(reviews)
+        if why := halt():
+            raise Stopped(why)
+        entries = entries_of(duel)
+        if not any(e["stat"] for e in entries):
+            raise ToolError("no entry changed any file")
+        end_duel(duel, "ready")
+        post("agon", "human", f"Duel #{duel} is ready. " + " ".join(entry_line(e, baseline[0]) for e in entries)
+             + ("" if tests else " No tests ran: AGON_TEST_CMD isn't set.") + " Pick the winner in the arena.")
+    except Stopped as e:
+        why = str(e).rstrip(".")
+        with contextlib.suppress(sqlite3.Error):
+            for entry in entries_of(duel):
+                if entry["state"] not in SETTLED:
+                    enter(duel, entry["label"], state="stopped")
+            end_duel(duel, "stopped", why)
+            post("agon", "human", f"Duel #{duel} stopped: {why}. It leaves nothing behind.")
+    except Exception as e:  # git failed, a bad setting, agon.db locked...: the human hears of it
+        why = str(e).rstrip(".")
+        with contextlib.suppress(sqlite3.Error):
+            for entry in entries_of(duel):
+                if entry["state"] not in SETTLED:
+                    enter(duel, entry["label"], state="failed")
+            end_duel(duel, "failed", why)
+            post("agon", "human", f"Duel #{duel} failed: {why}.")
+    finally:
+        if top is not None:
+            clean_duel(duel, top, trees.values())
+        DUELS.pop(duel, None)
+        DUEL_STOPS.pop(duel, None)
+        close_db()
+
+
+def entry_line(e, baseline):
+    """How entry `e` ended, for the chat: A: tests passed, review: approve (2 files changed, 10 insertions(+))."""
+    parts = [] if e["state"] == "done" else [e["state"]]
+    if e["tests"] and e["tests"] != NO_TESTS and e["state"] != "setup failed":
+        parts.append(compared(baseline, e["tests"]))
+    if e["reviewer"]:
+        parts.append(f"review: {e['verdict'] or 'no verdict'}")
+    change = e["stat"].splitlines()[-1].strip() if e["stat"] else "no changes"
+    return f"{e['label'].upper()}: " + (f"{', '.join(parts)} ({change})." if parts else f"{change}.")
+
+
+def clean_duel(duel, top, trees):
+    """Remove duel `duel`'s worktrees `trees` from the repository at `top`, then the branches that hold nothing to pick:
+    all of them when the duel stopped, else those without work. Best effort."""
+    for path in trees:
+        with contextlib.suppress(ToolError, OSError):
+            git(top, "worktree", "remove", "--force", path)
+        rmtree(path)
+    with contextlib.suppress(ToolError, OSError):
+        git(top, "worktree", "prune")  # a folder Windows kept a while: git lets its branch go once it's forgotten
+    with contextlib.suppress(sqlite3.Error):
+        state = db().execute("SELECT state FROM duels WHERE id = ?", (duel,)).fetchone()[0]
+        for e in entries_of(duel):
+            if e["branch"] and (state in ("stopped", "interrupted") or not e["stat"]):
+                with contextlib.suppress(ToolError, OSError):
+                    git(top, "branch", "-D", e["branch"])
+                    enter(duel, e["label"], branch=None)
+
+
+def duel_entry(duel, e, path, base, prompt, tests, limit, halt):
+    """One entry's turn, in a thread of its own: its agent does the task headless in worktree `path`, as ask runs a task,
+    then Agon runs the tests on its work (staged first, so that what the tests leave isn't committed) and commits it
+    as "Agon duel A"."""
+    label, agent = e["label"], e["agent"]
+    try:
+        enter(duel, label, state="working", started=time.time())
+        runs = f"runs the project's tests (`{command_line(tests[0])}`) there, " if tests else ""
+        answer, problem, hit = ask_run("human", agent, "task", DUEL.format(tests=runs, branch=e["branch"], prompt=prompt),
+                                       path, time.monotonic() + limit, halt)
+        if hit:
+            out_of_quota(agent, hit, own=False)  # marked until it resets, and the team is told
+        git(path, "add", "-A")
+        outcome = report = None
+        if not problem and tests:
+            enter(duel, label, state="testing")
+            with CHECKS_LOCK:  # with a time limit of their own: the wait for the lock takes nothing from them
+                outcome, report, problem = run_tests(tests, path, time.monotonic() + tests[1] + 60, halt)
+        elif not problem:
+            outcome, report, _ = run_tests(None, path, 0, halt)
+        if git(path, "diff", "--cached", "--name-only"):
+            git(path, "-c", f"user.name=Agon duel {label.upper()}", "-c", "user.email=agon@localhost", "-c",
+                "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m",
+                f"Duel #{duel}, entry {label.upper()}: {' '.join(prompt.split())[:60]}")
+        stat = git(path, "-c", "core.quotepath=off", "diff", "--stat", base, "HEAD").splitlines()
+        files = git(path, "-c", "core.quotepath=off", "diff", "--name-only", base, "HEAD").splitlines()
+        enter(duel, label, state="stopped" if halt() else "failed" if problem else "done", ended=time.time(),
+              tests=outcome, report=report, answer=answer and clip(answer, 3000), files=json.dumps(files),
+              stat="\n".join(stat if len(stat) <= 41 else [*stat[:40], " …", stat[-1]]) or None,
+              problem=problem and clip(problem, 1000))
+    except Exception as e2:  # its app isn't there, git failed, agon.db locked...
+        with contextlib.suppress(Exception):
+            enter(duel, label, state="failed", ended=time.time(), problem=clip(str(e2), 1000))
+    finally:
+        close_db()
+
+
+def duel_baseline(duel, path, tests, halt):
+    """The tests on the commit the duel started from, in a thread of its own while the agents work: what an entry's
+    tests show means something only next to them."""
+    try:
+        with CHECKS_LOCK:
+            outcome, report, problem = run_tests(tests, path, time.monotonic() + tests[1] + 60, halt)
+        if not problem:
+            with contextlib.suppress(sqlite3.Error):
+                db().execute("UPDATE duels SET baseline = ?, report = ? WHERE id = ?", (outcome, report, duel))
+    finally:
+        close_db()
+
+
+def duel_review(duel, e, reviewer, path, base, prompt, baseline, tests, limit, halt):
+    """Entry `e`'s review by agent `reviewer`, another duelist's company, in a thread of its own: read-only, in the
+    entry's worktree (gemini, whose app can't be held to read-only, in a throwaway copy of it), with Agon's test runs on
+    the work and on the baseline, and nothing about who wrote it."""
+    label = e["label"]
+    try:
+        enter(duel, label, state="reviewing", reviewer=reviewer)
+        tested = (f"On the work: {e['report']}\n\nOn {base[:12]}, before the work: "
+                  f"{baseline[1] or 'none: Agon could not run them there.'}") if tests else e["report"]
+        text = DUEL_REVIEW.format(copy=COPY if reviewer in REVIEW_COPY else "", base=base[:12], tests=tested,
+                                  prompt=prompt)
+        end = time.monotonic() + limit
+        if reviewer in REVIEW_COPY:  # its app can't be held to read-only: it reviews a throwaway copy
+            copy, folder = review_copy(path, path, reviewer)
+            try:
+                answer, problem, hit = ask_run("human", reviewer, "review", repath(text, [path], copy), folder, end,
+                                               halt)
+            finally:
+                rmtree(copy)
+        else:
+            answer, problem, hit = ask_run("human", reviewer, "review", text, path, end, halt)
+        if hit:
+            out_of_quota(reviewer, hit, own=False)
+        enter(duel, label, state="done", verdict=answer and verdict(answer), review=answer and clip(answer, 3000),
+              problem=problem and clip(f"The review failed: {problem}", 1000))
+    except Exception as e2:  # its app isn't there, git failed, agon.db locked...
+        with contextlib.suppress(Exception):
+            enter(duel, label, state="done", problem=clip(f"The review failed: {e2}", 1000))
+    finally:
+        close_db()
+
+
+def pick_duel(duel, label):
+    """The human picks duel `duel`'s winner, entry `label`: whose each entry was shows now, with how to merge the
+    winner (Agon never merges). Returns what the human reads."""
+    label = label.strip().lower() if isinstance(label, str) else ""
+    with transaction() as con:
+        row = con.execute("SELECT state, project FROM duels WHERE id = ?", (duel,)).fetchone()
+        if not row:
+            raise ToolError(f"There is no duel #{duel}.")
+        if row[0] != "ready":
+            raise ToolError(f"Duel #{duel} is {row[0]}: " + ("its winner is picked already." if row[0] == "picked" else
+                                                             "only a duel that is ready can have a winner."))
+        entries = entries_of(duel)
+        won = next((e for e in entries if e["label"] == label and e["stat"] and e["branch"]), None)
+        if not won:
+            raise ToolError(f"Duel #{duel} has no entry {label.upper() or '?'} with work to pick.")
+        con.execute("UPDATE duels SET state = 'picked', winner = ? WHERE id = ?", (label, duel))
+    drop = [e["branch"] for e in entries if e is not won and e["branch"]]
+    text = (f"Duel #{duel}: you picked {label.upper()}, by {won['agent']}. "
+            + " ".join(f"{e['label'].upper()} was {e['agent']}." for e in entries if e is not won)
+            + f" To merge it, in {row[1]}: git merge {won['branch']}"
+            + (f", and to drop the others: git branch -D {' '.join(drop)}" if drop else "") + ".")
+    post("agon", "human", text)
+    return text
+
+
+def stop_duel(duel):
+    """The human stops duel `duel`: its apps end, and it leaves nothing behind. Returns what the human reads."""
+    if duel in DUELS:
+        DUEL_STOPS[duel] = "the human stopped it"
+        return f"Duel #{duel} stops."
+    row = db().execute("SELECT state FROM duels WHERE id = ?", (duel,)).fetchone()
+    if not row:
+        raise ToolError(f"There is no duel #{duel}.")
+    raise ToolError(f"Duel #{duel} is {row[0]}: nothing of it runs.")
+
+
+def interrupted_duels():
+    """End the duels that ran when their arena ended (a crash, a closed terminal): the arena starts with this. Only one
+    arena runs (it holds the port), so a running duel that this one doesn't run has no arena. Their worktrees and branches
+    go, as a stopped duel's do, and the human hears of it."""
+    now = time.time()
+    for duel, top in db().execute("SELECT id, project FROM duels WHERE state = 'running'").fetchall():
+        if duel in DUELS:
+            continue
+        with transaction() as con:
+            con.execute("UPDATE duels SET state = 'interrupted', ended = ?, note = 'its arena ended while it ran' WHERE"
+                        " id = ?", (now, duel))
+            con.execute("UPDATE entries SET state = 'stopped' WHERE duel = ? AND state NOT IN ('done', 'failed',"
+                        " 'setup failed')", (duel,))
+        branches, trees = {e["branch"] for e in entries_of(duel) if e["branch"]}, []
+        with contextlib.suppress(ToolError, OSError):
+            for block in git(top, "worktree", "list", "--porcelain").split("\n\n"):
+                fields = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+                if fields.get("branch", "").removeprefix("refs/heads/") in branches or os.path.basename(
+                        fields.get("worktree", "")).startswith(f"agon-duel-{duel}-base-"):
+                    trees.append(fields["worktree"])
+        clean_duel(duel, top, trees)
+        post("agon", "human", f"Duel #{duel} ended: its arena closed while it ran. Its worktrees and branches are gone;"
+                              " start it again if you want it.")
+
+
+def unnamed(text, entries):
+    """`text` with the names of the entries' agents and of their apps as the entries' labels (entry A), for a blind
+    duel: what went wrong may name them."""
+    for e in entries:
+        words = "|".join(map(re.escape, IDENTITY.get(e["agent"], (e["agent"],))))
+        text = re.sub(rf"\b(?:{words})\b", f"entry {e['label'].upper()}", text, flags=re.I)
+    return text
+
+
+def duel_view(d, full=False):
+    """Duel `d` (its row, as a dict) for the arena: its entries' outcomes, or `full`, with what each agent said, its
+    review, its tests' report and its diff stat too. Until the human picks the winner, whose entry is whose stays
+    out: the entries are A, B and C, their reviewers are hidden too, and so are the agents' names in what went wrong."""
+    entries, blind, size = entries_of(d["id"]), d["state"] in ("running", "ready"), None if full else 300
+    shown = []
+    for e in entries:
+        problem = e["problem"] and (unnamed(e["problem"], entries) if blind else e["problem"])
+        entry = {"label": e["label"].upper(), "agent": None if blind else e["agent"], "state": e["state"],
+                 "started": e["started"], "ended": e["ended"], "compared": compared(d["baseline"], e["tests"]),
+                 "verdict": e["verdict"], "reviewer": None if blind else e["reviewer"], "reviewed": bool(e["reviewer"]),
+                 "change": e["stat"] and e["stat"].splitlines()[-1].strip(), "files": len(json.loads(e["files"])),
+                 "branch": e["branch"], "problem": problem and (clip(problem, size) if size else problem)}
+        if full:
+            entry |= {"answer": e["answer"], "review": e["review"], "report": e["report"], "stat": e["stat"]}
+        shown.append(entry)
+    return {key: d[key] for key in ("id", "project", "base", "state", "started", "ended", "baseline", "note")} | {
+        "prompt": d["prompt"] if full else clip(d["prompt"], 300), "winner": d["winner"] and d["winner"].upper(),
+        "entries": shown} | ({"report": d["report"]} if full else {})
+
+
+def duels_state():
+    """The latest duels for the arena's snapshot, newest first (see duel_view())."""
+    cur = db().execute("SELECT * FROM duels ORDER BY id DESC LIMIT 5")
+    names = [column[0] for column in cur.description]
+    return [duel_view(dict(zip(names, row))) for row in cur.fetchall()]
+
+
+def duel_state(duel):
+    """One duel in full for the arena (see duel_view())."""
+    cur = db().execute("SELECT * FROM duels WHERE id = ?", (duel,))
+    if not (row := cur.fetchone()):
+        raise ToolError(f"There is no duel #{duel}.")
+    return duel_view(dict(zip([column[0] for column in cur.description], row)), full=True)
+
+
+def checks_state():
+    """The setup and test commands a duel would run, as the arena's duel form shows them."""
+    shown = {}
+    for kind, command in (("tests", test_command), ("setup", setup_command)):
+        try:
+            found = command()
+            shown[kind] = command_line(found[0]) if found else None
+        except ToolError as e:
+            shown[kind] = f"a bad setting: {e}"
+    return shown
+
+
+def default_project(auto):
+    """The folder the arena's duel form starts with: AGON_PROJECT, autopilot's (`auto`, see autopilot_state()), else
+    the latest project Agon saw."""
+    if os.environ.get("AGON_PROJECT"):
+        return os.environ["AGON_PROJECT"]
+    if auto and auto.get("project"):
+        return auto["project"]
+    row = db().execute("SELECT project FROM (SELECT project, started AS at FROM duels UNION ALL SELECT project, started"
+                       " FROM asks UNION ALL SELECT project, updated FROM tasks) WHERE project IS NOT NULL ORDER BY at"
+                       " DESC LIMIT 1").fetchone()
+    return row and row[0]
 
 
 def gauge_windows(limits):
@@ -3561,6 +4060,11 @@ table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 th { color: var(--dim); font-weight: 600; font-size: 12px; }
 label.check { display: inline-flex; gap: 6px; align-items: center; margin-right: 12px; }
+#duel-form textarea, #duel-form input[type="text"] { display: block; width: 100%; margin: 6px 0; }
+#duel-form .row { margin: 6px 0; }
+.entry { background: var(--panel); border: 1px solid var(--line); margin: 0; }
+.entry.won { border: 2px solid var(--good); }
+code { font: 13px ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
 @media (min-width: 1100px) {
   main { grid-template-columns: 300px minmax(0, 1fr) 420px; }
   #team { display: block !important; border-right: 1px solid var(--line); }
@@ -3707,6 +4211,63 @@ function renderTask(t, box) {
     for (const r of t.reviews) box.append(el('div', 'small', r.reviewer + ': ' + r.verdict + ' (' + r.tests + ')'));
   }
 }
+function button(text, click) {
+  const b = el('button', '', text);
+  b.type = 'button';
+  b.addEventListener('click', click);
+  return b;
+}
+function entryLine(e) {  // what came of a duel's entry, without the long texts
+  const lines = [];
+  if (e.compared) lines.push([e.compared, outcome(e.compared)]);
+  if (e.reviewed) lines.push(['review' + (e.reviewer ? ' by ' + e.reviewer : '') + ': ' + (e.verdict || (e.state ===
+    'reviewing' ? 'running' : 'no verdict')), e.verdict === 'approve' ? 'good' : e.verdict === 'changes' ? 'bad' : '']);
+  if (e.change) lines.push([e.change, '']);
+  else if (['done', 'failed', 'stopped'].includes(e.state)) lines.push(['no changes', '']);
+  if (e.problem) lines.push([e.problem, 'bad']);
+  return lines;
+}
+function renderDuels(duels, box, act) {  // act(what, duel, label): the live page's stop, pick and details
+  if (!duels.length) return box.replaceChildren(el('div', 'small', 'No duels yet: give two or three agents the same task,'
+    + ' then pick the best work.'));
+  box.replaceChildren(...duels.map(d => {
+    const card = el('div', 'card duel'), head = el('div', 'row');
+    head.append(el('b', '', 'Duel #' + d.id), el('span', 'pill', d.state), el('span', 'small grow', d.ended ?
+      clock(d.started) : 'for ' + span(now() - d.started)));
+    if (act && d.state === 'running') head.append(button('Stop', () => act('stop', d.id)));
+    if (act) head.append(button('Details', () => act('open', d.id)));
+    card.append(head, el('div', '', d.prompt), el('div', 'small', 'from ' + d.base.slice(0, 7) + ' in ' + d.project
+      + (d.baseline ? ' · at the start: ' + d.baseline : '')));
+    if (d.note) card.append(el('div', 'small', d.note));
+    const grid = el('div', 'entries');
+    for (const e of d.entries) {
+      const c = el('div', 'card entry' + (d.winner === e.label ? ' won' : '')), r = el('div', 'row');
+      r.append(el('b', e.agent ? who(e.agent) : '', e.label + (e.agent ? ' · ' + e.agent : '')), el('span', 'pill', e.state));
+      c.append(r);
+      for (const [text, cls] of entryLine(e)) c.append(el('div', 'small ' + cls, text));
+      if (d.winner === e.label && e.branch) c.append(el('div', 'small', 'the winner: git merge ' + e.branch));
+      if (act && d.state === 'ready' && e.change && e.branch) c.append(button('Pick ' + e.label, () => act('pick', d.id,
+        e.label)));
+      grid.append(c);
+    }
+    card.append(grid);
+    return card;
+  }));
+}
+function renderDuel(d, box) {  // one duel in full: what each agent said, its review, its tests, its diff
+  box.replaceChildren(el('h2', '', 'Duel #' + d.id + ' · ' + d.state), el('pre', 'text', d.prompt),
+    el('div', 'small', 'from ' + d.base.slice(0, 12) + ' in ' + d.project));
+  if (d.note) box.append(el('div', 'small', d.note));
+  if (d.report) box.append(el('h2', '', 'At the start: ' + (d.baseline || '')), el('pre', 'text', d.report));
+  for (const e of d.entries) {
+    box.append(el('h2', '', 'Entry ' + e.label + (e.agent ? ' · ' + e.agent : '') + ' · ' + e.state));
+    for (const [text, cls] of entryLine(e)) box.append(el('div', 'small ' + cls, text));
+    if (e.branch) box.append(el('div', 'small', 'branch ' + e.branch));
+    for (const [label, text] of [['What it said', e.answer], ['What changed', e.stat], ['Its tests', e.report],
+                                 ['Its review', e.review]])
+      if (text) box.append(el('div', 'small', label), el('pre', 'text', text));
+  }
+}
 function tabs(initial) {  // the phone's tabs; on a wide screen the chat and the team stay, and the tabs pick the side panel
   const wide = matchMedia('(min-width: 1100px)');
   function show(panel) {
@@ -3820,6 +4381,60 @@ function hide() { $('#detail').hidden = true; }
 $('#close').addEventListener('click', hide);
 $('#detail').addEventListener('click', e => { if (e.target === $('#detail')) hide(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hide(); });
+function duelForm(box) {  // a new duel: the task, the agents, the project; the commands it runs come from the settings
+  const form = el('form', 'card'), task = el('textarea'), folder = el('input'), agents = el('div', 'row'),
+    checks = el('div', 'small'), start = el('button', '', 'Start the duel');
+  task.rows = 3;
+  task.placeholder = 'The task, the same for each agent';
+  task.setAttribute('aria-label', 'Task');
+  folder.type = 'text';
+  folder.placeholder = 'The project folder: a git repository';
+  folder.setAttribute('aria-label', 'Project folder');
+  for (const name of ['claude', 'gpt', 'gemini']) {
+    const label = el('label', 'check'), box = el('input');
+    box.type = 'checkbox';
+    box.value = name;
+    box.checked = true;
+    label.append(box, el('span', who(name), name));
+    agents.append(label);
+  }
+  let typed = false;
+  folder.addEventListener('input', () => { typed = true; });
+  form.append(el('b', '', 'New duel'), task, agents, folder, checks, start);
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    start.disabled = true;
+    try {
+      if (await post('/duel', {prompt: task.value, folder: folder.value,
+                               agents: [...agents.querySelectorAll('input:checked')].map(b => b.value)})) task.value = '';
+    } finally {
+      start.disabled = false;
+    }
+  });
+  box.replaceChildren(form);
+  return s => {
+    if (!typed && s.project && folder.value !== s.project) folder.value = s.project;
+    checks.replaceChildren(
+      el('div', '', 'Setup in each worktree: ' + (s.checks.setup || 'none (AGON_SETUP_CMD): a worktree has only what git'
+        + ' tracks')),
+      el('div', '', 'Tests: ' + (s.checks.tests || 'none (AGON_TEST_CMD)')));
+  };
+}
+async function duelAct(what, id, label) {
+  if (what === 'open') {
+    const r = await fetch('/board?duel=' + id);
+    if (!r.ok) return alert(await r.text());
+    renderDuel(await r.json(), $('#detail-body'));
+    $('#detail').hidden = false;
+    return;
+  }
+  if (what === 'stop' && !confirm('Stop duel #' + id + '? Its apps end, and it leaves nothing behind.')) return;
+  if (what === 'pick' && !confirm('Pick ' + label + ' as the winner of duel #' + id + '? Then you see whose work each'
+    + ' entry was.')) return;
+  await post('/duel/' + what, {duel: id, label: label});
+}
+const drawForm = duelForm($('#duel-form'));
+panels.push(s => { drawForm(s); renderDuels(s.duels, $('#duel-list'), duelAct); });
 setInterval(() => { if (shown && !document.hidden) update(shown); }, 30000);  // "for 5 min" moves on
 connect();
 """
@@ -3869,6 +4484,14 @@ class Arena(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):  # a page that closed mid-answer: nothing to report
             super().handle_error(request, client_address)
+
+
+def duel_number(body):
+    """The duel a POST names: {"duel": 3}."""
+    duel = body.get("duel")
+    if not isinstance(duel, int) or isinstance(duel, bool) or duel < 1:
+        raise ToolError('Send JSON like {"duel": 3}.')
+    return duel
 
 
 class Web(BaseHTTPRequestHandler):
@@ -3922,7 +4545,14 @@ class Web(BaseHTTPRequestHandler):
                 rows = db().execute("SELECT id, sender, rcpt, text, ts FROM msgs WHERE id > ? ORDER BY id",
                                     (after,)).fetchall()
             return self.json(rows)
-        if url.path == "/board":  # the arena's snapshot, or with id one task in full
+        if url.path == "/board":  # the arena's snapshot, or with id one task in full, or with duel one duel
+            if "duel" in query:
+                if (duel := number(query["duel"])) is None:
+                    return self.answer(400, "duel is a duel's number.")
+                try:
+                    return self.json(duel_state(duel))
+                except ToolError as e:
+                    return self.answer(404, str(e))
             if "id" not in query:
                 return self.json(arena_state())
             if (tid := number(query["id"])) is None:
@@ -3998,7 +4628,8 @@ class Web(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(max(0, min(int(self.headers["Content-Length"]), 1 << 20))))
         except Exception:
             body = None
-        handler = {"/msgs": self.say}.get(urlsplit(self.path).path)
+        handler = {"/msgs": self.say, "/duel": self.duel, "/duel/pick": self.pick, "/duel/stop": self.stop}.get(
+            urlsplit(self.path).path)
         if handler is None:
             return self.answer(404, "Nothing here.")
         handler(body if isinstance(body, dict) else {})
@@ -4014,6 +4645,25 @@ class Web(BaseHTTPRequestHandler):
         self.send_response(204)
         self.guard()
         self.end_headers()
+
+    def duel(self, body):
+        """POST /duel: the human starts a duel, as {"prompt": ..., "agents": ["claude", "gpt"], "folder": ...}."""
+        self.act(lambda: {"duel": start_duel(body.get("prompt"), body.get("agents"), body.get("folder"))})
+
+    def pick(self, body):
+        """POST /duel/pick: the human picks a duel's winner, as {"duel": 3, "label": "A"}."""
+        self.act(lambda: {"text": pick_duel(duel_number(body), body.get("label"))})
+
+    def stop(self, body):
+        """POST /duel/stop: the human stops a running duel, as {"duel": 3}."""
+        self.act(lambda: {"text": stop_duel(duel_number(body))})
+
+    def act(self, do):
+        """Answer with what do() returns, as JSON, or with why Agon did nothing."""
+        try:
+            self.json(do())
+        except ToolError as e:
+            self.answer(400, str(e))
 
     def json(self, value):
         body = json.dumps(value).encode()
@@ -4317,6 +4967,9 @@ def main(argv):
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         serve_mcp(argv[0])
     else:
+        for name in ("SIGTERM", "SIGBREAK"):  # like Ctrl+C (SIGBREAK: Ctrl+Break, a closed console on Windows): a
+            if hasattr(signal, name):  # running duel stops its apps and leaves nothing behind
+                signal.signal(getattr(signal, name), lambda *_: sys.exit(0))
         return arena()
     return 0
 
@@ -4335,12 +4988,21 @@ def arena():
               f" open {url}. Or another program uses the port.", file=sys.stderr)
         return 1
     print(f"Agon arena: {url}  (Ctrl+C to stop)", flush=True)
+    try:
+        interrupted_duels()  # a duel that ran when the last arena ended can't go on
+    except sqlite3.Error as e:
+        print(f"agon: {e}", file=sys.stderr)
+    close_db()
     webbrowser.open(url)
     try:
         server.serve_forever()
     finally:
-        ARENA_CLOSING.set()  # its event streams end
+        ARENA_CLOSING.set()  # its event streams and duels end
         server.server_close()
+        if DUELS:
+            print("agon: the duel stops: its apps end, and its worktrees and branches go...", file=sys.stderr, flush=True)
+        for thread in list(DUELS.values()):
+            thread.join(GRACE + 15)
     return 0
 
 
