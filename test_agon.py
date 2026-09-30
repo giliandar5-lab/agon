@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -750,14 +751,16 @@ fake.write_text("@echo off\n" if windows else "#!/bin/sh\n")
 fake.chmod(0o755)
 env = {k: v for k, v in os.environ.items() if k != "AGON_DB"}
 env |= {"PATH": str(bin_dir), "HOME": str(setup_home), "USERPROFILE": str(setup_home)}
-for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm test", "AGON_AUTO_REVIEW": "1"}):
+for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm test", "AGON_AUTO_REVIEW": "1",
+                  "AGON_ARENA_HOSTS": "laptop.tail1234.ts.net", "AGON_SETUP_CMD": "npm ci"}):
     p = subprocess.run([sys.executable, SERVER, "setup"], env=env | extra, capture_output=True, text=True, timeout=60)
     out, script = p.stdout, str(Path(SERVER).resolve())
     assert p.returncode == 0 and p.stderr == "", p
     assert f"claude is {fake}".lower() in out.lower() and "codex isn't on PATH" in out and "agy isn't on PATH" in out
     assert f"Python  {sys.executable}" in out and f"Agon    {script}" in out and f"python={sys.executable}" in out
     snippets = [json.loads(line) for line in out.splitlines() if line.startswith("  {")]
-    assert len(snippets) == 4, out  # Claude Code, Codex and Antigravity; Phase 5: agy's own settings
+    assert len(snippets) == 5, out  # Claude Code, Codex and Antigravity; Phase 5: agy's own settings; Phase 6: the
+    # status line
     [claude_hook] = snippets[0]["hooks"]["StopFailure"][0]["hooks"]
     assert claude_hook == {"type": "command", "command": sys.executable, "args": [script, "hook", "claude"],
                            "timeout": 60}  # exec form: no shell, so no quoting to get wrong
@@ -811,6 +814,31 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
                    f"Merge this into {setup_home.joinpath(*agon.GEMINI_SETTINGS)}:",
                    "Now: agy won't run (AGON_GEMINI_PLAN=1 runs it on your Google login, at your own risk)."):
         assert needed in out, (needed, out)
+    # Phase 6: the arena and a phone's tunnels (with the exact names it answers), the status line that keeps the plan's
+    # usage (Claude Code runs it with Git Bash or PowerShell on Windows: forward slashes, no quoted program), and the
+    # setup command a duel runs in each worktree, with the pip install -e trap
+    if windows:
+        runner = Path(sys.executable).as_posix()
+        status_line = f'{runner if " " not in runner else "py"} "{Path(script).as_posix()}" statusline'
+    else:
+        status_line = shlex.join([sys.executable, script, "statusline"])
+    assert snippets[4] == {"statusLine": {"type": "command", "command": status_line}}, snippets[4]
+    for needed in ("== Arena: the chat, each agent's fuel, the board, duels and the score, in a browser",
+                   "  " + agon.command_line([sys.executable, script]) + "   then open http://127.0.0.1:8765",
+                   "  ssh -L 8765:127.0.0.1:8765 you@this-computer", "  tailscale serve --bg 8765",
+                   "Now: AGON_ARENA_HOSTS is laptop.tail1234.ts.net" if extra else
+                   "Now: AGON_ARENA_HOSTS isn't set: 127.0.0.1 and localhost only.",
+                   "== Fuel: the plan's usage in the arena", f"merge this into {setup_home / '.claude' / 'settings.json'}",
+                   "== Duels: two or three agents do the same task", "AGON_SETUP_TIMEOUT seconds, 600",
+                   "A trap: after pip install -e with code under src/",
+                   "Now: AGON_SETUP_CMD is npm ci" if extra else "Now: AGON_SETUP_CMD isn't set"):
+        assert needed in out, (needed, out)
+if not windows:  # the status line works as printed: Claude Code runs it with sh -c and gives it JSON on stdin
+    shown = subprocess.run([shutil.which("sh"), "-c", snippets[4]["statusLine"]["command"]], capture_output=True,
+                           text=True, input=json.dumps({"model": {"display_name": "Opus"}, "rate_limits": {
+                               "five_hour": {"used_percentage": 12, "resets_at": int(time.time()) + 600}}}),
+                           env=env | {"AGON_DB": str(Path(TMP, "status.db"))}, timeout=60)
+    assert (shown.returncode, shown.stdout) == (0, "Opus · 5h 12%\n"), shown
 
 # Phase 2, 8-9. Claude Code channels: the server declares experimental["claude/channel"]; a Claude Code client that
 # has called a tool gets a doorbell notification when messages wait for it. The doorbell never moves the cursor
@@ -3702,6 +3730,7 @@ git_in(duelrepo, "init", "-q")
 git_in(duelrepo, "add", "-A")
 git_in(duelrepo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "first")
 base = git_in(duelrepo, "rev-parse", "HEAD")
+here = agon.toplevel(str(duelrepo))  # as git spells it: macOS's /private/var, Windows' long name for RUNNER~1
 agon.db().execute("UPDATE agents SET out_of_quota_until = NULL")  # the roster's checks above left gpt out of quota
 DUEL_ENV = {key: ASK[key] for key in ("FAKE_LOG", "FAKE_BEAT", "AGON_GEMINI_PLAN", "AGON_CMD_CLAUDE", "AGON_CMD_GPT",
                                       "AGON_CMD_GEMINI")} | {"AGON_TEST_CMD": None, "AGON_SETUP_CMD": None}
@@ -3749,10 +3778,10 @@ def tree_label(run, duel):  # the entry whose worktree a run was in
 with duel_env(AGON_TEST_CMD=GREP, AGON_SETUP_CMD=setup_cmd()):
     FAKE_LOG.unlink(missing_ok=True)
     first = agon.newest_id()
-    duel = duel_one = dueled("EDIT notes.txt NAP=1 PICKY=claude", ["claude", "gpt", "gemini"])
+    duel = duel_one = dueled("EDIT notes.txt NAP=2 PICKY=claude", ["claude", "gpt", "gemini"])
     d, entries = duel_of(duel), agon.entries_of(duel)
     runs, heard_ = fake_runs(), said_since(first)
-assert d["state"] == "ready" and d["base"] == base and d["project"] == os.path.normpath(duelrepo), d
+assert d["state"] == "ready" and d["base"] == base and d["project"] == here, d
 assert heard_[0] == (f"Duel #{duel} started: claude, gpt and gemini do the same task, each on a branch of its own from"
                      f" {base[:7]}, as entries A, B and C; whose is whose stays hidden until you pick the winner."), heard_
 assert sorted(e["label"] for e in entries) == ["a", "b", "c"] and {e["agent"] for e in entries} == {"claude", "gpt",
@@ -3762,7 +3791,7 @@ by = {e["agent"]: e for e in entries}
 # time; so did the tests, on the commit the duel started from (they failed there: no notes.txt yet) and on each entry
 setups = [r for r in runs if r["app"] == "tests" and r["mode"] == "setup"]
 tests = [r for r in runs if r["app"] == "tests" and r["mode"] == "grep"]
-assert len(setups) == 4 and all(r["root"] == os.path.normpath(duelrepo) and r["settings"] == ["AGON_ROOT"]
+assert len(setups) == 4 and all(r["root"] == here and r["settings"] == ["AGON_ROOT"]
                                 for r in setups), setups
 assert Path(setups[0]["cwd"]).name.startswith(f"agon-duel-{duel}-base-") and max(r["t"] for r in setups) < min(
     r["t"] for r in runs if r["app"] in APPS.values()), setups  # before any app started
@@ -3774,14 +3803,15 @@ assert agon.compared(d["baseline"], by["gpt"]["tests"]) == "tests passed: they f
 # the agents worked at once, each in its own worktree, told to leave the commit to Agon; the reviews ran at once too
 tasks = [r for r in runs if r["app"] in APPS.values() and not {"plan", "read-only"} & set(r["args"])]
 reviews = [r for r in runs if r["app"] in APPS.values() and {"plan", "read-only"} & set(r["args"])]
-assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 0.9, tasks  # each naps 1 s
-assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 0.9, reviews
+assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 1.8, tasks  # each naps 2 s:
+assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 1.8, reviews  # 4 s apart
+# one after another
 for r in tasks:
     e = by[{v: k for k, v in APPS.items()}[r["app"]]]
     assert tree_label(r, duel) == e["label"] and r["asked_by"] == "human", r
     assert r["prompt"].startswith("The human asks you to do a task through Agon") and (
         f"commits what you changed to branch agon/duel-{duel}-{e['label']}, and" in r["prompt"]) and (
-        "runs the project's tests (`") in r["prompt"] and r["prompt"].endswith("The task:\nEDIT notes.txt NAP=1"
+        "runs the project's tests (`") in r["prompt"] and r["prompt"].endswith("The task:\nEDIT notes.txt NAP=2"
                                                                               " PICKY=claude"), r["prompt"]
 # each entry was reviewed by the next duelist in label order (A by B, B by C, C by A), read-only, with the tests Agon
 # ran on the work and before it; gemini's review in a throwaway copy of the entry's worktree
@@ -3793,7 +3823,7 @@ for i, e in enumerate(order):
     r = next(r for r in reviews if r["app"] == APPS[reviewer])  # each reviews one entry
     assert f"git diff {base[:12]} HEAD" in r["prompt"] and "On the work: Test results, run by Agon:" in r["prompt"] and (
         f"On {base[:12]}, before the work: Test results, run by Agon:") in r["prompt"] and r["prompt"].endswith(
-        "The task:\nEDIT notes.txt NAP=1 PICKY=claude") and r["asked_by"] == "human", r["prompt"]
+        "The task:\nEDIT notes.txt NAP=2 PICKY=claude") and r["asked_by"] == "human", r["prompt"]
     assert Path(r["cwd"]).name.startswith("agon-review-gemini-") if reviewer == "gemini" else tree_label(
         r, duel) == e["label"], (reviewer, r["cwd"])
 # each entry's work is one commit on its branch, by "Agon duel A", with what the app wrote and nothing the setup or the
@@ -3801,7 +3831,7 @@ for i, e in enumerate(order):
 for e in entries:
     branch = f"agon/duel-{duel}-{e['label']}"
     assert e["branch"] == branch and git_in(duelrepo, "log", "-1", "--format=%an <%ae>|%s", branch) == (
-        f"Agon duel {e['label'].upper()} <agon@localhost>|Duel #{duel}, entry {e['label'].upper()}: EDIT notes.txt NAP=1"
+        f"Agon duel {e['label'].upper()} <agon@localhost>|Duel #{duel}, entry {e['label'].upper()}: EDIT notes.txt NAP=2"
         " PICKY=claude"), e
     assert git_in(duelrepo, "show", f"{branch}:notes.txt") == f"written by {APPS[e['agent']]}"
     assert git_in(duelrepo, "diff", "--name-only", base, branch) == "notes.txt" and json.loads(e["files"]) == [
@@ -3817,14 +3847,14 @@ assert shown["id"] == duel and [e["agent"] for e in shown["entries"]] == [None] 
     e["reviewer"] is None and e["reviewed"] for e in shown["entries"]), shown
 assert [e["label"] for e in shown["entries"]] == ["A", "B", "C"] and "answer" not in shown["entries"][0]
 full = agon.duel_state(duel)
-assert full["prompt"] == "EDIT notes.txt NAP=1 PICKY=claude" and full["report"] == d["report"] and all(
+assert full["prompt"] == "EDIT notes.txt NAP=2 PICKY=claude" and full["report"] == d["report"] and all(
     e["agent"] is None and e["stat"] and e["review"] and e["report"] for e in full["entries"]), full
 # the human picks: whose work each entry was shows now, with how to merge the winner (Agon never merges)
 won = by["gpt"]["label"]
 text = agon.pick_duel(duel, won.upper())
 drop = " ".join(f"agon/duel-{duel}-{e['label']}" for e in order if e["agent"] != "gpt")
 others = " ".join(f"{e['label'].upper()} was {e['agent']}." for e in order if e["agent"] != "gpt")
-assert text == (f"Duel #{duel}: you picked {won.upper()}, by gpt. {others} To merge it, in {os.path.normpath(duelrepo)}:"
+assert text == (f"Duel #{duel}: you picked {won.upper()}, by gpt. {others} To merge it, in {here}:"
                 f" git merge agon/duel-{duel}-{won}, and to drop the others: git branch -D {drop}.") and text in \
        said_since(first), text
 shown = agon.arena_state()["duels"][0]
@@ -4080,7 +4110,6 @@ def scores(project):
     return {a["name"]: a for a in next(p for p in agon.scoreboard() if p["project"] == project)["agents"]}
 
 
-here = os.path.normpath(duelrepo)
 first_review = {e["agent"]: e["verdict"] for e in agon.entries_of(duel_one)}  # one entry was reviewed by PICKY claude
 got = scores(here)
 assert (got["claude"]["duels"], got["gpt"]["duels"], got["gemini"]["duels"]) == (
@@ -4332,7 +4361,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.5)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.6)"):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -4377,7 +4406,7 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
                    "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
-                   "`mcp(agon/*)`", "(v0.5)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   "`mcp(agon/*)`", "(v0.6)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
                    ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
                    '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
                    ' gpt", "timeout": 10 }] }]'):
@@ -4395,10 +4424,10 @@ wake_lines = {"claude": ["claude", *agon.WAKE_COMMANDS["claude"], *agon.WAKE_PER
               "gpt": ["codex", *agon.WAKE_COMMANDS["gpt"], *agon.WAKE_PERMISSIONS["gpt"][0]],
               "gemini": ["agy", *agon.WAKE_COMMANDS["gemini"], *agon.WAKE_PERMISSIONS["gemini"][0]]}
 for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)", "#autopilot-python-agonpy-autopilot",
-                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.5)")),
+                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.6)")),
                       ("README.ru.md", ("## Автопилот (`python agon.py autopilot`)",
                                         "#автопилот-python-agonpy-autopilot",
-                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.5)"))):
+                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.6)"))):
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words, "`python agon.py stats`", "--agents claude,gpt --lead gpt", "`AGON_LEAD`", "`AGON_PROJECT`",
                    "`AGON_WAKE_ON_BROADCAST`", "`AGON_ACK_PATTERNS`", "`AGON_DEBOUNCE_SECONDS`", "`AGON_MAX_WORKERS`",
@@ -4424,6 +4453,29 @@ for fact in ("CLAUDE_CODE_MESSAGING_SOCKET", "`claude_code_version`", "`--skip-g
              "(https://code.claude.com/docs/en/authentication)", "(https://code.claude.com/docs/en/github-actions)",
              "(https://code.claude.com/docs/en/legal-and-compliance)",
              "(https://developers.openai.com/codex/auth/ci-cd-auth)"):
+    assert fact in roadmap, fact
+
+# Phase 6: both READMEs explain the arena (fuel, the status line and what it keeps, the security with the Origin a script
+# must send, a phone through SSH or Tailscale with AGON_ARENA_HOSTS, VS Code untested, watch and say), duels (the setup,
+# the pip install -e trap, the baseline, blind reviews, the pick, the stop), the scoreboard with its hints, and export
+# with what it masks; the roadmap has the phase ticked and the facts recorded
+for readme, words in (("README.md", ("## Arena (`python agon.py`)", "#arena-python-agonpy", "## Duels", "## Scoreboard",
+                                     "## Export", "The `pip install -e` trap")),
+                      ("README.ru.md", ("## Арена (`python agon.py`)", "#арена-python-agonpy", "## Дуэли", "## Рейтинг",
+                                        "## Экспорт", "Ловушка `pip install -e`"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for needed in (*words, "`AGON_ARENA_HOSTS=laptop.tail1234.ts.net`", "`tailscale serve --bg 8765`",
+                   "`ssh -L 8765:127.0.0.1:8765 ", "Origin: http://127.0.0.1:8765", "*Public*", "`5h 62%, 4 min ago`",
+                   "`~/.claude/settings.json`", "`python agon.py watch`", "`NO_COLOR`", "`FORCE_COLOR`", "`say -`",
+                   "`say --file ", "`AGON_SETUP_CMD`", "`AGON_SETUP_TIMEOUT`", "`AGON_ROOT`", "`npm ci`",
+                   "`agon/duel-N-a`", "`Agon duel A`", "`git merge agon/duel-3-a`", "`git branch -D ...`",
+                   "`.venv/bin/python -m pytest -q`", "`/board?duel=N`", "`python agon.py export replay`", "`--project ",
+                   "`--no-redact`", "`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`", "(v0.6)"):
+        assert needed in text, (readme, needed)
+    assert "(v0.5)" not in text, readme
+assert "- [x] Phase 6 — The arena" in roadmap and "Phase 6 additions" in roadmap and "Done in v0.6.0" in roadmap
+for fact in ("gh-85307", "`rate_limits.five_hour`", "`subagentStatusLine`", "`tailscale serve --bg 8765`",
+             "`account/rateLimits/read`", "U+2028", "--worktree NAME", "`AGON_ARENA_HOSTS`"):
     assert fact in roadmap, fact
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):

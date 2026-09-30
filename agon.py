@@ -46,7 +46,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.5.0"  # also in the plugin manifests
+VERSION = "0.6.0"  # also in the plugin manifests
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -3697,11 +3697,17 @@ def clean_duel(duel, top, trees):
     """Remove duel `duel`'s worktrees `trees` from the repository at `top`, then the branches that hold nothing to pick:
     all of them when the duel stopped, else those without work. Best effort."""
     for path in trees:
-        with contextlib.suppress(ToolError, OSError):
-            git(top, "worktree", "remove", "--force", path)
+        for wait in (0, 1, 2):  # Windows may keep a folder a moment after the processes that worked in it were killed
+            time.sleep(wait)
+            try:
+                git(top, "worktree", "remove", "--force", path)
+                break
+            except (ToolError, OSError):
+                if not os.path.exists(path):
+                    break
         rmtree(path)
     with contextlib.suppress(ToolError, OSError):
-        git(top, "worktree", "prune")  # a folder Windows kept a while: git lets its branch go once it's forgotten
+        git(top, "worktree", "prune")  # a folder Windows kept longer: git lets its branch go once it's forgotten
     with contextlib.suppress(sqlite3.Error):
         state = db().execute("SELECT state FROM duels WHERE id = ?", (duel,)).fetchone()[0]
         for e in entries_of(duel):
@@ -5235,6 +5241,46 @@ def setup(out=None):
         "and put GEMINI_API_KEY in the environment your apps and autopilot start with.",
         "Now: agy won't run (AGON_GEMINI_PLAN=1 runs it on your Google login, at your own risk)." if barred("gemini")
         else "Now: Agon may run agy.")
+
+    # the arena, and a phone that reaches it through a tunnel (the arena answers only at the names it knows)
+    hosts = os.environ.get("AGON_ARENA_HOSTS", "").strip()
+    say("", "== Arena: the chat, each agent's fuel, the board, duels and the score, in a browser",
+        "  " + command_line([py, script]) + f"   then open http://127.0.0.1:{PORT}",
+        "It answers only at its own address and takes posts only from its own page. On a phone, through a tunnel:",
+        f"  ssh -L {PORT}:127.0.0.1:{PORT} you@this-computer   (an SSH app on the phone; then http://127.0.0.1:{PORT})",
+        f"  tailscale serve --bg {PORT}   (Tailscale on both; it passes its own name, so list that exact name, such as",
+        "  laptop.tail1234.ts.net, in AGON_ARENA_HOSTS, comma-separated: never a pattern, the check keeps other sites out)",
+        f"Now: AGON_ARENA_HOSTS is {hosts}" if hosts else "Now: AGON_ARENA_HOSTS isn't set: 127.0.0.1 and localhost only.",
+        "In a terminal: python agon.py watch follows the chat, python agon.py say TEXT posts as you, and python agon.py",
+        "export replay|scorecard writes one HTML file to share (keys, e-mail addresses and your home folder masked).")
+
+    # a plan's usage, which only Claude Code's status line reports; Agon keeps its percentages and reset times only
+    if windows:  # Claude Code runs it with Git Bash (backslashes vanish) or PowerShell (a quoted program is a string)
+        runner = Path(py).as_posix()
+        status = f'{runner if " " not in runner else "py"} "{Path(script).as_posix()}" statusline'
+    else:
+        status = shlex.join([py, script, "statusline"])
+    say("", "== Fuel: the plan's usage in the arena (optional; Claude Code only, on a Pro or Max plan)",
+        "Claude Code's status line gets the plan's 5-hour and 7-day usage. Agon's status line command keeps only those",
+        "percentages, their reset times and the session id (not the transcript or the folders), and prints a usual line.",
+        "A plugin can't set the status line: merge this into " + str(home / ".claude" / "settings.json") + " yourself:",
+        "  " + json.dumps({"statusLine": {"type": "command", "command": status}}),
+        "Without it (or in an IDE panel that shows no status line) the arena shows working, idle, out of quota and the",
+        "reset time, as for the other apps.")
+
+    # duels: a worktree has only what git tracks, so the setup command installs the rest in each one
+    setup_ = os.environ.get("AGON_SETUP_CMD", "").strip()
+    say("", "== Duels: two or three agents do the same task on branches of their own; you pick the winner (the arena)",
+        "Each works in a new git worktree from your last commit: no node_modules, .venv or .env there. AGON_SETUP_CMD",
+        "installs them in each worktree first (run like AGON_TEST_CMD: without a shell, as you, one worktree at a time,",
+        f"stopped after AGON_SETUP_TIMEOUT seconds, {SETUP_TIMEOUT}); AGON_ROOT tells it your project's folder, to copy",
+        "an .env from. A trap: after pip install -e with code under src/, Python in any worktree imports your main",
+        "folder's code, so every entry's tests test the same code. Give each worktree a virtual environment of its own:",
+        "a setup script that makes .venv there and runs pip install -e . in it, and a test command that names it by a",
+        "relative path, taken from the worktree: " + (r".venv\Scripts\python.exe" if windows else ".venv/bin/python")
+        + " -m pytest -q.",
+        f"Now: AGON_SETUP_CMD is {setup_}" if setup_ else "Now: AGON_SETUP_CMD isn't set: the worktrees get nothing but"
+        " what git tracks.")
 
 
 class Args(argparse.ArgumentParser):
