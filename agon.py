@@ -29,6 +29,7 @@ import shlex
 import shutil
 import signal
 import socket
+import socketserver
 import sqlite3
 import stat
 import subprocess
@@ -4831,6 +4832,12 @@ class Arena(ThreadingHTTPServer):
     undefined (Microsoft's docs; CPython issue gh-85307): there it is off, as socket.create_server leaves it."""
     allow_reuse_address = os.name != "nt"
     daemon_threads = True
+
+    def server_bind(self):
+        """Bind, without the name http.server looks up for the address (socket.getfqdn, a reverse DNS lookup that can
+        keep the arena from listening for a while): it answers at 127.0.0.1 and needs none."""
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):  # a page that closed mid-answer: nothing to report

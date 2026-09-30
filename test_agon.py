@@ -3651,9 +3651,9 @@ assert bad_hosts.returncode == 1 and "AGON_ARENA_HOSTS must list exact host name
 
 # The terminal. python agon.py say posts as the human, checked as the arena checks it: the text from its arguments, from
 # stdin (-) or from a file (UTF-8, a BOM dropped), for text PowerShell 5.1 or agon.cmd would mangle. STOP pauses the team
-def say_cli(*args, stdin=b""):  # (exit code, stdout, stderr)
+def say_cli(*args, stdin=b""):  # (exit code, stdout, stderr), with Windows' \r\n read as \n
     p = subprocess.run([sys.executable, SERVER, "say", *args], input=stdin, capture_output=True, env=ARENA_DB, timeout=60)
-    return p.returncode, p.stdout.decode("utf-8"), p.stderr.decode("utf-8")
+    return p.returncode, *(out.decode("utf-8").replace("\r\n", "\n") for out in (p.stdout, p.stderr))
 
 
 def human_said():
@@ -3688,7 +3688,8 @@ tricky = agon.newest_id()
 def watching(**env):  # a running watch and the lines it printed so far, as they come
     p = subprocess.Popen([sys.executable, SERVER, "watch"], stdout=subprocess.PIPE, env=ARENA_DB | env)
     lines = queue.Queue()
-    threading.Thread(target=lambda: [lines.put(row.decode("utf-8")) for row in p.stdout], daemon=True).start()
+    threading.Thread(target=lambda: [lines.put(row.decode("utf-8").replace("\r\n", "\n")) for row in p.stdout],
+                     daemon=True).start()  # (on Windows a text stream ends its lines with \r\n)
     return p, lines
 
 
@@ -3778,7 +3779,7 @@ def tree_label(run, duel):  # the entry whose worktree a run was in
 with duel_env(AGON_TEST_CMD=GREP, AGON_SETUP_CMD=setup_cmd()):
     FAKE_LOG.unlink(missing_ok=True)
     first = agon.newest_id()
-    duel = duel_one = dueled("EDIT notes.txt NAP=2 PICKY=claude", ["claude", "gpt", "gemini"])
+    duel = duel_one = dueled("EDIT notes.txt NAP=4 PICKY=claude", ["claude", "gpt", "gemini"])
     d, entries = duel_of(duel), agon.entries_of(duel)
     runs, heard_ = fake_runs(), said_since(first)
 assert d["state"] == "ready" and d["base"] == base and d["project"] == here, d
@@ -3803,15 +3804,15 @@ assert agon.compared(d["baseline"], by["gpt"]["tests"]) == "tests passed: they f
 # the agents worked at once, each in its own worktree, told to leave the commit to Agon; the reviews ran at once too
 tasks = [r for r in runs if r["app"] in APPS.values() and not {"plan", "read-only"} & set(r["args"])]
 reviews = [r for r in runs if r["app"] in APPS.values() and {"plan", "read-only"} & set(r["args"])]
-# (each app naps 2 s: one after another, the three would start 4 s apart)
-assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 1.8, tasks
-assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 1.8, reviews
+# (each app naps 4 s: one after another, they would start at least 4 s apart; gemini's review makes its copy first)
+assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 3.5, tasks
+assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 3.5, reviews
 for r in tasks:
     e = by[{v: k for k, v in APPS.items()}[r["app"]]]
     assert tree_label(r, duel) == e["label"] and r["asked_by"] == "human", r
     assert r["prompt"].startswith("The human asks you to do a task through Agon") and (
         f"commits what you changed to branch agon/duel-{duel}-{e['label']}, and" in r["prompt"]) and (
-        "runs the project's tests (`") in r["prompt"] and r["prompt"].endswith("The task:\nEDIT notes.txt NAP=2"
+        "runs the project's tests (`") in r["prompt"] and r["prompt"].endswith("The task:\nEDIT notes.txt NAP=4"
                                                                               " PICKY=claude"), r["prompt"]
 # each entry was reviewed by the next duelist in label order (A by B, B by C, C by A), read-only, with the tests Agon
 # ran on the work and before it; gemini's review in a throwaway copy of the entry's worktree
@@ -3823,7 +3824,7 @@ for i, e in enumerate(order):
     r = next(r for r in reviews if r["app"] == APPS[reviewer])  # each reviews one entry
     assert f"git diff {base[:12]} HEAD" in r["prompt"] and "On the work: Test results, run by Agon:" in r["prompt"] and (
         f"On {base[:12]}, before the work: Test results, run by Agon:") in r["prompt"] and r["prompt"].endswith(
-        "The task:\nEDIT notes.txt NAP=2 PICKY=claude") and r["asked_by"] == "human", r["prompt"]
+        "The task:\nEDIT notes.txt NAP=4 PICKY=claude") and r["asked_by"] == "human", r["prompt"]
     assert Path(r["cwd"]).name.startswith("agon-review-gemini-") if reviewer == "gemini" else tree_label(
         r, duel) == e["label"], (reviewer, r["cwd"])
 # each entry's work is one commit on its branch, by "Agon duel A", with what the app wrote and nothing the setup or the
@@ -3831,7 +3832,7 @@ for i, e in enumerate(order):
 for e in entries:
     branch = f"agon/duel-{duel}-{e['label']}"
     assert e["branch"] == branch and git_in(duelrepo, "log", "-1", "--format=%an <%ae>|%s", branch) == (
-        f"Agon duel {e['label'].upper()} <agon@localhost>|Duel #{duel}, entry {e['label'].upper()}: EDIT notes.txt NAP=2"
+        f"Agon duel {e['label'].upper()} <agon@localhost>|Duel #{duel}, entry {e['label'].upper()}: EDIT notes.txt NAP=4"
         " PICKY=claude"), e
     assert git_in(duelrepo, "show", f"{branch}:notes.txt") == f"written by {APPS[e['agent']]}"
     assert git_in(duelrepo, "diff", "--name-only", base, branch) == "notes.txt" and json.loads(e["files"]) == [
@@ -3847,7 +3848,7 @@ assert shown["id"] == duel and [e["agent"] for e in shown["entries"]] == [None] 
     e["reviewer"] is None and e["reviewed"] for e in shown["entries"]), shown
 assert [e["label"] for e in shown["entries"]] == ["A", "B", "C"] and "answer" not in shown["entries"][0]
 full = agon.duel_state(duel)
-assert full["prompt"] == "EDIT notes.txt NAP=2 PICKY=claude" and full["report"] == d["report"] and all(
+assert full["prompt"] == "EDIT notes.txt NAP=4 PICKY=claude" and full["report"] == d["report"] and all(
     e["agent"] is None and e["stat"] and e["review"] and e["report"] for e in full["entries"]), full
 # the human picks: whose work each entry was shows now, with how to merge the winner (Agon never merges)
 won = by["gpt"]["label"]
@@ -4081,22 +4082,30 @@ for sig in () if os.name == "nt" else (signal.SIGTERM, signal.SIGHUP):  # (SIGHU
     env = {key: value for key, value in (ARENA_DB | DUEL_ENV).items() if value is not None} | {"BROWSER": "true"}
     server = subprocess.Popen([sys.executable, "-c", "import sys, agon\nagon.PORT = int(sys.argv[1])\n"
                                "sys.exit(agon.main([]))", str(agon.PORT)], cwd=HERE, env=env, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+                              stderr=subprocess.STDOUT, text=True)
+    printed, output = queue.Queue(), []
+    threading.Thread(target=lambda: [*map(printed.put, server.stdout), printed.put(None)], daemon=True).start()
     try:
-        until(lambda: subprocess.run([sys.executable, "-c", "import socket, sys\nsocket.create_connection(('127.0.0.1',"
-                                      " int(sys.argv[1])), 1)", str(agon.PORT)], capture_output=True).returncode == 0, 30)
+        first_line = printed.get(timeout=120)  # it listens once it says so
+        if not (first_line or "").startswith("Agon arena: "):
+            with contextlib.suppress(queue.Empty):
+                while (line := printed.get(timeout=5)) is not None:
+                    output.append(line)
+            raise AssertionError(f"the arena didn't start ({server.poll()}): {first_line!r}{''.join(output)}")
         code_, text = arena_post(json.dumps({"prompt": "HANG", "agents": ["claude", "gpt"], "folder": str(duelrepo)}),
                                  path="/duel")
         duel = json.loads(text)["duel"]
         until(lambda: all(e["state"] == "working" for e in agon.entries_of(duel)) and beating(), 30)
         server.send_signal(sig)
-        out, err = server.communicate(timeout=90)
+        server.wait(90)
     finally:
         if server.poll() is None:
             server.kill()
-            server.communicate()
-    assert server.returncode == 0 and "agon: the duel stops: its apps end, and its worktrees and branches go" in err, (
-        sig, server.returncode, out, err)
+        server.wait(30)
+    while (line := printed.get(timeout=30)) is not None:
+        output.append(line)
+    assert server.returncode == 0 and "agon: the duel stops: its apps end, and its worktrees and branches go..." in \
+           "".join(output), (sig, server.returncode, output)
     assert duel_of(duel)["state"] == "stopped" and duel_of(duel)["note"] == "the arena closed" and not beating(), sig
     assert not [b for b in duel_branches() if b.startswith(f"agon/duel-{duel}-")], sig
     assert git_in(duelrepo, "worktree", "list", "--porcelain").count("worktree ") == 1, sig
