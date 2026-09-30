@@ -892,17 +892,42 @@ assert agon.MODE_ARGS["review"] == {"claude": ["--permission-mode", "plan"], "gp
 # first, and words that name apps: BREAK=agy crashes agy's task, IDLE=codex leaves codex's task undone, PICKY=claude
 # makes claude's reviews ask for changes)
 FAKE, FAKE_LOG, BEAT = Path(TMP, "fake_app.py"), Path(TMP, "fake.log"), Path(TMP, "beat.txt")
+# The fakes write down each run as a line of JSON. A duel's apps start at once, and on Windows an append isn't atomic
+# (it finds the file's end, then writes there): two at once can overwrite each other's line. A lock gives them turns
+Path(TMP, "fake_log.py").write_text(r'''import json, os, time
+def logged(record):
+    with open(os.environ["FAKE_LOG"] + ".lock", "a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.01)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)  # let go when the file closes
+        try:
+            with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
+                log.write(json.dumps(record) + "\n")
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+''', encoding="utf-8")
 FAKE.write_text(r'''"""A fake Claude Code, Codex or Antigravity for ask: python fake_app.py claude|codex|agy ARGS..."""
 import json, os, subprocess, sys, time
+from fake_log import logged
 app, args = sys.argv[1], sys.argv[2:]
 prompt = next((a[3:] for a in args if a.startswith("-p=")), None)
 via = "stdin" if prompt is None else "args"
 if prompt is None:
     prompt = sys.stdin.buffer.read().decode("utf-8")
-with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
-    log.write(json.dumps({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
-                          "asked_by": os.environ.get("AGON_ASKED_BY"), "t": time.time(),
-                          "inbox": sorted(k for k in os.environ if k.startswith("CLAUDE_CODE_MESSAGING_"))}) + "\n")
+logged({"app": app, "args": args, "prompt": prompt, "via": via, "cwd": os.getcwd(),
+        "asked_by": os.environ.get("AGON_ASKED_BY"), "t": time.time(),
+        "inbox": sorted(k for k in os.environ if k.startswith("CLAUDE_CODE_MESSAGING_"))})
 def named(key):  # the apps that a word like BREAK=agy,codex in the prompt names
     return [name for word in prompt.split() if word.startswith(key + "=") for name in word[len(key) + 1:].split(",")]
 reviewing = bool({"plan", "read-only"} & set(args))
@@ -1528,15 +1553,14 @@ except agon.ToolError as e:
 FAKE_TESTS = Path(TMP, "fake_tests.py")
 FAKE_TESTS.write_text(r'''"""A fake test command: python fake_tests.py MODE ARGS..."""
 import json, os, subprocess, sys, time
+from fake_log import logged
 mode, args = sys.argv[1], sys.argv[2:]
-with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
-    log.write(json.dumps({"app": "tests", "mode": mode, "args": args, "cwd": os.getcwd(), "stdin": sys.stdin.read(),
-                          "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_",
-                                                                                     "CLAUDE_CODE_MESSAGING_"))),
-                          "files": sorted(os.listdir(".")), "root": os.environ.get("AGON_ROOT"), "t": time.time()}) + "\n")
+logged({"app": "tests", "mode": mode, "args": args, "cwd": os.getcwd(), "stdin": sys.stdin.read(),
+        "settings": sorted(k for k in os.environ if k.startswith(("AGON_", "CLAUDE_PLUGIN_OPTION_",
+                                                                   "CLAUDE_CODE_MESSAGING_"))),
+        "files": sorted(os.listdir(".")), "root": os.environ.get("AGON_ROOT"), "t": time.time()})
 def end():  # when a run ended, to see that two never overlap
-    with open(os.environ["FAKE_LOG"], "a", encoding="utf-8") as log:
-        log.write(json.dumps({"app": "tests-end", "mode": mode, "cwd": os.getcwd(), "t": time.time()}) + "\n")
+    logged({"app": "tests-end", "mode": mode, "cwd": os.getcwd(), "t": time.time()})
 def beat():  # a child that keeps writing, to see whether it is stopped
     subprocess.Popen([sys.executable, "-c", "import sys, time\nfor _ in range(1200):\n"
                       "    open(sys.argv[1], 'a').write('.')\n    time.sleep(0.05)", os.environ["FAKE_BEAT"]])
