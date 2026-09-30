@@ -3747,7 +3747,7 @@ def tree_label(run, duel):  # the entry whose worktree a run was in
 with duel_env(AGON_TEST_CMD=GREP, AGON_SETUP_CMD=setup_cmd()):
     FAKE_LOG.unlink(missing_ok=True)
     first = agon.newest_id()
-    duel = dueled("EDIT notes.txt NAP=1 PICKY=claude", ["claude", "gpt", "gemini"])
+    duel = duel_one = dueled("EDIT notes.txt NAP=1 PICKY=claude", ["claude", "gpt", "gemini"])
     d, entries = duel_of(duel), agon.entries_of(duel)
     runs, heard_ = fake_runs(), said_since(first)
 assert d["state"] == "ready" and d["base"] == base and d["project"] == os.path.normpath(duelrepo), d
@@ -3842,7 +3842,7 @@ for args, why in (((duel, won), "its winner is picked already"), ((999, "a"), "T
 with duel_env():
     FAKE_LOG.unlink(missing_ok=True)
     first = agon.newest_id()
-    duel = dueled("EDIT notes.txt BREAK=agy IDLE=codex", ["claude", "gpt", "gemini"])
+    duel = duel_two = dueled("EDIT notes.txt BREAK=agy IDLE=codex", ["claude", "gpt", "gemini"])
     d, by, runs = duel_of(duel), {e["agent"]: e for e in agon.entries_of(duel)}, fake_runs()
 assert d["state"] == "ready" and d["baseline"] is None and not [r for r in runs if r["app"] == "tests"], d
 assert by["gemini"]["state"] == "failed" and by["gemini"]["problem"].startswith("gemini failed after") and (
@@ -3876,7 +3876,7 @@ assert agon.duel_state(duel)["entries"][0]["agent"] in ("claude", "gpt", "gemini
 # alone. It fails everywhere: the duel fails, and leaves nothing behind
 nxt = agon.db().execute("SELECT COALESCE(MAX(id), 0) + 1 FROM duels").fetchone()[0]
 with duel_env(AGON_TEST_CMD=GREP, AGON_SETUP_CMD=setup_cmd(f"duel-{nxt}b", "base")):
-    duel = dueled("EDIT notes.txt", ["claude", "gpt", "gemini"])
+    duel = duel_setup = dueled("EDIT notes.txt", ["claude", "gpt", "gemini"])
     d, entries = duel_of(duel), agon.entries_of(duel)
 b = next(e for e in entries if e["label"] == "b")
 assert duel == nxt and d["state"] == "ready" and d["baseline"] == "setup failed" and "setup: a package failed to" \
@@ -4068,6 +4068,96 @@ if os.name != "nt":  # SIGTERM ends `python agon.py` like Ctrl+C: its running du
     assert duel_of(duel)["state"] == "stopped" and duel_of(duel)["note"] == "the arena closed" and not beating()
     assert not [b for b in duel_branches() if b.startswith(f"agon/duel-{duel}-")]
     assert git_in(duelrepo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+# The scoreboard, per project: for each agent the duels it won of the picked ones it worked in, the runs of the human's
+# tests on its work that passed, and its work that reviewers approved (and how much at the first review). A duel counts
+# only once its winner is picked: before, the scores would tell whose entry is whose
+
+
+def scores(project):
+    return {a["name"]: a for a in next(p for p in agon.scoreboard() if p["project"] == project)["agents"]}
+
+
+here = os.path.normpath(duelrepo)
+first_review = {e["agent"]: e["verdict"] for e in agon.entries_of(duel_one)}  # one entry was reviewed by PICKY claude
+got = scores(here)
+assert (got["claude"]["duels"], got["gpt"]["duels"], got["gemini"]["duels"]) == (
+    {"won": 1, "of": 2}, {"won": 1, "of": 2}, {"won": 0, "of": 2}), got  # duels 1 and 2; the rest aren't picked
+assert (got["claude"]["tests"], got["gpt"]["tests"], got["gemini"]["tests"]) == (
+    {"passed": 0, "of": 1}, {"passed": 1, "of": 1}, {"passed": 0, "of": 1}), got  # duel 2 ran no tests
+assert got["claude"]["reviews"] == {"approved": 2, "first": 2, "of": 2}, got["claude"]
+for name in ("gpt", "gemini"):
+    approved = int(first_review[name] == "approve")
+    assert got[name]["reviews"] == {"approved": approved, "first": approved, "of": 1}, (name, got[name])
+# picking a ready duel's winner updates it: a win for the winner, a duel for each agent that worked in it (not the one
+# whose setup failed), and their tests
+entries = agon.entries_of(duel_setup)
+won = next(e for e in entries if e["stat"])
+agon.pick_duel(duel_setup, won["label"])
+after = scores(here)
+for e in entries:
+    worked = e["state"] != "setup failed"
+    assert after[e["agent"]]["duels"] == {"won": got[e["agent"]]["duels"]["won"] + (e is won),
+                                          "of": got[e["agent"]]["duels"]["of"] + worked}, (e, after[e["agent"]])
+    assert after[e["agent"]]["tests"]["of"] == got[e["agent"]]["tests"]["of"] + worked, (e, after[e["agent"]])
+# Board tasks count for their owner: each done's test run once (its verdict carries it; a task still in review waits for
+# one), and each task's verdicts, the first one apart. Task asks count for the agent that answered; review asks don't
+# (whose work they judge is unknown), and neither do runs that found no test command. Hints need HINT_MIN results in one
+# kind of file (a board task approved at its first review, or a picked duel won); the best agent is named only when two
+# or more have enough results and it is ahead
+shop = os.path.normpath("/work/shop")
+
+
+def board_work(owner, files, rounds, state="done"):  # a task and its verdicts, each with the tests of its done
+    tid = agon.db().execute("INSERT INTO tasks(title, author, created, updated, state, owner, files, project, tests)"
+                            " VALUES ('Work', 'lead', 1, 1, ?, ?, ?, ?, ?)", (state, owner, json.dumps(files), shop,
+                                                                            rounds[-1][1] if rounds else None)).lastrowid
+    for i, (verdict, tests) in enumerate(rounds):
+        agon.db().execute("INSERT INTO reviews(task, owner, reviewer, verdict, tests, at) VALUES (?, ?, 'rev', ?, ?, ?)",
+                          (tid, owner, verdict, tests, 50 + i))
+    return tid
+
+
+P, F, T = "tests passed", "tests failed", "tests timed out"
+board_work("gpt", ["src/a.py"], [("approve", P)])
+board_work("gpt", ["src/b.py", "README.md"], [("changes", F), ("approve", P)])
+board_work("gpt", ["src/c.py"], [("approve", P)])
+agon.db().execute("INSERT INTO tasks(title, author, created, updated, state, owner, files, project, tests) VALUES"
+                  " ('Waits', 'lead', 1, 1, 'review', 'gpt', '[\"src/d.py\"]', ?, ?)", (shop, T))
+board_work("claude", ["x.py"], [("approve", agon.NO_TESTS)])
+board_work("claude", ["y.py"], [("changes", F)], state="doing")
+board_work("claude", ["z.py"], [("changes", F), ("changes", F)], state="doing")
+board_work("gemini", ["g.py"], [("approve", P)])
+board_work("gemini", ["h.py"], [("approve", P)])
+for asker, agent_, answered, mode, tests in (("claude", "gpt", "gpt", "task", P), ("claude", "gpt", "gemini", "task", F),
+                                             ("gpt", "claude", "claude", "task", agon.NO_TESTS),
+                                             ("gpt", "claude", "claude", "review", P)):
+    agon.db().execute("INSERT INTO asks(asker, agent, mode, project, started, ended, answered, tests) VALUES (?, ?, ?,"
+                      " ?, 1, 2, ?, ?)", (asker, agent_, mode, shop, answered, tests))
+got = scores(shop)
+assert got["gpt"] == {"name": "gpt", "duels": {"won": 0, "of": 0}, "tests": {"passed": 4, "of": 6},
+                      "reviews": {"approved": 3, "first": 2, "of": 3}}, got["gpt"]
+assert got["claude"] == {"name": "claude", "duels": {"won": 0, "of": 0}, "tests": {"passed": 0, "of": 3},
+                         "reviews": {"approved": 1, "first": 1, "of": 3}}, got["claude"]
+assert got["gemini"]["tests"] == {"passed": 2, "of": 3} and got["gemini"]["reviews"] == {"approved": 2, "first": 2,
+                                                                                          "of": 2}, got["gemini"]
+board = {p["project"]: p for p in agon.scoreboard()}
+assert list(board) == [here, shop]  # newest work first; work without a project isn't counted
+assert board[shop]["hints"] == [{"kind": ".py", "best": "gpt", "agents": [{"name": "gpt", "good": 2, "of": 3},
+                                                                          {"name": "claude", "good": 1, "of": 3}]}], \
+    board[shop]["hints"]  # gemini has 2 results, gpt 1 in .md: below HINT_MIN
+board_work("gemini", ["lib/k.PY"], [("approve", P)])
+for owner, rounds in (("gpt", [("approve", P)]), ("gpt", [("approve", P)]), ("gpt", [("changes", F), ("approve", P)]),
+                      ("claude", [("approve", P)]), ("claude", [("changes", F), ("approve", P)]),
+                      ("claude", [("approve", P)])):
+    board_work(owner, ["web/app.ts"], rounds)
+hints = {h["kind"]: h for h in {p["project"]: p for p in agon.scoreboard()}[shop]["hints"]}
+assert hints[".py"]["best"] == "gemini" and [a["name"] for a in hints[".py"]["agents"]] == ["gemini", "gpt", "claude"]
+assert hints[".ts"] == {"kind": ".ts", "best": None, "agents": [{"name": "claude", "good": 2, "of": 3},
+                                                               {"name": "gpt", "good": 2, "of": 3}]}, hints[".ts"]
+assert agon.kind_of("docs\\Guide.MD") == ".md" and agon.kind_of("Dockerfile") == "Dockerfile" and agon.kind_of(
+    ".gitignore") == ".gitignore"
+assert agon.arena_state()["score"] == agon.scoreboard()
 
 agon.close_db()
 agon.DB = test_db

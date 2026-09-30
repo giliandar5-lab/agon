@@ -3400,7 +3400,8 @@ def team_state(now):
 def arena_state(now=None):
     """What the arena shows, as JSON: whether the team is paused, autopilot, the roster (see team_state()), the open
     tasks and the latest done ones (without their long texts: GET /board?id=N has one in full), the latest asks, the
-    latest duels (GET /board?duel=N has one in full), the commands a duel runs and the folder its form starts with."""
+    latest duels (GET /board?duel=N has one in full), the commands a duel runs, the folder its form starts with, and
+    the scoreboard."""
     now = now or time.time()
     everything = board_tasks()
     states = {t["id"]: t["state"] for t in everything}
@@ -3418,7 +3419,7 @@ def arena_state(now=None):
     auto = autopilot_state(now)
     return {"now": now, "paused": paused(), "autopilot": auto, "team": team_state(now), "tasks": tasks,
             "done": len(done), "asks": asks, "duels": duels_state(), "checks": checks_state(),
-            "project": default_project(auto)}
+            "project": default_project(auto), "score": scoreboard()}
 
 
 def task_state(tid):
@@ -3920,6 +3921,94 @@ def default_project(auto):
     return row and row[0]
 
 
+# The scoreboard, per project: only work whose author Agon knows counts (board tasks, task asks, duel entries), and every
+# number is a count with what it is out of. A duel counts once the human picked its winner: before that, whose entry is
+# whose stays hidden, and the scores would tell
+HINT_MIN = 3  # results an agent needs in a kind of file before a hint names it
+RAN = ("tests passed", "tests failed", "tests timed out")  # a test run that says something about the work
+
+
+def kind_of(path):
+    """The kind of a file, for the hints: its extension (.py), or its name when it has none (Dockerfile)."""
+    name = posixpath.basename(path.replace("\\", "/"))
+    return os.path.splitext(name)[1].lower() or name
+
+
+def scoreboard():
+    """The scoreboard, per project (the top folder of its repository), newest activity first. For each agent: the duels it
+    won of the picked ones it worked in (not when the setup failed in its worktree); the runs of the human's tests on its work that passed (at board done, in task asks,
+    in duels); and its work that reviewers approved: board tasks (per task, its first verdict or after changes) and duel
+    entries. Hints: for each kind of file, the agents with at least HINT_MIN results in it, where a result is a board
+    task approved at its first review or not, or a picked duel won or not; the best one is named only when two or more
+    have enough results and it is ahead."""
+    con, projects = db(), {}
+
+    def scores(project, name, at):
+        p = projects.setdefault(project, {"at": 0, "agents": {}, "kinds": {}})
+        p["at"] = max(p["at"], at or 0)
+        return p["agents"].setdefault(name, {"duels": [0, 0], "tests": [0, 0], "reviews": [0, 0, 0]})
+
+    def tested(counts, tests):
+        if tests in RAN:
+            counts["tests"][0] += tests == "tests passed"
+            counts["tests"][1] += 1
+
+    def result(project, name, files, good):
+        for kind in {kind_of(f) for f in files if isinstance(f, str)}:
+            counts = projects[project]["kinds"].setdefault(kind, {}).setdefault(name, [0, 0])
+            counts[0] += good
+            counts[1] += 1
+
+    rounds = {}  # (task, owner) -> its project, files and verdicts, in order: one verdict for each done
+    for task, owner, verdict_, tests, at, project, files in con.execute(
+            "SELECT r.task, r.owner, r.verdict, r.tests, r.at, t.project, t.files FROM reviews r JOIN tasks t ON t.id ="
+            " r.task WHERE t.project IS NOT NULL ORDER BY r.id"):
+        tested(scores(project, owner, at), tests)
+        rounds.setdefault((task, owner), (project, files, []))[2].append(verdict_)
+    for (task, owner), (project, files, verdicts) in rounds.items():
+        counts = scores(project, owner, None)
+        counts["reviews"][0] += "approve" in verdicts
+        counts["reviews"][1] += verdicts[0] == "approve"
+        counts["reviews"][2] += 1
+        result(project, owner, json.loads(files), verdicts[0] == "approve")
+    for owner, tests, at, project in con.execute("SELECT owner, tests, updated, project FROM tasks WHERE state ="
+                                                 " 'review' AND owner IS NOT NULL AND project IS NOT NULL"):
+        tested(scores(project, owner, at), tests)  # its latest done, still waiting for a verdict
+    for name, tests, at, project in con.execute("SELECT COALESCE(answered, agent), tests, ended, project FROM asks WHERE"
+                                                " mode = 'task' AND ended IS NOT NULL AND project IS NOT NULL"):
+        tested(scores(project, name, at), tests)
+    for project, state, winner, at, name, label, entered, tests, verdict_, files in con.execute(
+            "SELECT d.project, d.state, d.winner, COALESCE(d.ended, d.started), e.agent, e.label, e.state, e.tests,"
+            " e.verdict, e.files FROM duels d JOIN entries e ON e.duel = d.id WHERE d.state NOT IN ('running',"
+            " 'ready')"):
+        counts = scores(project, name, at)
+        tested(counts, tests)
+        if verdict_:
+            counts["reviews"][0] += verdict_ == "approve"
+            counts["reviews"][1] += verdict_ == "approve"
+            counts["reviews"][2] += 1
+        if state == "picked" and entered != "setup failed":  # the human's setup failed there: no loss of the agent's
+            counts["duels"][0] += label == winner
+            counts["duels"][1] += 1
+            result(project, name, json.loads(files), label == winner)
+    shown = []
+    for project, p in sorted(projects.items(), key=lambda item: -item[1]["at"])[:10]:
+        hints = []
+        for kind, per in sorted(p["kinds"].items()):
+            enough = sorted(([name, good, of] for name, (good, of) in per.items() if of >= HINT_MIN),
+                            key=lambda row: (-row[1] / row[2], -row[2], row[0]))
+            if enough:
+                ahead = len(enough) > 1 and enough[0][1] / enough[0][2] > enough[1][1] / enough[1][2]
+                hints.append({"kind": kind, "best": enough[0][0] if ahead else None,
+                              "agents": [{"name": name, "good": good, "of": of} for name, good, of in enough]})
+        shown.append({"project": project, "hints": hints, "agents": [
+            {"name": name, "duels": {"won": c["duels"][0], "of": c["duels"][1]},
+             "tests": {"passed": c["tests"][0], "of": c["tests"][1]},
+             "reviews": {"approved": c["reviews"][0], "first": c["reviews"][1], "of": c["reviews"][2]}}
+            for name, c in sorted(p["agents"].items())]})
+    return shown
+
+
 def gauge_windows(limits):
     """The windows of a plan's usage in Claude Code's status line input (`rate_limits`): (its name, the percentage used,
     when it resets or None), each window as reported. A window can be missing: it is then unknown, never 0%."""
@@ -4065,6 +4154,8 @@ label.check { display: inline-flex; gap: 6px; align-items: center; margin-right:
 .entry { background: var(--panel); border: 1px solid var(--line); margin: 0; }
 .entry.won { border: 2px solid var(--good); }
 code { font: 13px ui-monospace, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+#score-project { margin: 10px 0 0; max-width: 100%; }
+.hint { margin: 6px 0; }
 @media (min-width: 1100px) {
   main { grid-template-columns: 300px minmax(0, 1fr) 420px; }
   #team { display: block !important; border-right: 1px solid var(--line); }
@@ -4088,7 +4179,8 @@ ARENA_MAIN = """<nav id="tabs">
 {composer}</section>
 <section id="board" class="panel side"><div id="tasks"></div></section>
 <section id="duels" class="panel side"><div id="duel-form"></div><div id="duel-list"></div></section>
-<section id="score" class="panel side"><div id="scores"></div></section>
+<section id="score" class="panel side"><select id="score-project" aria-label="Project" hidden></select>
+<div id="scores"></div></section>
 </main>
 <div id="detail" hidden><div class="sheet"><div class="row"><span class="grow"></span>
 <button type="button" id="close">Close</button></div><div id="detail-body"></div></div></div>"""
@@ -4268,6 +4360,35 @@ function renderDuel(d, box) {  // one duel in full: what each agent said, its re
       if (text) box.append(el('div', 'small', label), el('pre', 'text', text));
   }
 }
+const HINT_MIN = 3;
+function ratio(a, b) { return b ? a + ' of ' + b : '–'; }
+function renderScores(projects, box, chosen) {  // one project's scoreboard: `chosen`, else the one with the latest work
+  if (!projects.length) return box.replaceChildren(el('h2', '', 'Score'), el('div', 'small', 'No scores yet: they come'
+    + ' from board tasks, task asks and duels, per project.'));
+  const p = projects.find(x => x.project === chosen) || projects[0], table = el('table'), head = el('tr');
+  for (const h of ['Agent', 'Duels won', 'Tests passed', 'Work approved']) head.append(el('th', '', h));
+  table.append(head);
+  for (const a of p.agents) {
+    const row = el('tr'), name = el('td');
+    name.append(el('b', who(a.name), a.name));
+    row.append(name, el('td', '', ratio(a.duels.won, a.duels.of)), el('td', '', ratio(a.tests.passed, a.tests.of)),
+      el('td', '', ratio(a.reviews.approved, a.reviews.of) + (a.reviews.of ? ', ' + a.reviews.first + ' at the first'
+        + ' review' : '')));
+    table.append(row);
+  }
+  const parts = [el('h2', '', 'Score'), el('div', 'small', p.project), table, el('h2', '', 'Hints')];
+  if (!p.hints.length) parts.push(el('div', 'small', 'None yet: a hint needs an agent with ' + HINT_MIN + ' results in'
+    + ' one kind of file.'));
+  for (const h of p.hints) {
+    const line = el('div', 'hint');
+    line.append(el('code', '', h.kind), ': ' + h.agents.map(a => a.name + ' ' + a.good + ' of ' + a.of).join(', '));
+    if (h.best) line.append(' — give such tasks to ', el('b', who(h.best), h.best));
+    parts.push(line);
+  }
+  parts.push(el('div', 'small', 'A result: a board task approved at its first review, or a duel won. Only counts, only'
+    + ' this project: small numbers say little.'));
+  box.replaceChildren(...parts);
+}
 function tabs(initial) {  // the phone's tabs; on a wide screen the chat and the team stay, and the tabs pick the side panel
   const wide = matchMedia('(min-width: 1100px)');
   function show(panel) {
@@ -4435,6 +4556,16 @@ async function duelAct(what, id, label) {
 }
 const drawForm = duelForm($('#duel-form'));
 panels.push(s => { drawForm(s); renderDuels(s.duels, $('#duel-list'), duelAct); });
+const scoreProject = $('#score-project');  // which project's scores: the latest one, unless the human picks another
+scoreProject.addEventListener('change', () => { if (shown) renderScores(shown.score, $('#scores'), scoreProject.value); });
+panels.push(s => {
+  const names = s.score.map(p => p.project), picked = scoreProject.value;
+  if (names.join('\n') !== [...scoreProject.options].map(o => o.value).join('\n'))
+    scoreProject.replaceChildren(...names.map(name => el('option', '', name)));
+  scoreProject.value = names.includes(picked) ? picked : names[0] || '';
+  scoreProject.hidden = names.length < 2;
+  renderScores(s.score, $('#scores'), scoreProject.value);
+});
 setInterval(() => { if (shown && !document.hidden) update(shown); }, 30000);  // "for 5 min" moves on
 connect();
 """
