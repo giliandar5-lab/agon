@@ -3803,9 +3803,9 @@ assert agon.compared(d["baseline"], by["gpt"]["tests"]) == "tests passed: they f
 # the agents worked at once, each in its own worktree, told to leave the commit to Agon; the reviews ran at once too
 tasks = [r for r in runs if r["app"] in APPS.values() and not {"plan", "read-only"} & set(r["args"])]
 reviews = [r for r in runs if r["app"] in APPS.values() and {"plan", "read-only"} & set(r["args"])]
-assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 1.8, tasks  # each naps 2 s:
-assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 1.8, reviews  # 4 s apart
-# one after another
+# (each app naps 2 s: one after another, the three would start 4 s apart)
+assert len(tasks) == 3 and max(r["t"] for r in tasks) - min(r["t"] for r in tasks) < 1.8, tasks
+assert len(reviews) == 3 and max(r["t"] for r in reviews) - min(r["t"] for r in reviews) < 1.8, reviews
 for r in tasks:
     e = by[{v: k for k, v in APPS.items()}[r["app"]]]
     assert tree_label(r, duel) == e["label"] and r["asked_by"] == "human", r
