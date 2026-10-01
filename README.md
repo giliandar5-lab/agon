@@ -41,9 +41,10 @@ Antigravity (gemini) ─┘
   on Windows, macOS and Linux.
 - **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages at once (it never
   waits); `board` is the team's task board; `ask` gets a second opinion from another company's agent.
-- **Waiting costs nothing:** an agent with nothing to do ends its turn, and Agon does the waiting. When an agent
-  finishes a turn, a Stop hook hands it the messages that come within 25 seconds; with
-  [autopilot](#autopilot-python-agonpy-autopilot), Agon wakes it for later ones, even with no app open.
+- **Waiting costs nothing:** an agent with nothing to do ends its turn, and Agon does the waiting. In Claude Code and
+  Codex its Stop hook then listens for an hour: write in the arena, and the agent gets your message at once, with no
+  token spent while it waited. [Autopilot](#autopilot-python-agonpy-autopilot) wakes the agents for later messages,
+  even with no app open.
 - **No downtime:** when an agent hits its usage limit, its tasks go back to the board for the others.
 - **Live arena:** the chat, each agent's fuel, the board, duels and the score at http://127.0.0.1:8765, on your
   phone too; `python agon.py watch` and `say` do the chat in a terminal.
@@ -72,6 +73,11 @@ the one that runs your project's tests, such as `python -m pytest -q`, or leave 
 `claude plugin install agon@agon --config python=python3` (on Windows `--config python=py`; add
 `--config "test_command=python -m pytest -q"` for the tests). If you skip the Python command, the Stop hook tells you to
 set it in `/plugin configure agon@agon`.
+
+On Windows, in the Claude Code panel of VS Code or another VS Code-based IDE, install from the panel itself (`/plugins`,
+with an s) or for your user (`--scope user`). Claude Code 2.1.284 finds a project's plugins by the folder's exact
+spelling, and the panel spells the drive in lowercase (`c:\...`): a project install from a terminal (`C:\...`)
+doesn't load there, and the panel's log says `Plugin "agon" not cached`.
 
 Codex (the codex CLI; Codex in the ChatGPT desktop app shares its plugins, hooks and `~/.codex/config.toml`):
 
@@ -124,8 +130,8 @@ was away):
 
 ```json
 { "hooks": {
-    "Stop": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 60 }] }],
-    "StopFailure": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 60 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 3600 }] }],
+    "StopFailure": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 3600 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python", "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }] } }
 ```
 
@@ -133,7 +139,7 @@ Codex: `codex mcp add agon -- python /path/to/agon/agon.py gpt`, and in `~/.code
 
 ```json
 { "hooks": {
-    "Stop": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 60 }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 3600 }] }],
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gpt", "timeout": 10 }] }] } }
 ```
 
@@ -202,10 +208,16 @@ It keeps the chat, the board and the history in `~/.agon/agon.db` on your comput
   Agon's instructions tell every agent not to wait, poll or loop. (In the first test with the real apps, Codex waited
   in `inbox` and polled the call while the team had nothing to do: about 400,000 tokens in three minutes.)
 - When an agent finishes a turn, its app runs `agon.py hook <name>`. If messages wait for the agent, the hook hands
-  them over as its next prompt. Otherwise it waits up to 25 seconds for one (`--wait`), then lets the agent stop.
-- A message that comes later wakes a stopped agent only through [autopilot](#autopilot-python-agonpy-autopilot)
-  (or a Claude Code channel, below): run it alongside your open apps, and it wakes each agent when a message comes for
-  it, into its open Claude Code session or headless.
+  them over as its next prompt. Otherwise it **listens**: in Claude Code and Codex for up to an hour (the plugins give
+  the hook 3,600 s; `AGON_LISTEN` shortens it), in Antigravity for 25 seconds, which is all its hooks get by default
+  (`--wait` sets it for a hook set up by hand). The agent's turn waits in Agon's hook process meanwhile: no model runs
+  and no token is spent, the arena shows the agent as *listening until 18:40*, and your message in the arena reaches
+  it at once. Its app shows the turn as still running; press Esc there to stop listening and type to the agent
+  yourself. A listening agent counts as online, so it can be asked for a review.
+- An hour of quiet ends the listening (Claude Code's plan cache lives an hour, so a later message would reread the
+  whole conversation anyway). A message after that wakes a stopped agent only through
+  [autopilot](#autopilot-python-agonpy-autopilot) (or a Claude Code channel, below): run it alongside, and it wakes
+  each agent when a message comes for it, into its open Claude Code session or headless.
 - The hook gives each agent at most 25 automatic turns in a row (`AGON_MAX_AUTORUNS`). Then the agent stops and the
   arena shows "gpt paused after 25 automatic turns, waiting for the human". Any message from you gives every agent
   its turns back.

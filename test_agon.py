@@ -690,7 +690,7 @@ option = claude_plugin["userConfig"]["test_command"]
 assert option["type"] == "string" and option["title"] == "Test command" and option["default"] == "", option
 assert "python -m pytest -q" in option["description"], option
 assert "AGON_TEST_CMD, when set, comes first" in option["description"], option
-for event, timeout in (("Stop", 60), ("StopFailure", 60),  # a turn that ends in an API error runs StopFailure
+for event, timeout in (("Stop", 3600), ("StopFailure", 3600),  # a turn that ends in an API error runs StopFailure
                        ("UserPromptSubmit", 10)):  # Phase 4: before a turn, tasks that went to others while away
     assert claude_plugin["hooks"][event] == [{"hooks": [{"type": "command", "command": python, "timeout": timeout,
                                                          "args": ["${CLAUDE_PLUGIN_ROOT}/agon.py", "hook", "claude"]}]}]
@@ -706,6 +706,7 @@ assert agon.ENV_VARS == ["AGON_DB", "AGON_ASKED_BY", "AGON_CMD_CLAUDE", "AGON_CM
                          "AGON_AUTOPILOT"] and agon.TOOL_TIMEOUT == 960
 [codex_stop] = codex_plugin["hooks"]["hooks"]["Stop"][0]["hooks"]
 assert set(codex_stop) == {"type", "command", "commandWindows", "timeout"}, codex_stop
+assert codex_stop["timeout"] == agon.HOOK_TIMEOUT == 3600  # Phase 7.1: the Stop hook listens for an hour
 [codex_prompt] = codex_plugin["hooks"]["hooks"]["UserPromptSubmit"][0]["hooks"]  # Phase 4: the same command, sooner
 assert codex_prompt == codex_stop | {"timeout": 10} and set(codex_plugin["hooks"]["hooks"]) == {"Stop", "UserPromptSubmit"}
 antigravity = manifest("plugin.json")
@@ -764,7 +765,7 @@ for extra in ({}, {"AGON_DB": str(Path(TMP, "team2.db")), "AGON_TEST_CMD": "npm 
     # status line
     [claude_hook] = snippets[0]["hooks"]["StopFailure"][0]["hooks"]
     assert claude_hook == {"type": "command", "command": sys.executable, "args": [script, "hook", "claude"],
-                           "timeout": 60}  # exec form: no shell, so no quoting to get wrong
+                           "timeout": 3600}  # Phase 7.1: it listens for an hour  # exec form: no shell, so no quoting to get wrong
     assert snippets[0]["hooks"]["UserPromptSubmit"] == [{"hooks": [claude_hook | {"timeout": 10}]}]  # Phase 4
     assert snippets[1]["hooks"]["UserPromptSubmit"] == [{"hooks": [snippets[1]["hooks"]["Stop"][0]["hooks"][0]
                                                                    | {"timeout": 10}]}]
@@ -4650,7 +4651,7 @@ kind, out = setup_as(site_packages / "agon.py", scripts)
 assert kind == ("package", [str(command)]) and f"Agon    {agon.command_line([str(command)])}" in out, (kind, out)
 snippets = [json.loads(row) for row in out.splitlines() if row.startswith("  {")]
 assert snippets[0]["hooks"]["Stop"][0]["hooks"][0] == {"type": "command", "command": str(command),
-                                                        "args": ["hook", "claude"], "timeout": 60}, snippets[0]
+                                                        "args": ["hook", "claude"], "timeout": 3600}, snippets[0]
 for needed in (agon.command_line(["agy", "mcp", "add", "agon", str(command), "gemini"]),
                agon.command_line([str(command), "autopilot", "--agents", "claude,gpt,gemini", "--lead", "claude"]),
                agon.command_line([str(command)]) + f"   then open http://127.0.0.1:{agon.PORT}"):
@@ -4950,7 +4951,7 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
 # Phase 7, 18. The phase ticked with what it did and what is left to the maintainer; Phase 7.1 made it 0.7.1, so that
 # the apps' plugin managers see the update
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
-assert agon.VERSION == "0.7.1" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert agon.VERSION == "0.7.2" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
 assert "- [x] Phase 7.1 — Waiting costs nothing" in roadmap and "## Phase 7.1 — Waiting costs nothing" in roadmap
 
 # Phase 7.1. Waiting costs nothing: inbox answers at once and no longer offers to wait (an agent that waits in a turn
@@ -4974,6 +4975,34 @@ for readme in ("README.md", "README.ru.md"):
     text = (HERE / readme).read_text(encoding="utf-8")
     assert "Keep going until human says STOP" not in text and "then end your turn. If you don't have" in text, readme
     assert "don't build a workaround" in text and "`/mcp`" in text and "plugin:agon:agon" in text, readme
+
+# Phase 7.1. Listening: once an agent's turn ends, its Stop hook listens for messages, free (no model runs): up to an
+# hour in Claude Code and Codex (AGON_LISTEN shortens it; the plugins' 3600 s timeout ends it), 25 s in Antigravity.
+# The arena shows the agent as listening, it stays online, and a message from the arena reaches it at once
+assert agon.listen_seconds("claude") == agon.listen_seconds("codex") == agon.LISTEN == 3540 < agon.HOOK_TIMEOUT
+assert agon.listen_seconds("antigravity") == agon.HOOK_WAIT == 25
+with settings(AGON_LISTEN="90"):
+    assert agon.listen_seconds("codex") == 90
+with settings(AGON_LISTEN="99999"):
+    assert agon.listen_seconds("claude") == agon.LISTEN  # never past the hook's own timeout
+caught_up("lisa")
+listened, touch_every = [], agon.TOUCH_EVERY
+agon.TOUCH_EVERY = 0.3  # signs of life every 0.3 s here, not every 5 minutes
+t0 = time.monotonic()
+thread = threading.Thread(target=lambda: (listened.append(hook("lisa", wait=30)), agon.close_db()))
+thread.start()
+until(lambda: "lisa" in agon.listeners(time.time()))
+last_seen = lambda: agon.db().execute("SELECT last_seen FROM agents WHERE name = 'lisa'").fetchone()[0]
+seen = last_seen()
+lisa = next(a for a in agon.team_state(time.time()) if a["name"] == "lisa")
+assert lisa["state"] == "idle" and lisa["listening"] > time.time() + 20, lisa  # listening, not working
+until(lambda: last_seen() > seen)  # online: it may be asked for a review, its claims last
+agon.post("human", "lisa", "hello from the arena")
+thread.join(10)
+agon.TOUCH_EVERY = touch_every
+assert listened and listened[0][0]["decision"] == "block" and "human -> lisa: hello from the arena" in listened[0][0][
+    "reason"] and listened[0][0]["reason"].endswith(agon.HANDED), listened
+assert time.monotonic() - t0 < 10 and "lisa" not in agon.listeners(time.time())  # at once, and no longer listening
 
 # Phase 7.1. STOP: stop or стоп as the whole message too, in any letter case (never a longer message), and Agon itself
 # tells the human who is mid-turn when the team pauses, and that it goes on after: no agent spends a turn to say so

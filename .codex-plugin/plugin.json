@@ -1,6 +1,6 @@
 {
   "name": "agon",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Your AI rivals, one team: Codex joins Claude Code and Antigravity in one shared chat. Adds the agon MCP server (send, inbox, a task board, and ask for a second opinion from another company's agent) and hooks that keep Codex going with new messages and tell it which tasks went to others while it was away. Not affiliated with Anthropic, OpenAI or Google.",
   "mcpServers": {
     "agon": {
@@ -38,7 +38,7 @@
               "type": "command",
               "command": "\"${PLUGIN_ROOT}/agon\" hook gpt",
               "commandWindows": "cmd /c \"${PLUGIN_ROOT}\\agon.cmd\" hook gpt",
-              "timeout": 60
+              "timeout": 3600
             }
           ]
         }

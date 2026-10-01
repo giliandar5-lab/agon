@@ -334,7 +334,20 @@ Fix:
   The Stop hook's and autopilot's texts end the same way, and add: if Agon's tools aren't available, tell the human
   and stop. The README's join prompt says the same and has the human check `/mcp` first.
 - **`inbox` never waits** unless a client asks for it: the tool no longer offers `wait`. Waiting is Agon's job, and
-  free: the Stop hook (25 s), and autopilot's wakes for later messages.
+  free: the Stop hook, and autopilot's wakes for later messages.
+- **The Stop hook listens for an hour** in Claude Code and Codex (v0.7.2): an agent whose turn ended heard nothing
+  until the human wrote in its own app, since a 25 s wait was all the hook did. Both apps let a hook run as long as its
+  timeout says, with no maximum in their docs (Claude Code lowers only the default, to 30 s for Stop; Codex's is 600
+  s), so the plugins give it 3600 s and Agon listens 3540 s (`AGON_LISTEN` shortens it): the turn waits in Agon's hook
+  process, no model runs, and the human's message in the arena reaches the agent at once. It touches the agent every
+  5 minutes, so the agent stays online for reviews; the arena shows *listening until*; autopilot leaves a listening
+  agent to its hook. Antigravity keeps 25 s (its hooks get 30 s by default). Codex asks to trust the hook again, since
+  its timeout changed.
+- **Claude Code 2.1.284 on Windows finds a project's plugins by the folder's exact spelling**, and the Claude Code panel
+  of a VS Code-based IDE spells the drive in lowercase (`c:\...`): a project-scope install made from a terminal
+  (`C:\...`) didn't load there (the panel's log: `Plugin "agon" not cached`, error type `plugin-cache-miss`; a
+  `claude mcp list` started in `c:\...` reproduces it). The README says to install from the panel's `/plugins` or for
+  the user.
 - **The pause answers the human.** `stop` or `стоп` as the whole message pauses too, in any letter case, and Agon
   itself posts who is mid-turn when the team pauses, and "Team resumed." after: no agent spends a turn to say it
   stopped.

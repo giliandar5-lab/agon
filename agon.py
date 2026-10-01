@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-__version__ = VERSION = "0.7.1"  # also in the plugin manifests; flit reads __version__ for the PyPI package
+__version__ = VERSION = "0.7.2"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -61,7 +61,14 @@ PAUSED = ("Team paused: the human said STOP. End your turn now, without a reply;
 STOP_WORDS = ("stop", "стоп")  # the human's whole message, in any letter case, pauses the team
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
-HOOK_WAIT = 25  # seconds a Stop hook waits for a message: Antigravity gives hooks 30 s by default
+HOOK_WAIT = 25  # seconds an Antigravity Stop hook waits for a message: Antigravity gives hooks 30 s by default
+# Claude Code and Codex let a hook run as long as its timeout says (no maximum in their docs), so there a Stop hook
+# listens for an hour: the agent's turn waits in Agon's hook process, which costs no tokens, and the human's message in
+# the arena reaches it at once. An hour, since Claude Code's plan cache lives that long; AGON_LISTEN shortens it.
+# Without it an agent that ended its turn heard nothing until the human wrote in its own app (the first real-app test)
+LISTEN = 3540
+HOOK_TIMEOUT = 3600  # the Stop hook timeout the Claude Code and Codex plugins, and setup's snippets, give the hook
+TOUCH_EVERY = 300  # seconds between a listening hook's signs of life: the agent stays online for reviews and claims
 RING_DELAY = 1  # seconds a message may wait for inbox or the Stop hook before the channel doorbell rings
 FORMATS = {"gpt": "codex", "gemini": "antigravity"}  # the app each usual name runs in; any other name: claude
 CONTINUE = {"claude": "block", "codex": "block", "antigravity": "continue"}  # the decision that keeps it going
@@ -2588,13 +2595,43 @@ def out_of_turns(me, limit):
     return True
 
 
-def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
+def listen_seconds(fmt):
+    """How long the Stop hook of app format `fmt` listens for a message: HOOK_WAIT in Antigravity, which gives a hook 30
+    s, else LISTEN (AGON_LISTEN shortens it; the plugins' timeout stops it at HOOK_TIMEOUT)."""
+    return HOOK_WAIT if fmt == "antigravity" else min(seconds("AGON_LISTEN", LISTEN), LISTEN)
+
+
+def listening(me, until):
+    """Agent `me`'s Stop hook listens for messages until `until` (Unix time), or not any more (None). The arena shows it,
+    and autopilot leaves the agent to its hook meanwhile. Best effort, like presence."""
+    with contextlib.suppress(sqlite3.Error):
+        if until is None:
+            db().execute("DELETE FROM state WHERE key = ?", (f"listening:{me}",))
+        else:
+            db().execute("INSERT OR REPLACE INTO state(key, value) VALUES (?, ?)", (f"listening:{me}",
+                                                                                   json.dumps({"until": until})))
+
+
+def listeners(now):
+    """{agent: until when its Stop hook listens} for each hook listening now (see listening())."""
+    found = {}
+    with contextlib.suppress(sqlite3.Error):
+        for key, value in db().execute("SELECT key, value FROM state WHERE key LIKE 'listening:%'"):
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                until = json.loads(value).get("until")
+                if number_(until) and until > now:
+                    found[key.split(":", 1)[1]] = until
+    return found
+
+
+def hook(me, wait=None, fmt=None, inp=None, out=None):
     """Hook of agent `me`. Stop (and Claude Code's StopFailure): let it stop, or keep it going with its new messages as
     the next prompt. UserPromptSubmit (Claude Code, Codex): before a turn. The answer goes out as JSON on stdout with
     exit code 0 in every app: on Windows, PowerShell turns an exit code 2 into 1, so the other way to keep an agent
     going can get lost. In an app that autopilot runs headless (AGON_AUTOPILOT), a Stop hook doesn't wait: the app's
     turn ends, and autopilot wakes it again when messages come."""
     fmt, out = fmt or FORMATS.get(me, "claude"), out or sys.stdout.buffer
+    wait = listen_seconds(fmt) if wait is None else wait
     payload = read_payload(inp or sys.stdin.buffer)
     if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
         return
@@ -2637,10 +2674,21 @@ def stop_hook(me, wait, fmt, payload, out):
         return False
     if turn_failed(payload) or out_of_turns(me, max_autoruns()):
         return False
-    # 3. unread messages go out at once; 4. otherwise wait up to `wait` seconds for one
+    # 3. unread messages go out at once; 4. otherwise it listens up to `wait` seconds for one, free: the agent's app is
+    # idle meanwhile, and the agent stays online (reviews, claims) with a sign of life every TOUCH_EVERY seconds
     note, upto = taken_note(me)
-    rows, more, halted = inbox(me, cursor_of(me), wait if wait >= 0 else 0,
-                               MAX_INBOX - 100 - len(note) - len(HANDED))  # 100: the header and the "more" line
+    budget = MAX_INBOX - 100 - len(note) - len(HANDED)  # 100: the header and the "more" line
+    rows, more, halted = inbox(me, cursor_of(me), 0, budget)
+    if not rows and not halted and wait > 0:
+        end = time.time() + wait
+        listening(me, end)
+        mark(me, 0)  # the roster: listening, not working
+        try:
+            while not rows and not halted and (left := end - time.time()) > 0:
+                touch(me)
+                rows, more, halted = inbox(me, cursor_of(me), min(left, TOUCH_EVERY), budget)
+        finally:
+            listening(me, None)
     if halted or not rows:
         return False  # exit 0 without output: the agent may stop
     text = "\n".join(line(row) for row in rows)
@@ -3304,6 +3352,8 @@ class Autopilot:
         second session of the agent beside it: an idle Claude Code session takes them from its inbox socket (autopilot
         asks its MCP server to post them, see push()); a working one gets them from its Stop hook when its turn ends, and
         so does an app without an inbox socket (Codex, Antigravity): the human hears once that it waits for its app."""
+        if me in listeners(now):  # its Stop hook listens: it hands the messages over at once, no wake needed
+            return True
         inboxes = [(pid, busy, wake) for pid, path, busy, wake in open_apps if path]
         if not inboxes:
             self.notice(("open", me), f"{me}'s app is open, so autopilot leaves {me} to it: its Stop hook hands {me} its"
@@ -3596,7 +3646,8 @@ def team_state(now):
         tasks.setdefault(t["owner"], []).append({"id": t["id"], "title": t["title"], "role": t["state"]})
         if t["state"] == "review" and t["reviewer"]:
             tasks.setdefault(t["reviewer"], []).append({"id": t["id"], "title": t["title"], "role": "reviewer"})
-    busy_ones = set(runs) | set(duels) | set(asks) | set(live) | set(tasks)
+    listen = listeners(now)  # Stop hooks that listen for messages: their agents are idle, and hear the human at once
+    busy_ones = set(runs) | set(duels) | set(asks) | set(live) | set(tasks) | set(listen)
     week = now - 7 * 86400
     names = [*TEAM, *sorted(name for name, (_, seen, _, _) in agents.items()
                             if name not in TEAM and ((seen or 0) > week or name in busy_ones))]
@@ -3621,6 +3672,8 @@ def team_state(now):
             asker, mode, task, started = asks[name]
             what = f"a review of task #{task}" if task else "a review" if mode == "review" else "a task"
             entry |= {"state": "working", "since": started, "why": f"{what} for {asker}"}
+        elif name in listen:  # its turn waits in its Stop hook: no model works, whatever its app last said
+            entry |= {"state": "idle", "listening": listen[name]}
         elif busy > now - BUSY:
             entry |= {"state": "working", "since": busy, "why": ""}
         elif seen and seen > now - ONLINE:
@@ -4476,7 +4529,7 @@ function fuel(a) {
   if (a.state === 'working') return 'working' + (a.since ? ' for ' + span(now() - a.since) : '');
   if (a.state === 'limit') return 'out of quota until ' + clock(a.until);
   if (a.state === 'resting') return 'resting until ' + clock(a.until);
-  if (a.state === 'idle') return 'idle';
+  if (a.state === 'idle') return a.listening ? 'listening until ' + clock(a.listening) : 'idle';
   return a.seen ? 'away, seen ' + span(now() - a.seen) + ' ago' : 'not seen yet';
 }
 function renderTeam(team, box) {
@@ -5536,7 +5589,8 @@ def setup(out=None):
         say(line)
 
     hook = {"type": "command", "command": run[0], "args": [*run[1:], "hook", "claude"]}  # exec form: no shell
-    claude_hook, claude_prompt = [{"hooks": [hook | {"timeout": 60}]}], [{"hooks": [hook | {"timeout": 10}]}]
+    claude_hook = [{"hooks": [hook | {"timeout": HOOK_TIMEOUT}]}]  # the Stop hook listens for an hour (see LISTEN)
+    claude_prompt = [{"hooks": [hook | {"timeout": 10}]}]
     app("Claude Code", "claude")
     say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
         "  claude plugin marketplace add giliandar5-lab/agon",
@@ -5559,7 +5613,7 @@ def setup(out=None):
         "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", *run, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
         "  " + json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": codex_hook, "timeout": timeout}]}]
-                                     for event, timeout in (("Stop", 60), ("UserPromptSubmit", 10))}}),
+                                     for event, timeout in (("Stop", HOOK_TIMEOUT), ("UserPromptSubmit", 10))}}),
         f"  and under [mcp_servers.agon] in {home / '.codex' / 'config.toml'} (ask takes minutes, and Codex passes"
         " Agon only the variables it names):", f"  tool_timeout_sec = {TOOL_TIMEOUT}",
         f"  env_vars = {json.dumps(ENV_VARS)}")
@@ -5709,8 +5763,9 @@ def main(argv):
         cli = Args(prog=f"{command_name()} hook", description="Stop hook for Claude Code, Codex and Antigravity: keeps"
                    " the agent going with its new Agon messages, or lets it stop.")
         cli.add_argument("name", help="the agent's name in Agon: claude, gemini, gpt, ...")
-        cli.add_argument("--wait", type=float, default=HOOK_WAIT, metavar="SECONDS",
-                         help=f"how long to wait for a message before letting the agent stop (default {HOOK_WAIT})")
+        cli.add_argument("--wait", type=float, metavar="SECONDS",
+                         help=f"how long to listen for a message before letting the agent stop (default {LISTEN} in"
+                         f" Claude Code and Codex, AGON_LISTEN shortens it; {HOOK_WAIT} in Antigravity)")
         cli.add_argument("--format", choices=sorted(CONTINUE),
                          help="the app that runs the hook (default: gpt -> codex, gemini -> antigravity,"
                          " any other name -> claude)")
