@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-__version__ = VERSION = "0.7.2"  # also in the plugin manifests; flit reads __version__ for the PyPI package
+__version__ = VERSION = "0.7.3"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -58,7 +58,13 @@ MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next
 MAX_WAIT = 55
 PAUSED = ("Team paused: the human said STOP. End your turn now, without a reply; the human's next message resumes"
           " the team.")
-STOP_WORDS = ("stop", "стоп")  # the human's whole message, in any letter case, pauses the team
+# the human's whole message, in any letter case and with or without a closing !, pauses the team (the first real-app
+# test: "stop" in the words the human used, not only the button)
+STOP_WORDS = ("stop", "pause", "стоп", "пауза", "хватит", "остановись", "остановитесь")
+# The names a message from the human to all may call an agent by: it wakes that agent too, not only the lead (the first
+# real-app test: "gpt, why don't you answer?" to all woke only claude)
+CALLED = {"claude": ("claude", "клод", "клауд"), "gpt": ("gpt", "гпт", "codex", "кодекс"),
+          "gemini": ("gemini", "гемини", "джемини", "antigravity")}
 RECAP = 20  # messages recapped by the first inbox call of a server process...
 RECAP_CHARS = 150  # ...each cut to this many characters
 HOOK_WAIT = 25  # seconds an Antigravity Stop hook waits for a message: Antigravity gives hooks 30 s by default
@@ -466,7 +472,7 @@ def post(sender, rcpt, text):
 
 def is_stop(text):
     """Whether a message from the human pauses the team: STOP (or стоп) as the whole message, in any letter case."""
-    return isinstance(text, str) and text.strip().casefold() in STOP_WORDS
+    return isinstance(text, str) and text.strip().rstrip("!.").strip().casefold() in STOP_WORDS
 
 
 def paused():
@@ -2762,10 +2768,17 @@ def broadcast_mode():
 
 def wakes(me, rows, by_all):
     """The messages among `rows` (id, sender, rcpt, text) that wake agent `me`: the ones to it, and the ones to all when
-    broadcasts wake it (`by_all`). Never its own, nor acknowledgments, nor the human's STOP, which means stop; the others
-    don't wake it, but come along when it wakes."""
+    broadcasts wake it (`by_all`), or when the human's message to all calls it by name (see CALLED). Never its own, nor
+    acknowledgments, nor the human's STOP, which means stop; the others don't wake it, but come along when it wakes."""
     return [row for row in rows if row[1] != me and not is_ack(row[3]) and not (row[1] == "human" and is_stop(row[3]))
-            and (row[2] == me or row[2] == "all" and by_all)]
+            and (row[2] == me or row[2] == "all" and (by_all or row[1] == "human" and called(me, row[3])))]
+
+
+def called(me, text):
+    """Whether `text` calls agent `me` by one of its names (CALLED, or its own name) as a word, with any Russian ending
+    (клода, кодексу)."""
+    names = CALLED.get(me, (me,))
+    return any(re.search(rf"(?<!\w){re.escape(name)}[а-яё]*(?!\w)", str(text), re.I) for name in names)
 
 
 def wake_text(me, rows, more, fresh=""):

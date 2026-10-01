@@ -343,6 +343,11 @@ Fix:
   5 minutes, so the agent stays online for reviews; the arena shows *listening until*; autopilot leaves a listening
   agent to its hook. Antigravity keeps 25 s (its hooks get 30 s by default). Codex asks to trust the hook again, since
   its timeout changed.
+- **The human's message to all wakes every agent it names** (v0.7.3): with autopilot, a message to all wakes only the
+  lead, and "gpt, why don't you answer?" to all woke only claude, which answered for itself. Now a human's message to
+  all also wakes each agent it calls by name (gpt, гпт, codex, кодекс; claude, клод, клауд; gemini, гемини,
+  antigravity; with Russian endings); an agent's own status lines still wake nobody. `stop`, `pause`, `стоп`, `пауза`,
+  `хватит`, `остановись` and `остановитесь` as the whole message, with or without a closing `!`, pause the team.
 - **Claude Code 2.1.284 on Windows finds a project's plugins by the folder's exact spelling**, and the Claude Code panel
   of a VS Code-based IDE spells the drive in lowercase (`c:\...`): a project-scope install made from a terminal
   (`C:\...`) didn't load there (the panel's log: `Plugin "agon" not cached`, error type `plugin-cache-miss`; a

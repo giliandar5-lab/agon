@@ -4951,7 +4951,7 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
 # Phase 7, 18. The phase ticked with what it did and what is left to the maintainer; Phase 7.1 made it 0.7.1, so that
 # the apps' plugin managers see the update
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
-assert agon.VERSION == "0.7.2" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert agon.VERSION == "0.7.3" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
 assert "- [x] Phase 7.1 — Waiting costs nothing" in roadmap and "## Phase 7.1 — Waiting costs nothing" in roadmap
 
 # Phase 7.1. Waiting costs nothing: inbox answers at once and no longer offers to wait (an agent that waits in a turn
@@ -5007,7 +5007,8 @@ assert time.monotonic() - t0 < 10 and "lisa" not in agon.listeners(time.time()) 
 # Phase 7.1. STOP: stop or стоп as the whole message too, in any letter case (never a longer message), and Agon itself
 # tells the human who is mid-turn when the team pauses, and that it goes on after: no agent spends a turn to say so
 for text, stops in (("STOP", True), (" stop ", True), ("Стоп", True), ("СТОП\n", True), ("stop it", False),
-                    ("don't stop", False), ("STOP!", False), ("", False), (None, False)):
+                    ("don't stop", False), ("STOP!", True), ("Остановитесь!", True), ("хватит", True),
+                    ("остановитесь, это приказ", False), ("", False), (None, False)):
     assert agon.is_stop(text) is stops, text
 assert agon.human_post("all", "carry on") is None and not agon.paused()
 agon.mark("quiet", time.time())  # quiet's app said it works
@@ -5017,6 +5018,14 @@ assert "quiet" in said and "each stops at its next Agon call or at the end of it
 newest = agon.db().execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 2").fetchall()
 assert newest == [("agon", "human", said), ("human", "all", "стоп")], newest
 assert agon.wakes("claude", [(1, "human", "all", "Стоп")], True) == []  # a STOP wakes nobody, in any case
+# a message from the human to all that calls an agent by name wakes it too, not only the lead; an agent's doesn't
+row = (5, "human", "all", "gpt почему ты не отвечаешь?")
+assert agon.wakes("gpt", [row], False) == [row] and agon.wakes("gemini", [row], False) == []
+for text, who in (("а ты, клауда, что думаешь?", "claude"), ("Codex, review it", "gpt"), ("кодексу передай", "gpt"),
+                  ("ask gemini", "gemini")):
+    assert agon.called(who, text), (who, text)
+assert not agon.called("gpt", "gpts and chatgpt") and not agon.called("claude", "the claudette")
+assert agon.wakes("gpt", [(6, "claude", "all", "gpt took #2")], False) == []  # an agent's status line wakes nobody
 assert agon.human_post("all", "go on") == "Team resumed." and not agon.paused()
 agon.mark("quiet", 0)
 working = [a["name"] for a in agon.team_state(time.time()) if a["state"] == "working"]
