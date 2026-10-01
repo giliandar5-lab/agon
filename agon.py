@@ -5641,6 +5641,15 @@ def arena():
     return 0
 
 
+def stdout_works():
+    """Whether stdout still takes output: False once its reader went away."""
+    try:
+        sys.stdout.flush()
+        return True
+    except OSError:
+        return False
+
+
 def cli():
     """The `agon` and `agon-arena` commands of the PyPI package, and `python agon.py`: run the command in sys.argv and
     exit with its code; Ctrl+C, and a reader that stops reading (agon setup | head), end it quietly."""
@@ -5650,7 +5659,9 @@ def cli():
         sys.exit(code)
     except KeyboardInterrupt:
         pass
-    except BrokenPipeError:  # the reader went away: no traceback, and no second error when Python flushes stdout
+    except OSError as e:  # the reader went away: no traceback, and no second error when Python flushes stdout
+        if not (isinstance(e, BrokenPipeError) or os.name == "nt" and e.errno == 22 and not stdout_works()):
+            raise  # (Windows says EINVAL for a closed pipe; any other EINVAL is a real error)
         with contextlib.suppress(OSError):
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
