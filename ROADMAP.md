@@ -339,7 +339,8 @@ Fix:
   itself posts who is mid-turn when the team pauses, and "Team resumed." after: no agent spends a turn to say it
   stopped.
 - **Models in the arena.** The Team panel picks each agent's model and effort for the runs Agon starts (autopilot's
-  wakes, asks and duels; an open app keeps its own pick): Claude Code's aliases, the models the human's Codex lists in
+  wakes, asks and duels; an open app keeps its own pick): Claude's models by version, each with its own effort levels,
+  or the newest of a family; the models the human's Codex lists in
   `~/.codex/models_cache.json` (read only), any name for Antigravity. `AGON_<NAME>_MODEL` and `AGON_<NAME>_EFFORT`
   win over it. Asks and duels now pass the model too; before, only autopilot did.
 

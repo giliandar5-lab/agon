@@ -2756,10 +2756,22 @@ def cap(var, example):
 
 
 # The model and effort of the runs Agon starts (autopilot's wakes, asks, duels), picked in the arena; an app the human
-# has open keeps the model picked in it. Claude Code's aliases follow its newest models (code.claude.com model-config,
-# 2026-10); Codex lists its own models with their reasoning levels in ~/.codex/models_cache.json, which Agon only reads
-CLAUDE_MODELS = ("opus", "sonnet", "haiku", "fable", "best", "opusplan", "opus[1m]", "sonnet[1m]")
+# has open keeps the model picked in it. Claude Code takes a model's full name or an alias for the newest of a family:
+# the names and each one's effort levels as Anthropic lists them (2026-09; code.claude.com model-config: Opus 4.6 and
+# Sonnet 4.6 have no xhigh, Haiku 4.5 no effort at all). Codex lists its own models with their reasoning levels in
+# ~/.codex/models_cache.json, which Agon only reads
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_FOUR = ("low", "medium", "high", "max")
+CLAUDE_MODELS = (  # (the name Claude Code takes, the label, its effort levels)
+    ("claude-fable-5-1", "Fable 5.1", CLAUDE_EFFORTS), ("claude-fable-5", "Fable 5", CLAUDE_EFFORTS),
+    ("claude-opus-5-5", "Opus 5.5", CLAUDE_EFFORTS), ("claude-opus-5", "Opus 5", CLAUDE_EFFORTS),
+    ("claude-opus-4-8", "Opus 4.8", CLAUDE_EFFORTS), ("claude-opus-4-7", "Opus 4.7", CLAUDE_EFFORTS),
+    ("claude-opus-4-6", "Opus 4.6", _FOUR), ("claude-sonnet-5-5", "Sonnet 5.5", CLAUDE_EFFORTS),
+    ("claude-sonnet-5", "Sonnet 5", CLAUDE_EFFORTS), ("claude-sonnet-4-6", "Sonnet 4.6", _FOUR),
+    ("claude-haiku-4-5", "Haiku 4.5", ()),
+    ("fable", "newest Fable", CLAUDE_EFFORTS), ("opus", "newest Opus", CLAUDE_EFFORTS),
+    ("sonnet", "newest Sonnet", CLAUDE_EFFORTS), ("haiku", "newest Haiku", ()),
+)
 MODEL_NAME = re.compile(r"[A-Za-z0-9][\w.:/\[\]-]{0,79}")  # never a leading "-": the app would read it as a flag
 EFFORT_NAME = re.compile(r"[a-z]{1,16}")
 
@@ -2779,10 +2791,11 @@ def codex_cache(path, mtime):
 
 
 def model_options(name):
-    """The models the arena offers for agent `name`, each with its efforts: Claude Code's aliases, the models the
-    human's Codex lists (CODEX_HOME, else ~/.codex), and none for Antigravity, whose model the human types."""
+    """The models the arena offers for agent `name`, each with its efforts: Claude's by version and the newest of each
+    family, the models the human's Codex lists (CODEX_HOME, else ~/.codex), and none for Antigravity, whose model the
+    human types."""
     if name == "claude":
-        return [{"id": m, "label": m, "efforts": list(CLAUDE_EFFORTS)} for m in CLAUDE_MODELS]
+        return [{"id": m, "label": label, "efforts": list(efforts)} for m, label, efforts in CLAUDE_MODELS]
     if name == "gpt":
         path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "models_cache.json"
         with contextlib.suppress(OSError):

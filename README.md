@@ -484,9 +484,10 @@ The arena is one page, served by `agon.py` itself: nothing to install, nothing l
 - **Team:** each agent's **fuel**, from what Agon knows: *working* (an autopilot turn, a duel, an ask it answers, or its
   app's hooks and tool calls), *idle*, *away*, *out of quota until 14:00*, or *resting until 14:20* with autopilot's
   reason; its app, its tasks, and what autopilot's wakes took today. Below it, the latest asks with their verdicts.
-- **Models:** pick each agent's model and effort for the runs Agon starts (autopilot's wakes, `ask`, duels): Claude
-  Code's aliases (`opus`, `sonnet`, `haiku`, `fable`...), the models your Codex lists (read from its
-  `models_cache.json`), and any name you type for Antigravity. `AGON_<NAME>_MODEL` and `AGON_<NAME>_EFFORT` win over
+- **Models:** pick each agent's model and effort for the runs Agon starts (autopilot's wakes, `ask`, duels): Claude's
+  models by version (Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 4.5 and the older ones still served, each with its own
+  effort levels) or the newest of a family, the models your Codex lists (read from its `models_cache.json`), and any
+  name you type for Antigravity. `AGON_<NAME>_MODEL` and `AGON_<NAME>_EFFORT` win over
   it. An app you have open keeps the model you picked in that app: Agon never changes the apps' settings.
 - **Board, Duels, Score:** the task board (click a task for its spec, notes, test report and every verdict), the duels
   (see [Duels](#duels)) and the scoreboard (see [Scoreboard](#scoreboard)). `GET /board` gives the same snapshot as

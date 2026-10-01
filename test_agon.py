@@ -5010,8 +5010,12 @@ with settings(CODEX_HOME=str(codex_home)):
     picks = agon.models_state()
     assert [m["id"] for m in picks["gpt"]["options"]] == ["gpt-6.1-sol"], picks  # listed ones, and only names
     assert picks["gpt"]["options"][0] == {"id": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "efforts": ["low", "high"]}
-assert [m["id"] for m in picks["claude"]["options"]][:4] == ["opus", "sonnet", "haiku", "fable"]
-assert picks["claude"]["options"][0]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+claude_options = {m["id"]: m for m in picks["claude"]["options"]}  # Claude's models by version, newest first, then
+assert [m["label"] for m in picks["claude"]["options"]][:3] == ["Fable 5.1", "Fable 5", "Opus 5.5"]  # the aliases
+assert claude_options["claude-opus-5-5"]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+assert claude_options["claude-sonnet-4-6"]["efforts"] == ["low", "medium", "high", "max"]  # no xhigh before 4.7
+assert claude_options["claude-haiku-4-5"]["efforts"] == [] and claude_options["opus"]["label"] == "newest Opus"
+assert all(agon.MODEL_NAME.fullmatch(name) for name in claude_options)
 assert picks["gemini"]["options"] == [] and picks["claude"]["model"] == "" and picks["claude"]["env"] == []
 with settings(CODEX_HOME=str(Path(TMP, "no-codex"))):
     assert agon.model_options("gpt") == []  # no Codex: the human types the name
