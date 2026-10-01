@@ -47,7 +47,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-VERSION = "0.6.0"  # also in the plugin manifests
+__version__ = VERSION = "0.6.0"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -5325,6 +5325,21 @@ def setup(out=None):
         " what git tracks.")
 
 
+def command_name():
+    """How the human starts Agon here: `agon` when it runs as the command the PyPI package installs (agon or
+    agon-arena, an .exe on Windows), else `python agon.py`. Agon's hints name it, so they work as printed."""
+    stem, suffix = os.path.splitext(re.split(r"[\\/]", sys.argv[0] if sys.argv and sys.argv[0] else "agon.py")[-1])
+    if suffix.lower() in ("", ".exe") and stem.lower() in ("agon", "agon-arena"):
+        return "agon"
+    return "python agon.py"
+
+
+def usage():
+    """What `agon --help` prints: the commands, named the way the human starts Agon here."""
+    return __doc__.replace("python agon.py", command_name().ljust(len("python agon.py"))).strip() + (
+        f"\n{command_name()} --version   Agon's version")
+
+
 class Args(argparse.ArgumentParser):
     def error(self, message):  # argparse exits with 2, which Claude Code and Codex read as "keep the agent going"
         self.exit(1, f"{self.prog}: error: {message}\n")
@@ -5333,7 +5348,7 @@ class Args(argparse.ArgumentParser):
 def main(argv):
     """Run the command in `argv` (sys.argv without the script) and return the process exit code."""
     if argv[:1] == ["hook"]:
-        cli = Args(prog="agon.py hook", description="Stop hook for Claude Code, Codex and Antigravity: keeps"
+        cli = Args(prog=f"{command_name()} hook", description="Stop hook for Claude Code, Codex and Antigravity: keeps"
                    " the agent going with its new Agon messages, or lets it stop.")
         cli.add_argument("name", help="the agent's name in Agon: claude, gemini, gpt, ...")
         cli.add_argument("--wait", type=float, default=HOOK_WAIT, metavar="SECONDS",
@@ -5350,7 +5365,7 @@ def main(argv):
     elif argv == ["setup"]:
         setup()
     elif argv[:1] == ["autopilot"]:
-        cli = Args(prog="agon.py autopilot", description="Keeps the team working with no app open: when messages come"
+        cli = Args(prog=f"{command_name()} autopilot", description="Keeps the team working with no app open: when messages come"
                    " for an agent, wakes it through its app's own CLI, headless, on your own plan (or an open Claude"
                    " Code session through its inbox). STOP in the arena pauses it, Ctrl+C ends it.")
         cli.add_argument("--agents", default=",".join(COMMANDS), metavar="NAMES",
@@ -5367,12 +5382,12 @@ def main(argv):
     elif argv == ["stats"]:
         stats()
     elif argv[:1] == ["watch"]:
-        Args(prog="agon.py watch", description="The team's chat in the terminal, live: the last 20 messages, then each"
+        Args(prog=f"{command_name()} watch", description="The team's chat in the terminal, live: the last 20 messages, then each"
              " new one, until Ctrl+C. One color per sender on a terminal; NO_COLOR turns them off, FORCE_COLOR on."
              ).parse_args(argv[1:])
         chat_feed()
     elif argv[:1] == ["say"]:
-        cli = Args(prog="agon.py say", description="Post a message to the team as the human, as the arena does: STOP"
+        cli = Args(prog=f"{command_name()} say", description="Post a message to the team as the human, as the arena does: STOP"
                    " pauses the team, the next message resumes it.")
         cli.add_argument("--to", default="all", metavar="NAME", help="all (the default) or one agent: claude, gpt, ...")
         cli.add_argument("--file", metavar="PATH", help="read the text from this file (UTF-8)")
@@ -5391,7 +5406,7 @@ def main(argv):
             print(f"agon say: {e}", file=sys.stderr)
             return 1
     elif argv[:1] == ["export"]:
-        cli = Args(prog="agon.py export", description="A replay (the chat on a timeline, with the board, the duels and"
+        cli = Args(prog=f"{command_name()} export", description="A replay (the chat on a timeline, with the board, the duels and"
                    " the score) or a scorecard (the score and the duels), as one HTML file that loads nothing. It may"
                    " contain code, file paths and whatever the agents wrote: Agon masks keys and tokens in known"
                    " formats, e-mail addresses and your home folder's path, and says how many.")
@@ -5409,11 +5424,18 @@ def main(argv):
             return 1
         print(f"Saved {args.output or name}. {said}")
     elif argv[:1] == ["statusline"]:
-        cli = Args(prog="agon.py statusline", description="Claude Code's status line command: prints the model, the"
+        cli = Args(prog=f"{command_name()} statusline", description="Claude Code's status line command: prints the model, the"
                    " folder, the context and the plan's usage, and keeps only the plan's usage (the percentage of each"
                    " window, when it resets, the session id) for the arena.")
         cli.add_argument("name", nargs="?", default="claude", help="the agent's name in Agon (default claude)")
         statusline(cli.parse_args(argv[1:]).name)
+    elif argv[:1] in (["--version"], ["-V"]):
+        print(f"agon {VERSION}")
+    elif argv[:1] in (["--help"], ["-h"], ["help"]):
+        print(usage())
+    elif argv[0].startswith("-") if argv else False:  # an agent's name never starts with -: an option Agon doesn't know
+        print(f"agon: unknown option {argv[0]}: {command_name()} --help lists the commands", file=sys.stderr)
+        return 1
     elif argv:
         # Host apps end their MCP servers with SIGINT (Claude Code) or SIGTERM (Codex, agy after closing stdin).
         # Take SIGTERM like Ctrl+C: the server unwinds and waits while running asks stop their apps and log it
@@ -5459,8 +5481,14 @@ def arena():
     return 0
 
 
-if __name__ == "__main__":
+def cli():
+    """The `agon` and `agon-arena` commands of the PyPI package, and `python agon.py`: run the command in sys.argv and
+    exit with its code; Ctrl+C ends it quietly."""
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == "__main__":
+    cli()

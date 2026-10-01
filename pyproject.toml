@@ -1,0 +1,39 @@
+# The PyPI package agon-arena: agon.py itself, as one module. Agon stays one file with no dependencies; flit_core is
+# needed only to build the package, at release time (see CONTRIBUTING.md)
+[build-system]
+requires = ["flit_core>=4,<5"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "agon-arena"
+dynamic = ["version", "description"]
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "giliandar5-lab" }]
+keywords = ["mcp", "multi-agent", "claude-code", "codex", "antigravity"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/giliandar5-lab/agon"
+Issues = "https://github.com/giliandar5-lab/agon/issues"
+Changelog = "https://github.com/giliandar5-lab/agon/blob/main/ROADMAP.md"
+
+[project.scripts]
+agon = "agon:cli"
+agon-arena = "agon:cli"
+
+[tool.flit.module]
+name = "agon"
+
+[tool.flit.sdist]
+include = ["LICENSE", "README.md"]
+exclude = ["test_agon.py", "scripts/", "docs/", ".github/"]

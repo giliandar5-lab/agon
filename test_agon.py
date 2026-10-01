@@ -4536,6 +4536,52 @@ for fact in ("gh-85307", "`rate_limits.five_hour`", "`subagentStatusLine`", "`ta
              "`account/rateLimits/read`", "U+2028", "--worktree NAME", "`AGON_ARENA_HOSTS`"):
     assert fact in roadmap, fact
 
+# Phase 7, 1. The PyPI package agon-arena is agon.py itself, one module, built by flit_core at release time: its
+# version is agon.py's (flit reads __version__), the manifests carry the same one, and no e-mail is in its metadata
+assert agon.__version__ == agon.VERSION
+project = (HERE / "pyproject.toml").read_text(encoding="utf-8")
+try:
+    import tomllib
+    meta = tomllib.loads(project)
+except ModuleNotFoundError:  # Python 3.10: the checks below on the text say the same
+    meta = None
+if meta:
+    assert meta["build-system"]["build-backend"] == "flit_core.buildapi" and meta["build-system"]["requires"] == [
+        "flit_core>=4,<5"], meta["build-system"]
+    pkg = meta["project"]
+    assert pkg["name"] == "agon-arena" and pkg["dynamic"] == ["version", "description"], pkg
+    assert pkg["requires-python"] == ">=3.10" and pkg["license"] == "MIT" and pkg["license-files"] == ["LICENSE"]
+    assert pkg["authors"] == [{"name": "giliandar5-lab"}] and "maintainers" not in pkg, pkg  # a name, no e-mail
+    assert pkg["scripts"] == {"agon": "agon:cli", "agon-arena": "agon:cli"}, pkg["scripts"]  # uvx agon-arena needs the
+    assert meta["tool"]["flit"]["module"] == {"name": "agon"} and "dependencies" not in pkg  # second name
+assert "@" not in project and '"agon:cli"' in project
+assert callable(agon.cli) and agon.__doc__.splitlines()[0].startswith("Agon: ")  # flit's description: the docstring
+
+# Phase 7, 2. The agon command: --version and --help (help) print and exit, an unknown option is an error, and any other
+# first word is still an agent's name for the MCP server, as before
+def cli_run(*args, stdin=b""):  # (exit code, stdout, stderr) of python agon.py ARGS
+    p = subprocess.run([sys.executable, SERVER, *args], input=stdin, capture_output=True, timeout=60,
+                       env=dict(os.environ, AGON_DB=str(Path(TMP, "cli.db"))))
+    return p.returncode, p.stdout.decode().replace("\r\n", "\n"), p.stderr.decode().replace("\r\n", "\n")
+
+
+assert cli_run("--version") == (0, f"agon {agon.VERSION}\n", "") == cli_run("-V")
+code_, out, err = cli_run("--help")
+assert code_ == 0 and out.startswith("Agon: ") and "python agon.py setup" in out and "--version" in out, out
+assert cli_run("help") == cli_run("-h") == (code_, out, err)
+code_, out, err = cli_run("--bogus")
+assert (code_, out) == (1, "") and "unknown option --bogus" in err, (code_, out, err)
+ping = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'
+assert json.loads(cli_run("claude", stdin=ping)[1]) == {"jsonrpc": "2.0", "id": 1, "result": {}}  # still the server
+for argv0, name in (("/home/me/.local/bin/agon", "agon"), (r"C:\Users\me\.local\bin\agon.exe", "agon"),
+                    ("/x/bin/agon-arena", "agon"), ("/x/agon/agon.py", "python agon.py"), ("", "python agon.py"),
+                    ("/x/agon/agon", "agon")):  # (the plugins' ./agon launcher runs agon.py, so argv[0] is agon.py)
+    saved_argv, sys.argv = sys.argv, [argv0]
+    try:
+        assert agon.command_name() == name, (argv0, agon.command_name())
+    finally:
+        sys.argv = saved_argv
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()
