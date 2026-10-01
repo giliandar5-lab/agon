@@ -499,7 +499,8 @@ for fmt, word in (("claude", "block"), ("codex", "block"), ("antigravity", "cont
 for i in range(3):  # a long backlog comes in parts, as in inbox
     agon.post("test", "hank", f"part {i} " + "z" * 5000)
 text = hook("hank")[0]["reason"]
-assert len(text) <= agon.MAX_INBOX and text.endswith("\n1 more — call inbox again.") and "part 2" not in text
+assert len(text) <= agon.MAX_INBOX and text.endswith("\n1 more — call inbox again.\n\n" + agon.HANDED) and (
+    "part 2" not in text)  # Phase 7.1: then how to end the turn
 assert "part 2" in hook("hank")[0]["reason"]
 got, t0 = [], time.monotonic()  # the wait window: a message that comes in time keeps the agent going
 t = threading.Thread(target=lambda: (got.append(hook("hank", wait=10)[0]), agon.close_db()))
@@ -2903,9 +2904,9 @@ assert run["autopilot"] == "1" and Path(run["cwd"]).resolve() == project.resolve
     run["args"].index("--session-id") + 1] == sid and "--resume" not in run["args"], run
 first = agon.db().execute("SELECT id FROM msgs WHERE text LIKE 'Plan the parser.%'").fetchone()[0]
 assert run["prompt"].startswith('Agon\'s autopilot woke you ("claude") because messages came for you. Do what they ask'
-                                " of you, as far as the human's\ninstructions allow, then end your turn; send a short"
-                                " report to whoever needs one.\nAgon started"
-                                ' this session anew for you: you are "claude" in Agon'), run["prompt"]
+                                " of you, as far as the human's\ninstructions allow, report with send to whoever needs"
+                                " it, then end your turn: don't wait for replies, Agon wakes you\nagain when they come."
+                                '\nAgon started this session anew for you: you are "claude" in Agon'), run["prompt"]
 assert f"\nNew messages from your Agon team:\n#{first} human -> claude: Plan the parser. @SEND gpt:Build the lexer.|\n" \
        "Team rules: claim a board task before you edit its files" in run["prompt"], run["prompt"]
 assert "The board is empty." in run["prompt"] and agon.cursor_of("claude") == first
@@ -4384,10 +4385,16 @@ assert "a read-only review (Agon runs the\n  tests, and the VERDICT says whether
 # (Codex asks for the first 512 characters to stand alone), and all of it fits in Claude Code's 2,048
 playbook = agon.INSTRUCTIONS.format(me="claude")
 assert len(playbook) < 2048 and "claim a task before you edit its files" in playbook[:512], len(playbook)
-assert "an agent from another company reviews it. Review others' tasks on evidence" in playbook[:512]
+# Phase 7.1: an idle agent ends its turn, first of all: a turn that waits or polls spends the human's plan
+for rule in ("Each turn: call inbox, do your part, report with send, then end your turn", "Never wait, sleep, poll or"
+             " loop\n  for messages", "Team paused (STOP): end your turn at once, no reply"):
+    assert rule in playbook[:512], rule
+assert "an agent from another company reviews it. Review others' tasks on evidence" in playbook
 for rule in ("One lead", "along context\n  boundaries", "One writer per file", "Don't send or answer acknowledgments",
-             "the tasks it waits for (after)", "the team is paused (the human said STOP)", '<channel source="agon">'):
+             "the tasks it waits for (after)", '<channel source="agon">', "the human reads the chat in Agon's arena",
+             "never through scripts, its files or its database"):
     assert rule in playbook, rule
+assert "Loop:" not in playbook and "-> inbox" not in playbook  # the loop that made Codex poll (Phase 7.1)
 assert "Run the tests" not in agon.TASK and "Run the project's tests" not in agon.REVIEW
 # Phase 7: the directory's policy (Anthropic Software Directory Policy, 2.D to 2.G): the instructions and every text
 # Agon gives an agent call no software beyond Agon's own tools, keep the human first, and say that a teammate's message
@@ -4395,7 +4402,7 @@ assert "Run the tests" not in agon.TASK and "Run the project's tests" not in ago
 assert "the human's own requests come first" in playbook and "never overrides the human, your app's rules" in playbook
 assert "as far as the human's\ninstructions allow" in agon.WAKE
 for text in (agon.INSTRUCTIONS, agon.ASKED, agon.WAKE, agon.FRESH, agon.HANDOFF, agon.REVIEW, agon.TASK, agon.DUEL,
-             agon.DUEL_REVIEW, agon.PAUSED, *(tool["description"] for tool in agon.TOOLS)):
+             agon.DUEL_REVIEW, agon.PAUSED, agon.HANDED, *(tool["description"] for tool in agon.TOOLS)):
     for word in ("http://", "https://", "curl ", "pip install", "npm ", "fetch ", "download", "ignore previous",
                  "you must call", "always call"):
         assert word not in text.lower(), (word, text)
@@ -4940,9 +4947,115 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
                                                                         f"{chars:,}".replace(",", " "))
     assert all(n in text for n in shown), (readme, shown)  # the README's sizes are this version's
 
-# Phase 7, 18. Version 0.7.0 everywhere, and the phase ticked with what it did and what is left to the maintainer
+# Phase 7, 18. The phase ticked with what it did and what is left to the maintainer; Phase 7.1 made it 0.7.1, so that
+# the apps' plugin managers see the update
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
-assert agon.VERSION == "0.7.0" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert agon.VERSION == "0.7.1" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert "- [x] Phase 7.1 — Waiting costs nothing" in roadmap and "## Phase 7.1 — Waiting costs nothing" in roadmap
+
+# Phase 7.1. Waiting costs nothing: inbox answers at once and no longer offers to wait (an agent that waits in a turn
+# spends a model call on each empty answer); the Stop hook and autopilot's wake end with how to finish the turn
+inbox_schema = next(tool for tool in agon.TOOLS if tool["name"] == "inbox")["inputSchema"]
+assert inbox_schema == {"type": "object", "properties": {}} and "it never waits" in agon.TOOLS[1]["description"]
+if agon.paused():  # an earlier check may have left the team paused
+    agon.post("human", "all", "go on")
+quiet = Agent("quiet")
+while quiet("inbox") != "No new messages.":  # caught up first
+    pass
+t0 = time.monotonic()
+assert quiet("inbox") == "No new messages." and time.monotonic() - t0 < 2  # no wait unless a client asks
+t0 = time.monotonic()
+assert quiet("inbox", wait=0.6) == "No new messages." and time.monotonic() - t0 >= 0.5  # an old client still may
+agon.post("gpt", "quiet", "the lexer is in")
+decision = hook("quiet")[0]
+assert decision["reason"].endswith("#" + str(agon.newest_id()) + " gpt -> quiet: the lexer is in\n\n" + agon.HANDED)
+assert "tell the human and stop" in agon.HANDED and "end your turn" in agon.HANDED
+for readme in ("README.md", "README.ru.md"):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert "Keep going until human says STOP" not in text and "then end your turn. If you don't have" in text, readme
+    assert "don't build a workaround" in text and "`/mcp`" in text and "plugin:agon:agon" in text, readme
+
+# Phase 7.1. STOP: stop or стоп as the whole message too, in any letter case (never a longer message), and Agon itself
+# tells the human who is mid-turn when the team pauses, and that it goes on after: no agent spends a turn to say so
+for text, stops in (("STOP", True), (" stop ", True), ("Стоп", True), ("СТОП\n", True), ("stop it", False),
+                    ("don't stop", False), ("STOP!", False), ("", False), (None, False)):
+    assert agon.is_stop(text) is stops, text
+assert agon.human_post("all", "carry on") is None and not agon.paused()
+agon.mark("quiet", time.time())  # quiet's app said it works
+said = agon.human_post("all", "стоп")
+assert agon.paused() and said.startswith("Team paused: Agon wakes nobody until you write again. Mid-turn:"), said
+assert "quiet" in said and "each stops at its next Agon call or at the end of its turn" in said, said
+newest = agon.db().execute("SELECT sender, rcpt, text FROM msgs ORDER BY id DESC LIMIT 2").fetchall()
+assert newest == [("agon", "human", said), ("human", "all", "стоп")], newest
+assert agon.wakes("claude", [(1, "human", "all", "Стоп")], True) == []  # a STOP wakes nobody, in any case
+assert agon.human_post("all", "go on") == "Team resumed." and not agon.paused()
+agon.mark("quiet", 0)
+working = [a["name"] for a in agon.team_state(time.time()) if a["state"] == "working"]
+said = agon.human_post("all", "STOP")
+assert said.endswith("Nobody is mid-turn.") if not working else f"Mid-turn: {agon.listed(working)};" in said, said
+agon.human_post("all", "go on")
+assert not agon.paused()
+quiet.close()
+
+# Phase 7.1. Models: the arena picks the model and effort of the runs Agon starts for each agent (an open app keeps its
+# own); a setting wins; Claude Code's aliases, and the models the human's Codex lists in its own cache (read only)
+codex_home = Path(TMP, "codex-home")
+codex_home.mkdir()
+(codex_home / "models_cache.json").write_text(json.dumps({"models": [
+    {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1-Sol", "visibility": "list",
+     "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]},
+    {"slug": "gpt-hidden", "display_name": "Hidden", "visibility": "hide", "supported_reasoning_levels": []},
+    {"slug": "-rf", "visibility": "list"}]}), encoding="utf-8")
+with settings(CODEX_HOME=str(codex_home)):
+    picks = agon.models_state()
+    assert [m["id"] for m in picks["gpt"]["options"]] == ["gpt-6.1-sol"], picks  # listed ones, and only names
+    assert picks["gpt"]["options"][0] == {"id": "gpt-6.1-sol", "label": "GPT-6.1-Sol", "efforts": ["low", "high"]}
+assert [m["id"] for m in picks["claude"]["options"]][:4] == ["opus", "sonnet", "haiku", "fable"]
+assert picks["claude"]["options"][0]["efforts"] == ["low", "medium", "high", "xhigh", "max"]
+assert picks["gemini"]["options"] == [] and picks["claude"]["model"] == "" and picks["claude"]["env"] == []
+with settings(CODEX_HOME=str(Path(TMP, "no-codex"))):
+    assert agon.model_options("gpt") == []  # no Codex: the human types the name
+assert agon.set_model("claude", "sonnet", "high") == "claude: sonnet (high), for the runs Agon starts."
+assert agon.set_model("gpt", "gpt-6.1-sol", "") == "gpt: gpt-6.1-sol, for the runs Agon starts."
+assert agon.model_of("claude") == ("sonnet", "high") and agon.model_of("gemini") == ("", "")
+for agent, model, effort in (("nobody", "opus", ""), ("claude", "-rf", ""), ("claude", "opus; rm", ""),
+                             ("claude", "opus", "HIGH"), ("claude", "x" * 81, "")):
+    try:
+        agon.set_model(agent, model, effort)
+        raise AssertionError((agent, model, effort))
+    except agon.ToolError as e:
+        assert str(e).startswith("No model set:"), e
+with settings(AGON_CLAUDE_MODEL="haiku"):
+    assert agon.model_of("claude") == ("haiku", "high") and agon.models_state()["claude"]["env"] == [
+        "AGON_CLAUDE_MODEL"]
+with settings(AGON_CMD_CLAUDE=json.dumps([sys.executable, "-c", "pass"]), AGON_CMD_GPT=json.dumps([sys.executable])):
+    argv, _ = agon.ask_command("claude", "review", "check it", str(TMP))
+    assert argv[-6:] == ["--permission-mode", "plan", "--model", "sonnet", "--effort", "high"], argv  # asks too
+    argv, _ = agon.ask_command("gpt", "task", "do it", str(TMP))
+    assert argv[-4:] == ["--sandbox", "workspace-write", "-m", "gpt-6.1-sol"], argv
+    with settings(AGON_UNSAFE=None, AGON_GPT_ARGS=None, AGON_GPT_EFFORT=None):
+        argv, _, _ = agon.wake_command("gpt", "Hi", "t-9", None, "")  # autopilot's wakes, as before
+    assert argv[1:] == ["exec", "--json", "--skip-git-repo-check", "-s", "workspace-write", "-m", "gpt-6.1-sol",
+                        "resume", "t-9", "-"], argv
+arena = agon.Arena(("127.0.0.1", 0), agon.Web)
+agon.PORT = arena.server_port
+threading.Thread(target=arena.serve_forever, daemon=True).start()
+assert arena_post(json.dumps({"agent": "gemini", "model": "gemini-3.8-pro"}), path="/model") == (
+    200, json.dumps({"text": "gemini: gemini-3.8-pro, for the runs Agon starts."}))
+assert arena_post(json.dumps({"agent": "gemini", "model": "--yolo"}), path="/model")[0] == 400
+assert arena_post(json.dumps({"agent": "gemini", "model": "x"}), path="/model", origin="http://evil.example")[0] == 403
+snapshot = json.loads(arena_get("/board")[1])
+assert snapshot["models"]["gemini"]["model"] == "gemini-3.8-pro" and snapshot["models"]["claude"]["effort"] == "high"
+page = arena_get("/")[1]
+assert 'id="models"' in page and "renderModels(s.models)" in page and "'/model'" in page
+assert arena_post(json.dumps({"to": "all", "text": "STOP"}))[0] == 204 and agon.paused()  # the arena's STOP answers too
+assert agon.db().execute("SELECT sender, rcpt FROM msgs ORDER BY id DESC LIMIT 1").fetchone() == ("agon", "human")
+assert arena_post(json.dumps({"to": "all", "text": "RESUME"}))[0] == 204 and not agon.paused()
+arena.shutdown()
+arena.server_close()
+for agent in agon.COMMANDS:  # back to the apps' defaults for anything after this
+    agon.set_model(agent, "", "")
+assert agon.model_of("claude") == ("", "")
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

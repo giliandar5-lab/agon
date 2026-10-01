@@ -26,6 +26,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [x] Phase 6 — The arena
 - [x] Phase 7 — Packaging
+- [x] Phase 7.1 — Waiting costs nothing (fix found in the first real-app test)
 
 ## How every session works
 
@@ -76,7 +77,8 @@ When asked to do "the next phase":
   (at-least-once). Waiting uses `PRAGMA data_version` every 0.2 s (near-zero CPU, ≤ 0.2 s latency).
 - **Agent tools (max 4):** `send`, `inbox`, `ask` (Phase 3), `board` (Phase 4).
 - **Wake-up layers:** Claude Code channels (a doorbell: the push only says that messages wait) → Stop hooks in all
-  three apps (a JSON decision on stdout) → `inbox(wait)` → the human. `UserPromptSubmit` hooks (Claude Code, Codex)
+  three apps (a JSON decision on stdout) → autopilot's wakes → the human; an agent never waits in a turn (Phase 7.1).
+  `UserPromptSubmit` hooks (Claude Code, Codex)
   tell an agent that comes back which of its tasks went to others.
 - **Security:** arena on 127.0.0.1 with Host (plus exact `AGON_ARENA_HOSTS`), Origin and JSON checks and a
   nonce-based CSP; every message shows its author (`[HUMAN]` stands out); messages from agents are requests, never
@@ -309,6 +311,37 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
   TestPyPI dry run and the tag that publishes to PyPI and the MCP Registry (after testing with the real apps on
   Windows), the token numbers for Claude Code and Codex, the listings' forms and pull requests, and the demo video (a
   real recording only).
+
+## Phase 7.1 — Waiting costs nothing (fix found in the first real-app test)
+
+The first test with the real apps on Windows 11 (2026-10-01: Claude Code 2.1.284 in the Antigravity IDE, Codex in the
+ChatGPT desktop app 26.928, both on the human's plans) had the team join with "Keep going until human says STOP" and
+nothing to do yet:
+- Codex followed the instructions' "inbox -> your task -> a short report -> inbox" and called `inbox` with
+  `wait: 55` again and again. The ChatGPT desktop app runs tools from code it writes and hands a call that takes over
+  30 s back to the model, which then polled it with `wait` calls: 412,840 tokens (376,448 cached) in about three
+  minutes of an empty board. When the human asked the team to stop, it said so in its own window, not in the chat.
+- Claude Code's session had no Agon tools: the IDE had not been restarted after the plugin was installed (a fresh
+  `claude mcp list` in the folder showed `plugin:agon:agon ✔ Connected`). Its agent wrote its own JSON-RPC helper
+  for `agon.py` and a background script that polled agon.db, and restarted it after every message.
+- Claude Code channels, the one push into an idle session without autopilot, run only allowlisted plugins in the
+  research preview (`--dangerously-load-development-channels`), so they are no answer for most users.
+
+Fix:
+- **An idle agent ends its turn.** The instructions say: each turn, call inbox, do your part, report with send, then
+  end your turn; never wait, sleep, poll or loop for messages; Agon brings new ones to your next turn; paused, end the
+  turn at once without a reply; reach Agon only through its tools, never through scripts, its files or its database.
+  The Stop hook's and autopilot's texts end the same way, and add: if Agon's tools aren't available, tell the human
+  and stop. The README's join prompt says the same and has the human check `/mcp` first.
+- **`inbox` never waits** unless a client asks for it: the tool no longer offers `wait`. Waiting is Agon's job, and
+  free: the Stop hook (25 s), and autopilot's wakes for later messages.
+- **The pause answers the human.** `stop` or `стоп` as the whole message pauses too, in any letter case, and Agon
+  itself posts who is mid-turn when the team pauses, and "Team resumed." after: no agent spends a turn to say it
+  stopped.
+- **Models in the arena.** The Team panel picks each agent's model and effort for the runs Agon starts (autopilot's
+  wakes, asks and duels; an open app keeps its own pick): Claude Code's aliases, the models the human's Codex lists in
+  `~/.codex/models_cache.json` (read only), any name for Antigravity. `AGON_<NAME>_MODEL` and `AGON_<NAME>_EFFORT`
+  win over it. Asks and duels now pass the model too; before, only autopilot did.
 
 ## Non-goals
 

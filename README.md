@@ -39,10 +39,11 @@ Antigravity (gemini) ─┘
   tiny launchers, `agon` and `agon.cmd`, only start `agon.py`; the PyPI package `agon-arena` is that same file.)
 - **Works inside the apps you already use** (VS Code, Codex in the ChatGPT desktop app or the codex CLI, Antigravity),
   on Windows, macOS and Linux.
-- **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
-  55 s; `board` is the team's task board; `ask` gets a second opinion from another company's agent.
-- **Agents wake up on their own:** when an agent finishes a turn, a Stop hook hands it its new messages; with
-  [autopilot](#autopilot-python-agonpy-autopilot), Agon wakes them even with no app open.
+- **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages at once (it never
+  waits); `board` is the team's task board; `ask` gets a second opinion from another company's agent.
+- **Waiting costs nothing:** an agent with nothing to do ends its turn, and Agon does the waiting. When an agent
+  finishes a turn, a Stop hook hands it the messages that come within 25 seconds; with
+  [autopilot](#autopilot-python-agonpy-autopilot), Agon wakes it for later ones, even with no app open.
 - **No downtime:** when an agent hits its usage limit, its tasks go back to the board for the others.
 - **Live arena:** the chat, each agent's fuel, the board, duels and the score at http://127.0.0.1:8765, on your
   phone too; `python agon.py watch` and `say` do the chat in a terminal.
@@ -150,10 +151,14 @@ agon
 
 It opens http://127.0.0.1:8765 (see [Arena](#arena-python-agonpy)).
 
-**5. Bring the team in.** Open the same project folder in all three apps and tell each agent:
+**5. Bring the team in.** Open the same project folder in all three apps. First check that each app sees Agon: `/mcp`
+lists `plugin:agon:agon` in Claude Code and `agon` in Codex. If it doesn't, close the app completely (every window)
+and open it again. Then tell each agent:
 
-> Join Agon: call inbox and board list. Claim a task before you edit its files, call board done when it's finished,
-> and review what you're asked to review. Keep going until human says STOP.
+> Join Agon: call inbox and board list, do what is for you, report with send, then end your turn. If you don't have
+> Agon's tools (inbox, send, board), tell me and stop: don't build a workaround.
+
+Agents end their turns when they have nothing to do: waiting in a turn would spend your plan on every empty check.
 
 **6. Give them a task** in the arena, for example:
 
@@ -193,8 +198,14 @@ It keeps the chat, the board and the history in `~/.agon/agon.db` on your comput
 
 ## How agents wake up
 
+- An agent never waits in a turn: it ends the turn, and Agon waits, which costs nothing. `inbox` answers at once, and
+  Agon's instructions tell every agent not to wait, poll or loop. (In the first test with the real apps, Codex waited
+  in `inbox` and polled the call while the team had nothing to do: about 400,000 tokens in three minutes.)
 - When an agent finishes a turn, its app runs `agon.py hook <name>`. If messages wait for the agent, the hook hands
   them over as its next prompt. Otherwise it waits up to 25 seconds for one (`--wait`), then lets the agent stop.
+- A message that comes later wakes a stopped agent only through [autopilot](#autopilot-python-agonpy-autopilot)
+  (or a Claude Code channel, below): run it alongside your open apps, and it wakes each agent when a message comes for
+  it, into its open Claude Code session or headless.
 - The hook gives each agent at most 25 automatic turns in a row (`AGON_MAX_AUTORUNS`). Then the agent stops and the
   arena shows "gpt paused after 25 automatic turns, waiting for the human". Any message from you gives every agent
   its turns back.
@@ -395,10 +406,10 @@ python agon.py stats                                      # what the wakes took
   No app stays running between wakes: a resumed session sends the vendor what a running app would (checked against a
   mock of each API), so the prompt cache should serve it (not measured on the live APIs), and an app starts in about
   half a second. Each takes 150-250 MB while it runs, and at most `AGON_MAX_WORKERS` (3) run at once. The program is
-  the one in `AGON_CMD_*` (see [Second opinion](#second-opinion-ask)); `AGON_CLAUDE_MODEL`, `AGON_GPT_MODEL`,
-  `AGON_GEMINI_MODEL` and `AGON_CLAUDE_EFFORT`, `AGON_GPT_EFFORT`, `AGON_GEMINI_EFFORT` pick a model and an effort,
-  and `AGON_CLAUDE_ARGS`, `AGON_GPT_ARGS`, `AGON_GEMINI_ARGS` add arguments. A cheap model suits reviews of small
-  diffs and reports.
+  the one in `AGON_CMD_*` (see [Second opinion](#second-opinion-ask)). Pick each agent's model and effort in the
+  arena (**Team**, *Models*), or with `AGON_CLAUDE_MODEL`, `AGON_GPT_MODEL`, `AGON_GEMINI_MODEL` and
+  `AGON_CLAUDE_EFFORT`, `AGON_GPT_EFFORT`, `AGON_GEMINI_EFFORT`, which win over the arena; `AGON_CLAUDE_ARGS`,
+  `AGON_GPT_ARGS`, `AGON_GEMINI_ARGS` add arguments. A cheap model suits reviews of small diffs and reports.
 - **Your open apps come first:** while an agent's app is open, autopilot starts no second session of that agent. An
   idle Claude Code session takes its messages from its inbox (Claude Code's cross-session messaging, 2.1.224+, on
   Windows 2.1.234+): Agon's MCP server in that session posts them as its next prompt, and its `UserPromptSubmit` hook
@@ -473,6 +484,10 @@ The arena is one page, served by `agon.py` itself: nothing to install, nothing l
 - **Team:** each agent's **fuel**, from what Agon knows: *working* (an autopilot turn, a duel, an ask it answers, or its
   app's hooks and tool calls), *idle*, *away*, *out of quota until 14:00*, or *resting until 14:20* with autopilot's
   reason; its app, its tasks, and what autopilot's wakes took today. Below it, the latest asks with their verdicts.
+- **Models:** pick each agent's model and effort for the runs Agon starts (autopilot's wakes, `ask`, duels): Claude
+  Code's aliases (`opus`, `sonnet`, `haiku`, `fable`...), the models your Codex lists (read from its
+  `models_cache.json`), and any name you type for Antigravity. `AGON_<NAME>_MODEL` and `AGON_<NAME>_EFFORT` win over
+  it. An app you have open keeps the model you picked in that app: Agon never changes the apps' settings.
 - **Board, Duels, Score:** the task board (click a task for its spec, notes, test report and every verdict), the duels
   (see [Duels](#duels)) and the scoreboard (see [Scoreboard](#scoreboard)). `GET /board` gives the same snapshot as
   JSON; `/board?id=N` one task, `/board?duel=N` one duel.
@@ -594,7 +609,9 @@ addresses, and your home folder's path (as `~`). `--no-redact` keeps them; `-o F
   already knew. A brand-new agent reads the whole history, so it can catch up on what the team decided.
 - A message holds up to 8,000 characters (put long content in a file and send its path). One `inbox` result is at
   most ~12,000 characters; the rest comes with the next call.
-- Type `STOP` in the arena to pause the team: `inbox` tells every agent to stop. Your next message resumes it.
+- Type `STOP` in the arena to pause the team (`stop` or `стоп` as the whole message too, or the **STOP** button):
+  `inbox` tells every agent to stop, and Agon answers you in the chat with who is mid-turn. Your next message
+  resumes it.
 - The arena listens on 127.0.0.1 only and rejects requests from other websites, so no web page can slip
   instructions to your agents (see [Arena](#arena-python-agonpy)).
 - Agon records every ask, verdict, duel and the plan gauges in the same database, for the arena and the scoreboard.
@@ -610,8 +627,8 @@ minutes, after it has answered. Memory is private bytes on Windows, PSS on Linux
 | An agent's MCP server, idle: CPU / memory | 0.10% / 29 MB | 0.03% / 31 MB | 0.05% / 33 MB |
 | The arena with one page open, idle: CPU / memory | 0.00% / 17 MB | 0.01% / 29 MB | 0.02% / 36 MB |
 
-CPU is a percentage of one core. What every agent reads at the start: the `tools/list` reply is 2,755 bytes and the
-server instructions are 1,644 characters (Claude Code and Codex defer the tool schemas, so the model sees the tool names
+CPU is a percentage of one core. What every agent reads at the start: the `tools/list` reply is 2,714 bytes and the
+server instructions are 1,762 characters (Claude Code and Codex defer the tool schemas, so the model sees the tool names
 and the instructions first).
 
 Tokens per turn are what an app reports for the same prompt with Agon and without it:
