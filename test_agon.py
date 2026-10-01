@@ -4836,7 +4836,8 @@ assert "permissions:\n  contents: read" in release  # write rights only in the j
 # Phase 7, 14. server.json for the MCP Registry, and glama.json: the registry name the README carries, this version, the
 # package on PyPI run with uvx, the agent's name as a required argument, no e-mail address
 server = json.loads((HERE / "server.json").read_text(encoding="utf-8"))
-assert server["$schema"].endswith("/2025-12-11/server.schema.json") and server["name"] == "io.github.giliandar5-lab/agon"
+assert server["$schema"].endswith("/2025-12-11/server.schema.json")
+assert server["name"] == "io.github.giliandar5-lab/agon"
 assert f"<!-- mcp-name: {server['name']} -->" in (HERE / "README.md").read_text(encoding="utf-8")
 assert len(server["description"]) <= 100 and not re.search(r"\bGPT", server["description"])
 package = server["packages"][0]
@@ -4876,13 +4877,30 @@ logs.mkdir()
 (logs / "codex-without.jsonl").write_text(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 11000, "cached_input_tokens": 9000, "output_tokens": 30}}))
 for app_, adds in (("claude", 1000), ("codex", 2000)):
-    p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens", str(logs / f"{app_}-with.jsonl"),
-                        str(logs / f"{app_}-without.jsonl")], capture_output=True, timeout=60)
+    p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens",
+                        str(logs / f"{app_}-with.jsonl"), str(logs / f"{app_}-without.jsonl")], capture_output=True,
+                       timeout=60)
     assert p.returncode == 0 and json.loads(p.stdout)["agon_adds_input"] == adds, (app_, p.stdout, p.stderr)
 p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens", str(logs / "codex-with.jsonl"),
                     str(HERE / "README.md")], capture_output=True, timeout=60)
 assert p.returncode != 0 and b"no turns found" in p.stderr, p.stderr
 assert "python scripts/measure.py idle 120" in (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+
+# Phase 7, 17. Screenshots of the arena come from scripts/screenshots.py with made-up data, and say so on the image and
+# under it. The repository holds no binary files but images (the plugin checklist): no video, no archive, no program
+binaries = []
+for path in subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=HERE,
+                           capture_output=True, text=True).stdout.splitlines():
+    if b"\0" in (HERE / path).read_bytes()[:8192]:
+        binaries.append(path)
+assert binaries and all(Path(path).suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff2"} for path in
+                        binaries), binaries
+assert all(path.startswith("docs/images/") for path in binaries), binaries
+assert "Screenshot with demo data" in (HERE / "scripts" / "screenshots.py").read_text(encoding="utf-8")
+for readme in ("README.md", "README.ru.md"):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert "raw.githubusercontent.com/giliandar5-lab/agon/main/docs/images/arena.png)" in text, readme
+    assert "Screenshot with demo data" in text, readme
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

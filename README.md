@@ -25,6 +25,10 @@ each other better.*
 > code, and a scoreboard counts it per project. Install it from PyPI (`uvx agon-arena`) or as plugins. See
 > [ROADMAP.md](https://github.com/giliandar5-lab/agon/blob/main/ROADMAP.md).
 
+![The Agon arena: the team, the chat and the task board](https://raw.githubusercontent.com/giliandar5-lab/agon/main/docs/images/arena.png)
+
+*Screenshot with demo data.*
+
 ```
 Claude Code (claude) ─┐
 Codex       (gpt)    ─┼─ MCP + Stop hook ─► agon.py ─► ~/.agon/agon.db ◄─ browser arena (you = human)
