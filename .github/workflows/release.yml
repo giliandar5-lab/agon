@@ -1,0 +1,123 @@
+name: release
+
+# A tag v<version> builds the package once, tests that wheel on each system, puts it on TestPyPI, then on PyPI once the
+# maintainer approves the pypi environment, and lists the new version in the MCP Registry. Run by hand (workflow
+# dispatch), it stops after TestPyPI: a dry run. No secrets: PyPI and the registry trust this workflow (OIDC)
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: python -m pip install uv
+      - name: the tag, agon.py, the plugin manifests and server.json name one version
+        run: python scripts/check_package.py versions "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+      - run: uv build -o dist
+      - run: python scripts/check_package.py dist dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  test:
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.x"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: the built wheel, installed
+        run: |
+          python -m venv venv
+          bin=venv/bin; [ -d venv/Scripts ] && bin=venv/Scripts
+          "$bin/python" -m pip install dist/*.whl
+          python scripts/check_package.py installed "$bin/agon"
+
+  testpypi:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/agon-arena
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true  # a second dry run of one version
+
+  pypi:
+    needs: testpypi
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi  # its required reviewer (the maintainer) approves every release
+      url: https://pypi.org/p/agon-arena
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  registry:
+    needs: pypi
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - run: ./mcp-publisher validate
+      - run: ./mcp-publisher login github-oidc
+      - name: Publish to the MCP Registry (it checks the package on PyPI, which may take a few minutes to show it)
+        run: |
+          for wait in 30 60 120 240 0; do
+            ./mcp-publisher publish && exit 0
+            sleep "$wait"
+          done
+          exit 1

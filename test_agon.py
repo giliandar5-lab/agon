@@ -4819,6 +4819,39 @@ checker = (HERE / "scripts" / "check_package.py").read_text(encoding="utf-8")
 compile(checker, "check_package.py", "exec")
 assert set(re.findall(r"^(?:import|from) (\w+)", checker, re.M)) <= set(sys.stdlib_module_names), "stdlib only"
 
+# Phase 7, 13. A tag v<version> releases: one build, tested on each system with the oldest and newest Python, TestPyPI,
+# PyPI after the maintainer approves its environment, then the MCP Registry; by hand it is a dry run up to TestPyPI.
+# Trusted publishing: no token or password anywhere
+release = (HERE / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+for needed in ('tags: ["v*"]', "workflow_dispatch:", "check_package.py versions", "uv build -o dist",
+               "check_package.py dist dist", "os: [ubuntu-latest, windows-latest, macos-latest]", '"3.10"',
+               "name: testpypi", "repository-url: https://test.pypi.org/legacy/", "name: pypi",
+               "if: github.ref_type == 'tag'", "pypa/gh-action-pypi-publish@release/v1", "id-token: write",
+               "./mcp-publisher validate", "./mcp-publisher login github-oidc", "./mcp-publisher publish"):
+    assert needed in release, needed
+assert release.index("needs: build") < release.index("needs: test") < release.index("needs: testpypi") < release.index(
+    "needs: pypi")
+assert "secrets." not in release and "password" not in release and "token:" not in release.replace("id-token:", "")
+assert "permissions:\n  contents: read" in release  # write rights only in the jobs that publish
+# Phase 7, 14. server.json for the MCP Registry, and glama.json: the registry name the README carries, this version, the
+# package on PyPI run with uvx, the agent's name as a required argument, no e-mail address
+server = json.loads((HERE / "server.json").read_text(encoding="utf-8"))
+assert server["$schema"].endswith("/2025-12-11/server.schema.json") and server["name"] == "io.github.giliandar5-lab/agon"
+assert f"<!-- mcp-name: {server['name']} -->" in (HERE / "README.md").read_text(encoding="utf-8")
+assert len(server["description"]) <= 100 and not re.search(r"\bGPT", server["description"])
+package = server["packages"][0]
+assert server["version"] == package["version"] == agon.VERSION and package["identifier"] == "agon-arena"
+assert (package["registryType"], package["runtimeHint"], package["transport"]) == ("pypi", "uvx", {"type": "stdio"})
+assert package["packageArguments"] == [{"type": "positional", "valueHint": "agent", "description": package[
+    "packageArguments"][0]["description"], "isRequired": True, "choices": ["claude", "gpt", "gemini"]}]
+assert {v["name"] for v in package["environmentVariables"]} <= set(agon.ENV_VARS)
+glama = json.loads((HERE / "glama.json").read_text(encoding="utf-8"))
+assert glama["maintainers"] == ["giliandar5-lab"]
+for name in ("server.json", "glama.json", "pyproject.toml"):
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", (HERE / name).read_text(encoding="utf-8")), name
+assert subprocess.run([sys.executable, str(HERE / "scripts" / "check_package.py"), "versions"], capture_output=True,
+                      timeout=60).returncode == 0
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()

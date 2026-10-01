@@ -3,6 +3,7 @@
 python scripts/check_package.py dist DIR            the wheel and sdist in DIR: what they hold, their metadata
 python scripts/check_package.py installed CMD...    an installed agon: --version, and setup (it writes nothing)
 python scripts/check_package.py uvx-kill WHEEL      killing uvx ends the Agon it started (the Python under it)
+python scripts/check_package.py versions [TAG]      agon.py, the plugin manifests, server.json (and the tag) agree
 """
 import json
 import os
@@ -127,6 +128,18 @@ def uvx_kill(wheel):
     print("RESULT: ending uvx leaves Agon's Python running until its stdin closes, then it ends")
 
 
+def versions(tag=""):
+    found = {"agon.py": VERSION}
+    for name in (".claude-plugin/plugin.json", ".codex-plugin/plugin.json"):
+        found[name] = json.loads((HERE / name).read_text(encoding="utf-8"))["version"]
+    server = json.loads((HERE / "server.json").read_text(encoding="utf-8"))
+    found["server.json"], found["server.json package"] = server["version"], server["packages"][0]["version"]
+    if tag:
+        found["the tag"] = tag.removeprefix("v")
+    check(len(set(found.values())) == 1, f"one version: {found}")
+
+
 if __name__ == "__main__":
     what, args = sys.argv[1], sys.argv[2:]
-    {"dist": lambda: dist(args[0]), "installed": lambda: installed(args), "uvx-kill": lambda: uvx_kill(args[0])}[what]()
+    {"dist": lambda: dist(args[0]), "installed": lambda: installed(args), "uvx-kill": lambda: uvx_kill(args[0]),
+     "versions": lambda: versions(*args)}[what]()

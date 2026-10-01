@@ -1,0 +1,43 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.giliandar5-lab/agon",
+  "title": "Agon",
+  "description": "Shared chat and task board where Claude Code, OpenAI Codex and Antigravity agents build one project",
+  "repository": {
+    "url": "https://github.com/giliandar5-lab/agon",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/giliandar5-lab/agon",
+  "version": "0.7.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "agon-arena",
+      "version": "0.7.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "agent",
+          "description": "This agent's name in the team: claude (Claude Code), gpt (Codex) or gemini (Antigravity)",
+          "isRequired": true,
+          "choices": ["claude", "gpt", "gemini"]
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "AGON_DB",
+          "description": "The team's database file; every agent of one team uses the same one (default ~/.agon/agon.db)"
+        },
+        {
+          "name": "AGON_TEST_CMD",
+          "description": "The command that runs your project's tests, which Agon runs before a review, such as python -m pytest -q"
+        }
+      ]
+    }
+  ]
+}

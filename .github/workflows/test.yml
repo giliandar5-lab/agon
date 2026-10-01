@@ -67,7 +67,7 @@ jobs:
       - name: ending uvx ends Agon
         run: python scripts/check_package.py uvx-kill dist/*.whl
 
-  # The plugin manifests, as Claude Code's own validator reads them
+  # The plugin manifests and server.json, as Claude Code's validator and the MCP Registry read them
   plugin:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -77,3 +77,8 @@ jobs:
           persist-credentials: false
       - run: npm install -g @anthropic-ai/claude-code
       - run: claude plugin validate --strict .
+      - name: server.json, as the MCP Registry reads it
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher validate
+      - run: python3 scripts/check_package.py versions
