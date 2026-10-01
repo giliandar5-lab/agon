@@ -19,6 +19,7 @@ import datetime
 import functools
 import hashlib
 import json
+import math
 import os
 import posixpath
 import queue
@@ -48,7 +49,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-__version__ = VERSION = "0.7.4"  # also in the plugin manifests; flit reads __version__ for the PyPI package
+__version__ = VERSION = "0.7.5"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -2611,11 +2612,13 @@ def out_of_quota(me, text, own=True):
 
 
 def max_autoruns():
-    """AGON_MAX_AUTORUNS: how many times in a row the hook may keep an agent going without the human (25)."""
+    """AGON_MAX_AUTORUNS: how many times in a row the hook may keep an agent going without the human (25); 0: no limit,
+    the human's own choice (the first real-app test: "why only 12? make it endless")."""
     try:
-        return int(os.environ.get("AGON_MAX_AUTORUNS") or 25)
+        value = int(os.environ.get("AGON_MAX_AUTORUNS") or 25)
     except ValueError:
-        raise ValueError("AGON_MAX_AUTORUNS must be a whole number, such as 25") from None
+        raise ValueError("AGON_MAX_AUTORUNS must be a whole number, such as 25, or 0 for no limit") from None
+    return math.inf if value == 0 else value
 
 
 def out_of_turns(me, limit):
@@ -3244,7 +3247,8 @@ class Autopilot:
         # the settings, read once: a bad one stops autopilot before anything runs
         self.debounce = seconds("AGON_DEBOUNCE_SECONDS", DEBOUNCE)
         self.timeout = seconds("AGON_TURN_TIMEOUT", TURN_TIMEOUT)
-        self.max_wakes = count("AGON_MAX_WAKES_PER_HOUR", MAX_WAKES)
+        self.max_wakes = math.inf if os.environ.get("AGON_MAX_WAKES_PER_HOUR", "").strip() == "0" else count(
+            "AGON_MAX_WAKES_PER_HOUR", MAX_WAKES)  # 0: no limit, the human's own choice
         self.max_workers = count("AGON_MAX_WORKERS", MAX_WORKERS)
         self.rotate = (count("AGON_ROTATE_TOKENS", ROTATE_TOKENS), count("AGON_ROTATE_TURNS", ROTATE_TURNS),
                        count("AGON_ROTATE_HOURS", ROTATE_HOURS))

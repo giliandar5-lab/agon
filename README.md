@@ -433,7 +433,8 @@ python agon.py stats                                      # what the wakes took
   20 messages the agent knew, the board and its last report. With `AGON_HANDOFF_NOTE=1` the old session first writes a
   hand-off for it (one more turn).
 - **Brakes:** at most `AGON_MAX_WAKES_PER_HOUR` (12) wakes of one agent an hour, and 25 automatic turns in a row
-  without a message from you (`AGON_MAX_AUTORUNS`, as for the hooks). `AGON_DAILY_USD` caps what Claude Code
+  without a message from you (`AGON_MAX_AUTORUNS`, as for the hooks); `0` turns either off, and then two agents that
+  talk to each other go on until STOP or your plan's limit. `AGON_DAILY_USD` caps what Claude Code
   estimates one agent spent since midnight (and goes to `--max-budget-usd`), `AGON_DAILY_TOKENS` the tokens of each
   agent (uncached input and output); both are off until you set them (with agy on a paid API key, set
   `AGON_DAILY_TOKENS`). A turn takes at most `AGON_TURN_TIMEOUT` seconds (900): then Agon interrupts it, and 20 seconds

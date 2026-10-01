@@ -639,6 +639,9 @@ try:
 except ValueError as e:
     assert "AGON_MAX_AUTORUNS" in str(e)
 del os.environ["AGON_MAX_AUTORUNS"]
+os.environ["AGON_MAX_AUTORUNS"] = "0"  # 0: no limit, the human's own choice
+assert agon.max_autoruns() == float("inf") and not agon.out_of_turns("kai", agon.max_autoruns())
+del os.environ["AGON_MAX_AUTORUNS"]
 HOOKS = dict(os.environ, AGON_DB=str(Path(TMP, "hooks.db")))  # a chat of its own, so names like gpt are free
 
 
@@ -3050,6 +3053,8 @@ with settings(AGON_MAX_WAKES_PER_HOUR="3"):
         " times in the last hour (AGON_MAX_WAKES_PER_HOUR)."), heard()
 agon.db().execute("UPDATE pilot SET parked = NULL WHERE agent = 'claude'")
 spent = agon.db().execute("SELECT SUM(usd) FROM runs WHERE agent = 'claude'").fetchone()[0]
+with settings(AGON_MAX_WAKES_PER_HOUR="0"):  # 0: no limit
+    assert agon.Autopilot(["claude"], "claude", str(project)).max_wakes == float("inf")
 with settings(AGON_DAILY_USD="5", AGON_MAX_WAKES_PER_HOUR="100"):
     braked = agon.Autopilot(["claude", "gpt", "gemini"], "claude", str(project), told.append)
     assert step(braked) == ["claude"]
@@ -4951,7 +4956,7 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
 # Phase 7, 18. The phase ticked with what it did and what is left to the maintainer; Phase 7.1 made it 0.7.1, so that
 # the apps' plugin managers see the update
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
-assert agon.VERSION == "0.7.4" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert agon.VERSION == "0.7.5" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
 assert "- [x] Phase 7.1 — Waiting costs nothing" in roadmap and "## Phase 7.1 — Waiting costs nothing" in roadmap
 
 # Phase 7.1. Waiting costs nothing: inbox answers at once and no longer offers to wait (an agent that waits in a turn
