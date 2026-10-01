@@ -2,8 +2,9 @@
 
 ## Positioning
 
-**Your AI rivals, one team.** Agon turns Claude (Claude Code), GPT (Codex) and Gemini (Antigravity) into one
-team working on your project, and shows it live in an arena. Two pillars:
+**Your AI rivals, one team.** Agon turns the agents of Claude Code, OpenAI Codex and Antigravity into one
+team working on your project (not affiliated with Anthropic, OpenAI or Google; in commands and settings they are
+`claude`, `gpt` and `gemini`), and shows it live in an arena. Two pillars:
 
 1. **AI team arena.** Agents coordinate on a shared board, review each other's work across vendors, and can
    duel on a task so you learn which AI is best on *your* code.
@@ -24,7 +25,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 4 — Task board (no downtime)
 - [x] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [x] Phase 6 — The arena
-- [ ] Phase 7 — Packaging
+- [x] Phase 7 — Packaging
 
 ## How every session works
 
@@ -287,11 +288,33 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
 
 - PyPI package `agon-arena` with an `agon` command (`uvx agon-arena`), listings in plugin marketplaces and MCP
   directories, a demo video, and measured numbers (idle CPU and RAM, `tools/list` size, tokens per turn).
+- Every tool says its `title` and all four hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`; `ask` keeps the default open world): the claude.ai directory requires them, and an app reads a
+  missing hint as the riskier value. `board` is not destructive: it records task state on Agon's own board, every
+  action also posts to the chat, and reviews have a table of their own. `ask` is: another company's agent may write
+  files (on a branch of its own). So the `tools/list` limit in the tests went from 2,500 to 2,900 bytes (the new size
+  and a small margin) instead of cutting the descriptions: Claude Code and Codex defer tool schemas behind tool
+  search, so the model reads the names and the server instructions first, and a schema only when it needs the tool.
+- Listings: the official MCP Registry (`io.github.giliandar5-lab/agon`, from `server.json`, published by the release
+  workflow), the claude.ai directory (its form, by the maintainer), awesome-mcp-servers, mcp.so, Glama, the
+  Antigravity interest form and awesome-codex-plugins. The texts for the lists run by other people go in the pull
+  request; the maintainer submits them after the release (no pull requests in other people's repositories from a
+  session).
+- Tokens per turn: Claude Code and Codex, from the usage each app reports, with and without Agon. Antigravity's
+  `gemini` is "not measured": its headless usage needs an API key.
+- Done in v0.7.0: the package (`agon-arena`, built by `flit_core` at release time), the `agon` command, setup that
+  prints the command an install keeps, a database that older copies keep working on, annotations, the directory policy
+  checks, PRIVACY.md and SECURITY.md, CI that builds and installs the package on each system, the release workflow,
+  `server.json`, the measuring and screenshot scripts, and the numbers CI measured. Left to the maintainer: the
+  TestPyPI dry run and the tag that publishes to PyPI and the MCP Registry (after testing with the real apps on
+  Windows), the token numbers for Claude Code and Codex, the listings' forms and pull requests, and the demo video (a
+  real recording only).
 
 ## Non-goals
 
 A Rust/Go rewrite, Electron, third-party dependencies, dozens of tools, parallel-writer swarms by default,
-editing users' config files, hard-coded model rankings, claims we can't measure.
+editing users' config files, hard-coded model rankings, claims we can't measure. (`flit_core` builds the PyPI package
+at release time only: nothing installs it to run Agon, and the package depends on nothing.)
 
 ## Working rules for every phase
 
@@ -299,6 +322,9 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
   these tools change monthly. If the docs are unreachable from your environment, use the facts below and list
   in the pull request what you could not re-verify.
 - `agon.py` stays one file with zero dependencies; existing tools stay backward compatible.
+- Every schema step stays backward compatible (new tables, or new columns with defaults, never a new meaning for an
+  old column), so an older copy keeps working: each app keeps its own copy of Agon, and all share one database. The
+  arena and setup name the app whose copy is older and say how to update it.
 - Every new behavior gets an assert-based check in `test_agon.py`; `python test_agon.py` must print `ok`.
 - The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
   (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.
@@ -709,6 +735,38 @@ tried with agy 1.2.10 for Linux, whose sessions need a Google login, and the 1.2
   a long user name (`C:\Users\RUNNER~1\AppData\Local\Temp` on GitHub's runner); git spells the same folder long, with
   `/`. Git Bash, and so Claude Code's Bash tool, writes the home folder as `/c/Users/me`. A child's `print()` into a
   pipe ends its lines with `\r\n`.
+
+**Phase 7 additions (checked 2026-09-30 to 2026-10-01; hands-on with uv 0.8.17, Python 3.11, flit_core 4, Claude
+Code 2.1.285 and codex-cli 0.159.3 on Linux)**
+- Packaging: `flit_core` (>=4) builds one module from `agon.py`, with the version from `__version__` and the summary
+  from the docstring's first line, Metadata 2.5 with a PEP 639 `license = "MIT"` and no `Author-email`. hatchling and setuptools build it
+  too; `uv_build` wants a package folder (`agon/__init__.py`). An sdist that leaves out the tests stays small.
+- `uvx agon-arena` needs a script named like the package (`agon-arena`), else uv says to use `uvx --from agon-arena
+  agon`. uvx keeps its environments in uv's cache (`archive-v0`, `environments-v2`): `uv cache clean` deletes them
+  (`uv cache prune` kept them here, though uv's docs say it may), so setup prints no path into it. `uv tool install` keeps the tool in `~/.local/share/uv/tools`
+  (Windows `%APPDATA%\uv\data\tools`) with the command in `~/.local/bin`. uvx and `uv tool` download a Python when
+  none fits (`UV_PYTHON_DOWNLOADS=never` stops it); pip and pipx use the Python they run on.
+- uv's and pip's `agon.exe` on Windows is a real launcher program (uv's trampoline, distlib's launcher) that starts
+  Python in a job object and passes stdio through *(from their sources)*. But `uvx.exe` itself starts `uv.exe`, which
+  starts `agon-arena.exe`: ending `uvx.exe` (TerminateProcess) leaves `uv.exe`, the launcher and Python running while
+  Agon's stdin stays open, and they end as soon as it closes, as it does when the app closes or dies. On Linux and
+  macOS, ending uvx (SIGTERM) ends Agon at once *(CI, `scripts/check_package.py uvx-kill`, 2026-10-01)*.
+- Updating a plugin: Claude Code `claude plugin marketplace update agon`, then `claude plugin update agon@agon`, and a
+  restart; Codex `codex plugin marketplace upgrade agon`, then `codex plugin add agon@agon` *(both hands-on with a
+  local marketplace)*. Each update installs the new copy in a new folder; the old one stays behind.
+- MCP Registry: `server.json` (schema 2025-12-11), `registryType: "pypi"`, `runtimeHint: "uvx"`; the registry checks
+  that the package's description contains `mcp-name: io.github.giliandar5-lab/agon` (an HTML comment in the README
+  does it), the namespace is case-sensitive, a version is immutable once published, and `mcp-publisher login
+  github-oidc` logs a workflow in without a secret.
+- PyPI: Trusted Publishing from a GitHub environment (`id-token: write`, `pypa/gh-action-pypi-publish`, Linux only,
+  attestations by default); a new project starts from a pending publisher. The project page shows the maintainers'
+  user names, not the uploader, and an `Author-email` as a mailto link (so the package has none). PyPI's README
+  renderer breaks relative links, keeps `#anchors`, and strips video.
+- The claude.ai directory's policy wants a `title` and every applicable hint on each tool, a privacy policy, tool
+  descriptions that match what the tools do, and no instructions that make Claude call other software unasked; its
+  plugin checklist holds files over 256 KiB (`agon.py`, `test_agon.py`) for a reviewer.
+- Brands: the apps are named as they are (Claude Code, OpenAI Codex, Antigravity), never "GPT" as a product, with "not
+  affiliated with Anthropic, OpenAI or Google"; `gpt` stays an agent's name in commands.
 
 **CI (GitHub Actions)** *(checked 2026-09-24 in the actions' repositories)*
 - Current majors: `actions/checkout@v7`, `actions/setup-python@v7` (node24). `ubuntu-latest` is Ubuntu 24.04,

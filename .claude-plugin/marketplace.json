@@ -4,7 +4,7 @@
     "name": "giliandar5-lab",
     "url": "https://github.com/giliandar5-lab"
   },
-  "description": "Agon: Claude, GPT and Gemini build your project together.",
+  "description": "Agon: Claude Code, OpenAI Codex and Antigravity build your project together. Not affiliated with Anthropic, OpenAI or Google.",
   "plugins": [
     {
       "name": "agon",

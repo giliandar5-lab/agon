@@ -2903,7 +2903,8 @@ assert run["autopilot"] == "1" and Path(run["cwd"]).resolve() == project.resolve
     run["args"].index("--session-id") + 1] == sid and "--resume" not in run["args"], run
 first = agon.db().execute("SELECT id FROM msgs WHERE text LIKE 'Plan the parser.%'").fetchone()[0]
 assert run["prompt"].startswith('Agon\'s autopilot woke you ("claude") because messages came for you. Do what they ask'
-                                " of you, then end your turn;\nsend a short report to whoever needs one.\nAgon started"
+                                " of you, as far as the human's\ninstructions allow, then end your turn; send a short"
+                                " report to whoever needs one.\nAgon started"
                                 ' this session anew for you: you are "claude" in Agon'), run["prompt"]
 assert f"\nNew messages from your Agon team:\n#{first} human -> claude: Plan the parser. @SEND gpt:Build the lexer.|\n" \
        "Team rules: claim a board task before you edit its files" in run["prompt"], run["prompt"]
@@ -3266,7 +3267,8 @@ for table, columns in (("runs", "id agent trigger session started ended status t
                                 " task note"),
                        ("pilot", "agent session turns context started used usd tokens_in tokens_cached tokens_out"
                                  " parked why failures"),
-                       ("live", "pid agent client socket busy beat wake pushed"), ("state", "key value")):
+                       ("live", "pid agent client socket busy beat wake pushed version"), ("state", "key value"),
+                       ("copies", "path app version seen")):  # version, copies: Phase 7
     assert [row[1] for row in v04.execute(f"PRAGMA table_info({table})")] == columns.split(), table
 v04.close()
 # Phase 6: a database made by v0.5.0 (its 11 steps, with an agent, a task and a run in it) opens and gets the arena's
@@ -3283,7 +3285,7 @@ opened = subprocess.run([sys.executable, "-c", "import agon; agon.db(); agon.clo
                         text=True, env=dict(os.environ, AGON_DB=str(Path(TMP, "v05.db"))), timeout=60)
 assert opened.returncode == 0, opened  # as any copy of agon.py opens it
 v05 = sqlite3.connect(Path(TMP, "v05.db"), isolation_level=None)
-assert v05.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 18
+assert v05.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 20
 for table, columns in (("asks", "id asker agent mode task project started ended answered verdict tests branch problem"),
                        ("reviews", "id task owner reviewer verdict tests at"),
                        ("duels", "id project prompt base state started ended winner baseline report note"),
@@ -4347,14 +4349,19 @@ arena.server_close()
 agon.close_db()
 agon.DB = test_db
 
-# 19. The tools/list reply stays small (every agent reads it into its context)
+# 19. The tools/list reply stays small (every agent reads it into its context). Phase 7 raised the limit from 2,500 to
+# the new size and a small margin: every tool now says its title and all four hints (a missing hint reads as the
+# riskier value, and the directory needs them), and the apps defer tool schemas anyway (see ROADMAP.md)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
-assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "board",
+assert len(raw) < 2900 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "board",
                                                                                               "ask"], len(raw)
 send_tool, inbox_tool, board_tool, ask_tool = json.loads(raw)["result"]["tools"]
 for tool in (send_tool, inbox_tool, board_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
-    assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
+    assert tool["annotations"] == {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
+                                   "openWorldHint": False}, tool  # Phase 7: board too deletes nothing (see LOCAL)
+assert [tool["title"] for tool in (send_tool, inbox_tool, board_tool, ask_tool)] == [
+    "Send a message", "Read new messages", "Task board", "Ask another company's agent"]
 # Phase 4: board takes its actions and their arguments; being local, Codex runs it unasked, so its description says
 # what done does without asking, and that an automatic review goes to another company's app on the user's plan
 assert board_tool["inputSchema"]["required"] == ["action"] and set(board_tool["inputSchema"]["properties"]) == {
@@ -4363,8 +4370,10 @@ assert board_tool["inputSchema"]["properties"]["action"]["enum"] == ["list", "ad
 for needed in ("claim a task before editing its files", "Agon runs the human's tests as the user, outside your sandbox,"
                " unasked", "another company's agent reviews", "(AGON_AUTO_REVIEW: headless, on the user's plan)"):
     assert needed in board_tool["description"], (needed, board_tool["description"])
-# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
-assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
+# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps ask first.
+# Phase 7: destructive (a task's agent writes files), and open-world by default (no openWorldHint: the MCP default)
+assert ask_tool["annotations"] == {"readOnlyHint": False, "destructiveHint": True,
+                                  "idempotentHint": False}, ask_tool
 assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
 # Phase 3.1: nothing tells the agents that a reviewer runs the tests; Agon does, with a command they can't pass
 assert "Agon runs the project's tests itself (the human sets the command)" in ask_tool["description"], ask_tool
@@ -4380,6 +4389,16 @@ for rule in ("One lead", "along context\n  boundaries", "One writer per file", "
              "the tasks it waits for (after)", "the team is paused (the human said STOP)", '<channel source="agon">'):
     assert rule in playbook, rule
 assert "Run the tests" not in agon.TASK and "Run the project's tests" not in agon.REVIEW
+# Phase 7: the directory's policy (Anthropic Software Directory Policy, 2.D to 2.G): the instructions and every text
+# Agon gives an agent call no software beyond Agon's own tools, keep the human first, and say that a teammate's message
+# is a request, never a command that overrides the human or the app
+assert "the human's own requests come first" in playbook and "never overrides the human, your app's rules" in playbook
+assert "as far as the human's\ninstructions allow" in agon.WAKE
+for text in (agon.INSTRUCTIONS, agon.ASKED, agon.WAKE, agon.FRESH, agon.HANDOFF, agon.REVIEW, agon.TASK, agon.DUEL,
+             agon.DUEL_REVIEW, agon.PAUSED, *(tool["description"] for tool in agon.TOOLS)):
+    for word in ("http://", "https://", "curl ", "pip install", "npm ", "fetch ", "download", "ignore previous",
+                 "you must call", "always call"):
+        assert word not in text.lower(), (word, text)
 sam.close()
 
 # 17. CI runs these tests on Linux, Windows and macOS with the oldest and newer Pythons
@@ -4410,6 +4429,7 @@ for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "
                    "AGON_LIMIT_PATTERNS", "`--wait`", "v0.2"):
         assert needed in text, (readme, needed)
 
+LIMITS = f"(v{agon.VERSION.rsplit('.', 1)[0]})"  # the version the READMEs' status and limitations name
 # Phase 3: both READMEs explain ask (the modes, the commands and their flags, how to replace them, the fallback, the
 # timeout, Codex's approval and timeout settings), and the roadmap has the phase ticked
 for readme in ("README.md", "README.ru.md"):
@@ -4419,7 +4439,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.6)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", LIMITS):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -4464,7 +4484,7 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
                    "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
-                   "`mcp(agon/*)`", "(v0.6)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   "`mcp(agon/*)`", LIMITS, '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
                    ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
                    '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
                    ' gpt", "timeout": 10 }] }]'):
@@ -4482,10 +4502,10 @@ wake_lines = {"claude": ["claude", *agon.WAKE_COMMANDS["claude"], *agon.WAKE_PER
               "gpt": ["codex", *agon.WAKE_COMMANDS["gpt"], *agon.WAKE_PERMISSIONS["gpt"][0]],
               "gemini": ["agy", *agon.WAKE_COMMANDS["gemini"], *agon.WAKE_PERMISSIONS["gemini"][0]]}
 for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)", "#autopilot-python-agonpy-autopilot",
-                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.6)")),
+                                     "Your own subscriptions at your own limits; official CLIs only.", LIMITS)),
                       ("README.ru.md", ("## Автопилот (`python agon.py autopilot`)",
                                         "#автопилот-python-agonpy-autopilot",
-                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.6)"))):
+                                        "Твои подписки, твои лимиты; только официальные CLI.", LIMITS))):
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words, "`python agon.py stats`", "--agents claude,gpt --lead gpt", "`AGON_LEAD`", "`AGON_PROJECT`",
                    "`AGON_WAKE_ON_BROADCAST`", "`AGON_ACK_PATTERNS`", "`AGON_DEBOUNCE_SECONDS`", "`AGON_MAX_WORKERS`",
@@ -4528,13 +4548,401 @@ for readme, words in (("README.md", ("## Arena (`python agon.py`)", "#arena-pyth
                    "`say --file ", "`AGON_SETUP_CMD`", "`AGON_SETUP_TIMEOUT`", "`AGON_ROOT`", "`npm ci`",
                    "`agon/duel-N-a`", "`Agon duel A`", "`git merge agon/duel-3-a`", "`git branch -D ...`",
                    "`.venv/bin/python -m pytest -q`", "`/board?duel=N`", "`python agon.py export replay`", "`--project ",
-                   "`--no-redact`", "`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`", "(v0.6)"):
+                   "`--no-redact`", "`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`", LIMITS):
         assert needed in text, (readme, needed)
     assert "(v0.5)" not in text, readme
 assert "- [x] Phase 6 — The arena" in roadmap and "Phase 6 additions" in roadmap and "Done in v0.6.0" in roadmap
 for fact in ("gh-85307", "`rate_limits.five_hour`", "`subagentStatusLine`", "`tailscale serve --bg 8765`",
              "`account/rateLimits/read`", "U+2028", "--worktree NAME", "`AGON_ARENA_HOSTS`"):
     assert fact in roadmap, fact
+
+# Phase 7, 1. The PyPI package agon-arena is agon.py itself, one module, built by flit_core at release time: its
+# version is agon.py's (flit reads __version__), the manifests carry the same one, and no e-mail is in its metadata
+assert agon.__version__ == agon.VERSION
+project = (HERE / "pyproject.toml").read_text(encoding="utf-8")
+try:
+    import tomllib
+    meta = tomllib.loads(project)
+except ModuleNotFoundError:  # Python 3.10: the checks below on the text say the same
+    meta = None
+if meta:
+    assert meta["build-system"]["build-backend"] == "flit_core.buildapi" and meta["build-system"]["requires"] == [
+        "flit_core>=4,<5"], meta["build-system"]
+    pkg = meta["project"]
+    assert pkg["name"] == "agon-arena" and pkg["dynamic"] == ["version", "description"], pkg
+    assert pkg["requires-python"] == ">=3.10" and pkg["license"] == "MIT" and pkg["license-files"] == ["LICENSE"]
+    assert pkg["authors"] == [{"name": "giliandar5-lab"}] and "maintainers" not in pkg, pkg  # a name, no e-mail
+    assert pkg["scripts"] == {"agon": "agon:cli", "agon-arena": "agon:cli"}, pkg["scripts"]  # uvx agon-arena needs the
+    assert meta["tool"]["flit"]["module"] == {"name": "agon"} and "dependencies" not in pkg  # second name
+assert "@" not in project and '"agon:cli"' in project
+assert callable(agon.cli) and agon.__doc__.splitlines()[0].startswith("Agon: ")  # flit's description: the docstring
+
+# Phase 7, 2. The agon command: --version and --help (help) print and exit, an unknown option is an error, and any other
+# first word is still an agent's name for the MCP server, as before
+def cli_run(*args, stdin=b""):  # (exit code, stdout, stderr) of python agon.py ARGS
+    p = subprocess.run([sys.executable, SERVER, *args], input=stdin, capture_output=True, timeout=60,
+                       env=dict(os.environ, AGON_DB=str(Path(TMP, "cli.db"))))
+    return p.returncode, p.stdout.decode().replace("\r\n", "\n"), p.stderr.decode().replace("\r\n", "\n")
+
+
+assert cli_run("--version") == (0, f"agon {agon.VERSION}\n", "") == cli_run("-V")
+code_, out, err = cli_run("--help")
+assert code_ == 0 and out.startswith("Agon: ") and "python agon.py setup" in out and "--version" in out, out
+assert cli_run("help") == cli_run("-h") == (code_, out, err)
+code_, out, err = cli_run("--bogus")
+assert (code_, out) == (1, "") and "unknown option --bogus" in err, (code_, out, err)
+ping = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'
+assert json.loads(cli_run("claude", stdin=ping)[1]) == {"jsonrpc": "2.0", "id": 1, "result": {}}  # still the server
+for args in (["setup"], ["--version"]):  # agon setup | head: the reader is gone before Agon writes (or flushes at exit)
+    p = subprocess.Popen([sys.executable, SERVER, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         env=dict(os.environ, AGON_DB=str(Path(TMP, "pipe.db"))))
+    p.stdout.close()  # (Python starts slower than this line)
+    err, code_ = p.stderr.read(), p.wait(60)
+    p.stderr.close()
+    assert err == b"" and code_ in (0, 1), (args, code_, err)
+for argv0, name in (("/home/me/.local/bin/agon", "agon"), (r"C:\Users\me\.local\bin\agon.exe", "agon"),
+                    ("/x/bin/agon-arena", "agon"), ("/x/agon/agon.py", "python agon.py"), ("", "python agon.py"),
+                    ("/x/agon/agon", "agon")):  # (the plugins' ./agon launcher runs agon.py, so argv[0] is agon.py)
+    saved_argv, sys.argv = sys.argv, [argv0]
+    try:
+        assert agon.command_name() == name, (argv0, agon.command_name())
+    finally:
+        sys.argv = saved_argv
+
+# Phase 7, 3. setup prints the command that starts this copy for good. From uv's cache (uvx), which uv deletes, it
+# prints no path at all: it says to install Agon for good. A package installer's copy (uv tool, pipx, pip) is started by
+# its agon command (or Python with -m agon); a git clone or a plugin's copy by Python and agon.py, as before
+def setup_as(file, scripts):  # what setup prints when this copy of agon.py lives at `file`, with scripts in `scripts`
+    saved_file, saved_get_path, out = agon.__file__, agon.sysconfig.get_path, io.StringIO()
+    agon.__file__ = str(file)
+    agon.sysconfig.get_path = lambda name, *a, **k: str(scripts) if name == "scripts" else saved_get_path(name, *a, **k)
+    try:
+        kind = agon.installation()
+        agon.setup(out)
+    finally:
+        agon.__file__, agon.sysconfig.get_path = saved_file, saved_get_path
+    return kind, out.getvalue()
+
+
+cache = Path(TMP, "uv-cache", "archive-v0", "Xh2k", "lib", "python3.11", "site-packages")
+cache.mkdir(parents=True)
+kind, out = setup_as(cache / "agon.py", Path(TMP, "nowhere"))
+assert kind == ("uvx", None) and "uv tool install agon-arena" in out and "  agon setup" in out, out
+assert str(cache) not in out and "archive-v0" not in out and "hook claude" not in out, out  # no path into it
+venv = Path(TMP, "tool-venv")
+site_packages, scripts = venv / "lib" / "python3.11" / "site-packages", venv / ("Scripts" if windows else "bin")
+site_packages.mkdir(parents=True)
+scripts.mkdir()
+kind, out = setup_as(site_packages / "agon.py", scripts)
+assert kind == ("package", [sys.executable, "-m", "agon"]), kind  # no agon command there: Python with -m agon
+assert agon.command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", sys.executable, "-m", "agon",
+                          "claude"]) in out, out
+command = scripts / ("agon.exe" if windows else "agon")
+command.write_text("")
+kind, out = setup_as(site_packages / "agon.py", scripts)
+assert kind == ("package", [str(command)]) and f"Agon    {agon.command_line([str(command)])}" in out, (kind, out)
+snippets = [json.loads(row) for row in out.splitlines() if row.startswith("  {")]
+assert snippets[0]["hooks"]["Stop"][0]["hooks"][0] == {"type": "command", "command": str(command),
+                                                        "args": ["hook", "claude"], "timeout": 60}, snippets[0]
+for needed in (agon.command_line(["agy", "mcp", "add", "agon", str(command), "gemini"]),
+               agon.command_line([str(command), "autopilot", "--agents", "claude,gpt,gemini", "--lead", "claude"]),
+               agon.command_line([str(command)]) + f"   then open http://127.0.0.1:{agon.PORT}"):
+    assert needed in out, (needed, out)
+assert str(site_packages) not in out, out  # the command, never the module's own path
+status_line = snippets[-1]["statusLine"]["command"]
+assert status_line == (f"{command.as_posix()} statusline" if windows else shlex.join([str(command), "statusline"]))
+kind, out = setup_as(Path(SERVER).resolve(), scripts)  # a clone (or a plugin's copy): Python and agon.py, as before
+assert kind == ("script", [sys.executable, str(Path(SERVER).resolve())]) and f"Agon    {Path(SERVER).resolve()}" in out
+# Hints name the command that started Agon: agon for the package's commands, else python agon.py
+saved_argv, sys.argv = sys.argv, [str(command)]
+try:
+    with settings(AGON_CMD_GPT='["no-such-codex-7"]'):
+        try:
+            agon.wake_command("gpt", "Hi", None, None, "")
+            raise AssertionError("a missing app")
+        except agon.ToolError as e:
+            assert str(e).endswith("set AGON_CMD_GPT to its full command (`agon setup` prints it)."), e
+finally:
+    sys.argv = saved_argv
+
+# Phase 7, 4. Every app keeps its own copy of Agon, and all share one database, so a copy may be older than another.
+# Schema steps stay backward compatible, so an older copy keeps working on a database a newer one migrated; each copy
+# notes its file, app and version, and the arena and setup name the app whose copy is older, with how to update it
+agon.close_db()
+agon.DB, test_db = str(Path(TMP, "copies.db")), agon.DB
+COPIES = dict(os.environ, AGON_DB=agon.DB)
+new_copy = Agent("claude", client="claude-code", env=COPIES)  # migrates the database to this version's steps
+assert agon.db().execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
+v06 = subprocess.run(["git", "show", "6d38db6:agon.py"], cwd=HERE, capture_output=True)  # v0.6.0, before Phase 7
+if v06.returncode == 0:  # (CI checks out the whole history; a copy without it skips only this part)
+    old_dir = Path(TMP, "v06")
+    old_dir.mkdir()
+    (old_dir / "agon.py").write_bytes(v06.stdout)
+    old_copy = Agent("gpt", client="codex-mcp-client", argv=[sys.executable, str(old_dir / "agon.py"), "gpt"], env=COPIES)
+    assert old_copy.hello["serverInfo"]["version"] == "0.6.0", old_copy.hello
+    new_copy("send", text="from the new copy")
+    assert "from the new copy" in old_copy("inbox", wait=0)
+    old_copy("send", text="from the old copy")
+    assert "from the old copy" in new_copy("inbox", wait=0)
+    assert "#1" in old_copy("board", action="add", title="Old copies still use the board")
+    for _ in range(100):  # its server's row in live, without a version
+        if agon.db().execute("SELECT 1 FROM live WHERE client = 'codex-mcp-client'").fetchone():
+            break
+        time.sleep(0.1)
+    old_rows = [row for row in agon.arena_state()["outdated"] if row["version"] == "older than 0.7"]
+    assert old_rows == [{"app": "Codex", "version": "older than 0.7", "newest": agon.VERSION, "path": None,
+                         "update": "codex plugin marketplace upgrade agon, then codex plugin add agon@agon, and"
+                                   " restart Codex"}], old_rows
+    old_copy.close()
+else:
+    print("skipped: an older copy of agon.py from git history (this clone has no history)", file=sys.stderr)
+mine = str(Path(SERVER).resolve())
+assert agon.db().execute("SELECT app, version FROM copies WHERE path = ?", (mine,)).fetchone() == ("Claude Code",
+                                                                                                    agon.VERSION)
+new_copy.close()
+agon.db().execute("DELETE FROM live")
+now = time.time()
+for path, app_, version, seen in (
+        ("/u/.claude/plugins/cache/agon/agon/0.5.0/agon.py", "Claude Code", "0.5.0", now - 100),  # updated since
+        ("/u/.codex/plugins/cache/agon/agon/agon.py", "Codex", "0.5.0", now - 10),
+        ("/u/old/agon.py", None, "0.1.0", now - 40 * 86400)):  # not seen for 40 days: gone
+    agon.db().execute("INSERT INTO copies VALUES (?, ?, ?, ?)", (path, app_, version, seen))
+assert agon.arena_state()["outdated"] == [{
+    "app": "Codex", "version": "0.5.0", "newest": agon.VERSION, "path": "/u/.codex/plugins/cache/agon/agon/agon.py",
+    "update": "codex plugin marketplace upgrade agon, then codex plugin add agon@agon, and restart Codex"}]
+out = io.StringIO()
+agon.setup(out)
+assert f"Codex runs Agon 0.5.0, older than {agon.VERSION}. It keeps working; to update it: codex plugin marketplace" \
+       " upgrade agon, then codex plugin add agon@agon, and restart Codex." in out.getvalue(), out.getvalue()
+assert "This copy is" not in out.getvalue() and "0.1.0" not in out.getvalue()
+agon.db().execute("INSERT INTO copies VALUES ('/u/new/agon.py', NULL, '99.0.0', ?)", (now,))
+assert agon.older_copies()[0] == (f"        This copy is Agon {agon.VERSION}; another one that uses this chat is"
+                                  " 99.0.0. Update this one."), agon.older_copies()
+assert {row["app"] for row in agon.arena_state()["outdated"]} == {"Codex", "Claude Code"}  # 'claude' ran this copy
+before = agon.db().execute("SELECT seen FROM copies WHERE path = ?", (mine,)).fetchone()[0]
+agon.note_copy("Claude Code")  # the same copy, app and version within the hour: nothing to write
+assert agon.db().execute("SELECT seen FROM copies WHERE path = ?", (mine,)).fetchone()[0] == before
+agon.note_copy("Antigravity")  # the same file in another app: noted at once
+assert agon.db().execute("SELECT app FROM copies WHERE path = ?", (mine,)).fetchone()[0] == "Antigravity"
+for path, app_, hint in (
+        ("/u/.local/share/uv/tools/agon-arena/lib/python3.12/site-packages/agon.py", None, "uv tool upgrade agon-arena"),
+        ("/u/.local/pipx/venvs/agon-arena/lib/python3.12/site-packages/agon.py", None, "pipx upgrade agon-arena"),
+        ("/u/.cache/uv/archive-v0/x/lib/python3.12/site-packages/agon.py", None, "uvx agon-arena@latest"),
+        ("/usr/lib/python3/dist-packages/agon.py", None, "pip install -U agon-arena"),
+        ("/u/.gemini/plugins/agon/agon.py", None, "git pull in the folder you cloned Agon into, then agy plugin"
+                                                   " install that folder again"),
+        ("/u/src/agon/agon.py", None, f"git pull in {Path('/u/src/agon')}"),
+        (None, "Claude Code", "claude plugin marketplace update agon, then claude plugin update agon@agon, and restart"
+                              " Claude Code")):
+    assert agon.update_hint(app_, path) == hint, (path, agon.update_hint(app_, path))
+assert agon.version_key("0.10.0") > agon.version_key("0.9.1") > agon.version_key("") == ()
+agon.close_db()
+agon.DB = str(Path(TMP, "no-such", "agon.db"))
+assert agon.older_copies() == [] and not Path(agon.DB).parent.exists()  # setup reads a chat only when there is one
+agon.DB = str(Path(TMP, "v05-like.db"))  # a chat an older copy made, without these tables yet
+sqlite3.connect(agon.DB).execute("CREATE TABLE live(pid INTEGER)").connection.close()
+assert agon.older_copies() == []
+agon.DB = test_db
+assert 'id="outdated"' in agon.PAGE and "s.outdated" in agon.PAGE
+
+# Phase 7, 8 and 9. The public texts name the apps, never GPT as a product, and say Agon is not affiliated with their
+# companies; the READMEs (PyPI shows the English one) carry the registry's mcp-name, absolute links only (PyPI breaks
+# relative ones), what Agon runs, sends and fetches, example prompts, support, and the Python each install needs
+summary = agon.__doc__.splitlines()[0]
+assert "Claude Code, OpenAI Codex and Antigravity" in summary and not re.search(r"\bGPT", summary)
+assert len(summary) <= 120
+for name in (".claude-plugin/marketplace.json", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json", "plugin.json"):
+    text = (HERE / name).read_text(encoding="utf-8")
+    assert not re.search(r"\bGPT", text) and "Not affiliated with Anthropic, OpenAI or Google." in text, name
+    assert "@" not in text, name  # no e-mail address in a manifest
+assert not re.search(r"\bGPT", (HERE / "ROADMAP.md").read_text(encoding="utf-8").split("## Progress")[0])
+B = "https://github.com/giliandar5-lab/agon/blob/main/"
+for readme, words in (
+        ("README.md", ("Claude Code, OpenAI Codex and Antigravity", "not affiliated with Anthropic, OpenAI or Google",
+                       "## What Agon runs, sends and fetches", "Agon itself makes no network requests",
+                       "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`", "127.0.0.1 only", "Agon never pushes or fetches",
+                       "More prompts that work:", "## Support", "/issues", f"{B}SECURITY.md", f"{B}PRIVACY.md",
+                       "uv tool install agon-arena", "pipx install agon-arena", "uvx agon-arena",
+                       "Only `uvx` and `uv tool` download a\nPython", "installing a plugin turns them on")),
+        ("README.ru.md", ("Claude Code, OpenAI Codex и Antigravity", "не связанный с Anthropic, OpenAI или Google",
+                          "## Что Agon запускает, отправляет и скачивает", "Сам Agon не делает сетевых запросов",
+                          "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`", "только на 127.0.0.1",
+                          "Agon\n  никогда не делает push или fetch", "Ещё запросы, которые работают:", "## Поддержка",
+                          "/issues", f"{B}SECURITY.md", f"{B}PRIVACY.md", "uv tool install agon-arena",
+                          "pipx install agon-arena", "uvx agon-arena", "Только `uvx` и `uv tool` сами скачивают Python",
+                          "установка плагина включает их"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert not re.search(r"\bGPT", text.split("\n## Quick start")[0].split("\n## Быстрый старт")[0]), readme
+    assert text.count("<!-- mcp-name: io.github.giliandar5-lab/agon -->") == 1, readme
+    assert not re.findall(r"\]\((?!https?://|#)", text), (readme, re.findall(r"\]\((?!https?://|#)[^)]*\)", text))
+    for word in words:
+        assert word in text, (readme, word)
+    assert len(re.findall(r"^> ", text.split("## How agents wake up")[0].split("## Как агенты просыпаются")[0],
+                          re.M)) >= 6, readme  # the example prompts: at least five, a line or more each
+    assert "@" not in re.sub(r"`[^`]*`|agon@agon", "", text.split("## How")[0].split("## Как")[0]), readme  # no e-mail
+
+# Phase 7, 10. A privacy policy (what agon.db keeps, that Agon sends nothing, what the apps send) and a security policy
+# (private reports through GitHub, no e-mail address), linked from both READMEs
+privacy = (HERE / "PRIVACY.md").read_text(encoding="utf-8")
+for needed in ("~/.agon/agon.db", "Agon itself sends\nnothing over the network", "no telemetry", "delete the file",
+               "under that company's terms and privacy policy", "/issues", "not affiliated with Anthropic, OpenAI"):
+    assert needed in privacy, needed
+c = sqlite3.connect(":memory:")
+agon.migrate(c)
+tables = {name for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+c.close()
+assert tables == {"msgs", "agents", "tasks", "releases", "runs", "pilot", "live", "state", "asks", "reviews", "duels",
+                  "entries", "gauges", "copies"}, tables  # a new table: say in PRIVACY.md what it keeps, then add it
+security = (HERE / "SECURITY.md").read_text(encoding="utf-8")
+for needed in ("/security/advisories/new", "private vulnerability reporting", "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`",
+               "127.0.0.1", "AGON_UNSAFE"):
+    assert needed in security, needed
+for text in (privacy, security):
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)  # no e-mail address
+
+# Phase 7, 11. The contributing guide and the roadmap: no build step to work on Agon, the package built at release,
+# backward-compatible schema steps, flit_core at build time only, the listings, and gemini's tokens not measured
+guide = (HERE / "CONTRIBUTING.md").read_text(encoding="utf-8")
+for needed in ("no build step while you work on it", "built at release time", "`flit_core` is needed only",
+               "`__version__` in `agon.py`", "never a new meaning for an old column", "Nothing over the network",
+               "SECURITY.md"):
+    assert needed in guide, needed
+roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+for needed in ("never a new meaning for an\n  old column", "`flit_core` builds the PyPI package\nat release time only",
+               "MCP Registry (`io.github.giliandar5-lab/agon`", "awesome-mcp-servers, mcp.so, Glama",
+               "awesome-codex-plugins", '`gemini` is "not measured"', "**Phase 7 additions",
+               "from 2,500 to 2,900 bytes"):
+    assert needed in roadmap, needed
+
+# Phase 7, 12. CI builds the package as the release does, checks what it holds, installs it with pip, pipx and uv tool on
+# each system, ends a uvx-started Agon as an app would, and runs Claude Code's own validator on the plugin
+ci = (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+for needed in ("  package:", "-o dist", "check_package.py dist dist", 'installed "$bin/agon"',
+               "pipx install dist/*.whl", "uv tool install dist/*.whl", "check_package.py uvx-kill dist/*.whl",
+               "  plugin:", "npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."):
+    assert needed in ci, needed
+assert ci.count("os: [ubuntu-latest, windows-latest, macos-latest]") == 3  # tests, package, measure
+checker = (HERE / "scripts" / "check_package.py").read_text(encoding="utf-8")
+compile(checker, "check_package.py", "exec")
+assert set(re.findall(r"^(?:import|from) (\w+)", checker, re.M)) <= set(sys.stdlib_module_names), "stdlib only"
+
+# Phase 7, 13. A tag v<version> releases: one build, tested on each system with the oldest and newest Python, TestPyPI,
+# PyPI after the maintainer approves its environment, then the MCP Registry; by hand it is a dry run up to TestPyPI.
+# Trusted publishing: no token or password anywhere
+release = (HERE / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+for needed in ('tags: ["v*"]', "workflow_dispatch:", "check_package.py versions", "-o dist",
+               "check_package.py dist dist", "os: [ubuntu-latest, windows-latest, macos-latest]", '"3.10"',
+               "name: testpypi", "repository-url: https://test.pypi.org/legacy/", "name: pypi",
+               "if: github.ref_type == 'tag'", "pypa/gh-action-pypi-publish@release/v1", "id-token: write",
+               "./mcp-publisher validate", "./mcp-publisher login github-oidc", "./mcp-publisher publish"):
+    assert needed in release, needed
+assert release.index("needs: build") < release.index("needs: test") < release.index("needs: testpypi") < release.index(
+    "needs: pypi")
+assert "secrets." not in release and "password" not in release and "token:" not in release.replace("id-token:", "")
+# What the publishing jobs run is pinned: uv (pip --require-hashes), flit_core (uv build's constraints with hashes), and
+# one release of mcp-publisher, checked against the SHA-256 the workflow records before it runs, never releases/latest
+for workflow in (release, ci):
+    assert "releases/latest" not in workflow and "uv build -o" not in workflow
+    assert "--build-constraints .github/build-constraints.txt --require-hashes" in workflow
+assert "pip install --require-hashes -r .github/build-requirements.txt" in release
+assert re.search(r"VERSION: v\d+\.\d+\.\d+\n *SHA256: [0-9a-f]{64} ", release), "a pinned mcp-publisher"
+assert release.index("sha256sum --check --strict") < release.index("tar xzf mcp-publisher.tar.gz") < release.index(
+    "./mcp-publisher validate")
+assert "sha256sum --check --strict" in ci
+for name, package in ((".github/build-requirements.txt", "uv"), (".github/build-constraints.txt", "flit-core")):
+    pins = (HERE / name).read_text(encoding="utf-8")
+    assert re.search(rf"^{package}==\d+\.\d+\.\d+ \\$", pins, re.M) and len(re.findall(r"--hash=sha256:[0-9a-f]{64}",
+                                                                                     pins)) >= 1, name
+assert "permissions:\n  contents: read" in release  # write rights only in the jobs that publish
+# Phase 7, 14. server.json for the MCP Registry, and glama.json: the registry name the README carries, this version, the
+# package on PyPI run with uvx, the agent's name as a required argument, no e-mail address
+server = json.loads((HERE / "server.json").read_text(encoding="utf-8"))
+assert server["$schema"].endswith("/2025-12-11/server.schema.json")
+assert server["name"] == "io.github.giliandar5-lab/agon"
+assert f"<!-- mcp-name: {server['name']} -->" in (HERE / "README.md").read_text(encoding="utf-8")
+assert len(server["description"]) <= 100 and not re.search(r"\bGPT", server["description"])
+package = server["packages"][0]
+assert server["version"] == package["version"] == agon.VERSION and package["identifier"] == "agon-arena"
+assert (package["registryType"], package["runtimeHint"], package["transport"]) == ("pypi", "uvx", {"type": "stdio"})
+assert package["packageArguments"] == [{"type": "positional", "valueHint": "agent", "description": package[
+    "packageArguments"][0]["description"], "isRequired": True, "choices": ["claude", "gpt", "gemini"]}]
+assert {v["name"] for v in package["environmentVariables"]} <= set(agon.ENV_VARS)
+glama = json.loads((HERE / "glama.json").read_text(encoding="utf-8"))
+assert glama["maintainers"] == ["giliandar5-lab"]
+for name in ("server.json", "glama.json", "pyproject.toml"):
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", (HERE / name).read_text(encoding="utf-8")), name
+assert subprocess.run([sys.executable, str(HERE / "scripts" / "check_package.py"), "versions"], capture_output=True,
+                      timeout=60).returncode == 0
+
+# Phase 7, 15. scripts/measure.py: the idle CPU and memory of an agent's server and of the arena on this system, what
+# every agent reads at the start, and tokens per turn from the apps' own logs, with Agon and without
+measured = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "idle", "1"], capture_output=True,
+                          timeout=120)
+assert measured.returncode == 0, measured.stderr
+numbers = json.loads(measured.stdout)
+assert 2000 < numbers["tools_list_bytes"] < 2900 and numbers["instructions_chars"] < 2048, numbers
+for part in ("server", "arena"):
+    assert 0 <= numbers[part]["cpu_percent"] < 50 and 5 < numbers[part]["memory_mb"] < 500, numbers
+logs = Path(TMP, "logs")
+logs.mkdir()
+(logs / "claude-with.jsonl").write_text("\n".join(json.dumps(e) for e in (
+    {"type": "system", "subtype": "init"}, {"type": "assistant", "message": {"usage": {"input_tokens": 9}}},
+    {"type": "result", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1000, "cache_read_input_tokens":
+                                 20000, "output_tokens": 50}})) + "\nnot json\n")
+(logs / "claude-without.jsonl").write_text(json.dumps({"type": "result", "usage": {
+    "input_tokens": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 20000, "output_tokens": 40}}))
+(logs / "codex-with.jsonl").write_text("\n".join(json.dumps(e) for e in (
+    {"type": "thread.started", "thread_id": "x"},
+    {"type": "turn.completed", "usage": {"input_tokens": 12000, "cached_input_tokens": 9000, "output_tokens": 30}},
+    {"type": "turn.completed", "usage": {"input_tokens": 14000, "cached_input_tokens": 11000, "output_tokens": 50}})))
+(logs / "codex-without.jsonl").write_text(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 11000, "cached_input_tokens": 9000, "output_tokens": 30}}))
+for app_, adds in (("claude", 1000), ("codex", 2000)):
+    p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens",
+                        str(logs / f"{app_}-with.jsonl"), str(logs / f"{app_}-without.jsonl")], capture_output=True,
+                       timeout=60)
+    assert p.returncode == 0 and json.loads(p.stdout)["agon_adds_input"] == adds, (app_, p.stdout, p.stderr)
+p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens", str(logs / "codex-with.jsonl"),
+                    str(HERE / "README.md")], capture_output=True, timeout=60)
+assert p.returncode != 0 and b"no turns found" in p.stderr, p.stderr
+assert "python scripts/measure.py idle 120" in (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+
+# Phase 7, 17. Screenshots of the arena come from scripts/screenshots.py with made-up data, and say so on the image and
+# under it. The repository holds no binary files but images (the plugin checklist): no video, no archive, no program
+binaries = []
+for path in subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=HERE,
+                           capture_output=True, text=True).stdout.splitlines():
+    if b"\0" in (HERE / path).read_bytes()[:8192]:
+        binaries.append(path)
+assert binaries and all(Path(path).suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff2"} for path in
+                        binaries), binaries
+assert all(path.startswith("docs/images/") for path in binaries), binaries
+shooter = (HERE / "scripts" / "screenshots.py").read_text(encoding="utf-8")
+assert "Screenshot with demo data" in shooter and 'os.environ["AGON_TEST_CMD"]' in shooter  # real tests, real verdicts
+assert shooter.count('action="done"') == 2 and 'verdict="changes"' in shooter and 'verdict="approve"' in shooter
+for readme in ("README.md", "README.ru.md"):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert "raw.githubusercontent.com/giliandar5-lab/agon/main/docs/images/arena.png)" in text, readme
+    assert "Screenshot with demo data" in text, readme
+
+# Phase 7, 16. Both READMEs give the measured numbers with their date, systems and Python, what every agent reads at the
+# start as this version has it, and say which token numbers aren't measured
+for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "Python 3.13", "Windows Server 2025",
+                                     "Ubuntu 24.04", "macOS 26 (arm64)", "not measured, since its headless usage needs"
+                                     " an API key")),
+                      ("README.ru.md", ("## Замеры", "Замерено 2026-10-01", "Python 3.13", "Windows Server 2025",
+                                        "не замерено — его работа без интерфейса требует API-ключа"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for word in words:
+        assert word in text, (readme, word)
+    size, chars = numbers["tools_list_bytes"], numbers["instructions_chars"]
+    shown = (f"{size:,}", f"{chars:,}") if readme == "README.md" else (f"{size:,}".replace(",", " "),
+                                                                        f"{chars:,}".replace(",", " "))
+    assert all(n in text for n in shown), (readme, shown)  # the README's sizes are this version's
+
+# Phase 7, 18. Version 0.7.0 everywhere, and the phase ticked with what it did and what is left to the maintainer
+roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+assert agon.VERSION == "0.7.0" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

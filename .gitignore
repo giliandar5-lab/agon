@@ -1,2 +1,3 @@
 agon.db*
 __pycache__/
+dist/

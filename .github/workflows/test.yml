@@ -23,7 +23,84 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0  # the tests run v0.6.0's agon.py from history against a newer database
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - run: python test_agon.py
+
+  # The PyPI package, built as the release builds it, installed the three ways the README gives, on each system
+  package:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - run: python -m pip install uv pipx
+      - run: uv build --build-constraints .github/build-constraints.txt --require-hashes -o dist
+      - run: python scripts/check_package.py dist dist
+      - name: pip install
+        run: |
+          python -m venv venv
+          bin=venv/bin; [ -d venv/Scripts ] && bin=venv/Scripts
+          "$bin/python" -m pip install dist/*.whl
+          python scripts/check_package.py installed "$bin/agon"
+      - name: pipx install
+        run: |
+          PIPX_HOME="$PWD/pipx" PIPX_BIN_DIR="$PWD/pipx-bin" pipx install dist/*.whl
+          python scripts/check_package.py installed pipx-bin/agon
+      - name: uv tool install
+        run: |
+          UV_TOOL_DIR="$PWD/uv-tools" UV_TOOL_BIN_DIR="$PWD/uv-bin" uv tool install dist/*.whl
+          python scripts/check_package.py installed uv-bin/agon
+      - name: ending uvx ends Agon
+        run: python scripts/check_package.py uvx-kill dist/*.whl
+
+  # The plugin manifests and server.json, as Claude Code's validator and the MCP Registry read them
+  plugin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate --strict .
+      - name: server.json, as the MCP Registry reads it (the mcp-publisher the release uses, checked the same way)
+        run: |
+          VERSION=$(sed -n 's/^ *VERSION: //p' .github/workflows/release.yml)
+          SHA256=$(sed -n 's/^ *SHA256: \([0-9a-f]*\).*/\1/p' .github/workflows/release.yml)
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$VERSION/mcp-publisher_linux_amd64.tar.gz"
+          echo "$SHA256  mcp-publisher.tar.gz" | sha256sum --check --strict
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+          ./mcp-publisher validate
+      - run: python3 scripts/check_package.py versions
+
+  # The README's measured numbers: an idle MCP server and an idle arena on each system (see scripts/measure.py)
+  measure:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python scripts/measure.py idle 120

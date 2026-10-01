@@ -1,0 +1,5 @@
+# What the release workflow installs to build the package, pinned with hashes (pip --require-hashes). The build job
+# runs on ubuntu-latest (x86_64); the sdist hash is a fallback pip never needs there
+uv==0.12.21 \
+    --hash=sha256:0083454d25479f1cd03547c8c98c235b4af92bd07f0e61c3eae5d1cbb0c1834c \
+    --hash=sha256:ff77ff843bd3fd0920a18558882532a27079c1f465a4d1781648aff176a180cb
