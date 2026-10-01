@@ -4910,7 +4910,9 @@ for path in subprocess.run(["git", "ls-files", "--cached", "--others", "--exclud
 assert binaries and all(Path(path).suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".woff2"} for path in
                         binaries), binaries
 assert all(path.startswith("docs/images/") for path in binaries), binaries
-assert "Screenshot with demo data" in (HERE / "scripts" / "screenshots.py").read_text(encoding="utf-8")
+shooter = (HERE / "scripts" / "screenshots.py").read_text(encoding="utf-8")
+assert "Screenshot with demo data" in shooter and 'os.environ["AGON_TEST_CMD"]' in shooter  # real tests, real verdicts
+assert shooter.count('action="done"') == 2 and 'verdict="changes"' in shooter and 'verdict="approve"' in shooter
 for readme in ("README.md", "README.ru.md"):
     text = (HERE / readme).read_text(encoding="utf-8")
     assert "raw.githubusercontent.com/giliandar5-lab/agon/main/docs/images/arena.png)" in text, readme
