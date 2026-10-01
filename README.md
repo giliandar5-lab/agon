@@ -641,7 +641,7 @@ minutes, after it has answered. Memory is private bytes on Windows, PSS on Linux
 | The arena with one page open, idle: CPU / memory | 0.00% / 17 MB | 0.01% / 29 MB | 0.02% / 36 MB |
 
 CPU is a percentage of one core. What every agent reads at the start: the `tools/list` reply is 2,714 bytes and the
-server instructions are 1,762 characters (Claude Code and Codex defer the tool schemas, so the model sees the tool names
+server instructions are 1,848 characters (Claude Code and Codex defer the tool schemas, so the model sees the tool names
 and the instructions first).
 
 Tokens per turn are what an app reports for the same prompt with Agon and without it:

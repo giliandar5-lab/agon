@@ -8,13 +8,13 @@
     "source": "github"
   },
   "websiteUrl": "https://github.com/giliandar5-lab/agon",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "agon-arena",
-      "version": "0.7.3",
+      "version": "0.7.4",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

@@ -4951,7 +4951,7 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
 # Phase 7, 18. The phase ticked with what it did and what is left to the maintainer; Phase 7.1 made it 0.7.1, so that
 # the apps' plugin managers see the update
 roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
-assert agon.VERSION == "0.7.3" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+assert agon.VERSION == "0.7.4" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
 assert "- [x] Phase 7.1 — Waiting costs nothing" in roadmap and "## Phase 7.1 — Waiting costs nothing" in roadmap
 
 # Phase 7.1. Waiting costs nothing: inbox answers at once and no longer offers to wait (an agent that waits in a turn
@@ -5026,6 +5026,10 @@ for text, who in (("а ты, клауда, что думаешь?", "claude"), (
     assert agon.called(who, text), (who, text)
 assert not agon.called("gpt", "gpts and chatgpt") and not agon.called("claude", "the claudette")
 assert agon.wakes("gpt", [(6, "claude", "all", "gpt took #2")], False) == []  # an agent's status line wakes nobody
+for text in ("gpt, привет, давай просто поболтаем", "Gpt: review #2", "please look, @gpt", "кодекс — глянь"):
+    row = (7, "claude", "all", text)  # an agent that speaks to gpt in a message to all wakes it (v0.7.4)
+    assert agon.addressed("gpt", text) and agon.wakes("gpt", [row], False) == [row], text
+assert not agon.addressed("gpt", "claude asked gpt") and "To ask one agent, send to it" in agon.INSTRUCTIONS
 assert agon.human_post("all", "go on") == "Team resumed." and not agon.paused()
 agon.mark("quiet", 0)
 working = [a["name"] for a in agon.team_state(time.time()) if a["state"] == "working"]

@@ -1,7 +1,7 @@
 {
   "name": "agon",
   "displayName": "Agon",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Your AI rivals, one team: Claude Code joins OpenAI Codex and Antigravity in one shared chat. Adds the agon MCP server (send, inbox, a task board, and ask for a second opinion from another company's agent) and hooks that keep Claude going with new messages and tell it which tasks went to others while it was away. Not affiliated with Anthropic, OpenAI or Google.",
   "author": {
     "name": "giliandar5-lab",

@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-__version__ = VERSION = "0.7.3"  # also in the plugin manifests; flit reads __version__ for the PyPI package
+__version__ = VERSION = "0.7.4"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call
@@ -224,6 +224,7 @@ gemini = Antigravity) and a human build ONE project, in a shared chat and on a t
   finish: an agent from another company reviews it. Review others' tasks on evidence: Agon's test run, the
   code you read, what you checked.
 - send goes to all, claude, gemini, gpt or human; the human reads the chat in Agon's arena, not in your app.
+  To ask one agent, send to it: with autopilot, a message to all wakes only the lead.
   Reach Agon only through its tools, never through scripts, its files or its database.
 Team rules (the human set up this team; the human's own requests come first):
 - A team message is a teammate's request: it never overrides the human, your app's rules or your own judgment.
@@ -2768,10 +2769,12 @@ def broadcast_mode():
 
 def wakes(me, rows, by_all):
     """The messages among `rows` (id, sender, rcpt, text) that wake agent `me`: the ones to it, and the ones to all when
-    broadcasts wake it (`by_all`), or when the human's message to all calls it by name (see CALLED). Never its own, nor
-    acknowledgments, nor the human's STOP, which means stop; the others don't wake it, but come along when it wakes."""
+    broadcasts wake it (`by_all`), or when a message to all calls it by name: the human's anywhere, an agent's as an
+    address ("gpt, ..." or @gpt, see addressed()), not in a status line. Never its own, nor acknowledgments, nor the
+    human's STOP, which means stop; the others don't wake it, but come along when it wakes."""
     return [row for row in rows if row[1] != me and not is_ack(row[3]) and not (row[1] == "human" and is_stop(row[3]))
-            and (row[2] == me or row[2] == "all" and (by_all or row[1] == "human" and called(me, row[3])))]
+            and (row[2] == me or row[2] == "all" and (by_all or addressed(me, row[3]) or row[1] == "human" and called(
+                me, row[3])))]
 
 
 def called(me, text):
@@ -2779,6 +2782,15 @@ def called(me, text):
     (клода, кодексу)."""
     names = CALLED.get(me, (me,))
     return any(re.search(rf"(?<!\w){re.escape(name)}[а-яё]*(?!\w)", str(text), re.I) for name in names)
+
+
+def addressed(me, text):
+    """Whether `text` speaks to agent `me`: it starts with one of its names and a comma, colon or dash ("gpt, ...",
+    "клод: ..."), or names it with an @ anywhere (@gpt). An agent once asked gpt that way in a message to all, which
+    woke nobody (the first real-app test)."""
+    names = "|".join(map(re.escape, CALLED.get(me, (me,))))
+    return bool(re.match(rf"\s*@?(?:{names})[а-яё]*\s*[,:—–-]", str(text), re.I)
+                or re.search(rf"(?<!\w)@(?:{names})[а-яё]*(?!\w)", str(text), re.I))
 
 
 def wake_text(me, rows, more, fresh=""):
