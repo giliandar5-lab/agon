@@ -4814,7 +4814,7 @@ for needed in ("  package:", "uv build -o dist", "check_package.py dist dist", '
                "pipx install dist/*.whl", "uv tool install dist/*.whl", "check_package.py uvx-kill dist/*.whl",
                "  plugin:", "npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."):
     assert needed in ci, needed
-assert ci.count("os: [ubuntu-latest, windows-latest, macos-latest]") == 2
+assert ci.count("os: [ubuntu-latest, windows-latest, macos-latest]") == 3  # tests, package, measure
 checker = (HERE / "scripts" / "check_package.py").read_text(encoding="utf-8")
 compile(checker, "check_package.py", "exec")
 assert set(re.findall(r"^(?:import|from) (\w+)", checker, re.M)) <= set(sys.stdlib_module_names), "stdlib only"
@@ -4851,6 +4851,38 @@ for name in ("server.json", "glama.json", "pyproject.toml"):
     assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", (HERE / name).read_text(encoding="utf-8")), name
 assert subprocess.run([sys.executable, str(HERE / "scripts" / "check_package.py"), "versions"], capture_output=True,
                       timeout=60).returncode == 0
+
+# Phase 7, 15. scripts/measure.py: the idle CPU and memory of an agent's server and of the arena on this system, what
+# every agent reads at the start, and tokens per turn from the apps' own logs, with Agon and without
+measured = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "idle", "1"], capture_output=True,
+                          timeout=120)
+assert measured.returncode == 0, measured.stderr
+numbers = json.loads(measured.stdout)
+assert 2000 < numbers["tools_list_bytes"] < 2900 and numbers["instructions_chars"] < 2048, numbers
+for part in ("server", "arena"):
+    assert 0 <= numbers[part]["cpu_percent"] < 50 and 5 < numbers[part]["memory_mb"] < 500, numbers
+logs = Path(TMP, "logs")
+logs.mkdir()
+(logs / "claude-with.jsonl").write_text("\n".join(json.dumps(e) for e in (
+    {"type": "system", "subtype": "init"}, {"type": "assistant", "message": {"usage": {"input_tokens": 9}}},
+    {"type": "result", "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1000, "cache_read_input_tokens":
+                                 20000, "output_tokens": 50}})) + "\nnot json\n")
+(logs / "claude-without.jsonl").write_text(json.dumps({"type": "result", "usage": {
+    "input_tokens": 10, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 20000, "output_tokens": 40}}))
+(logs / "codex-with.jsonl").write_text("\n".join(json.dumps(e) for e in (
+    {"type": "thread.started", "thread_id": "x"},
+    {"type": "turn.completed", "usage": {"input_tokens": 12000, "cached_input_tokens": 9000, "output_tokens": 30}},
+    {"type": "turn.completed", "usage": {"input_tokens": 14000, "cached_input_tokens": 11000, "output_tokens": 50}})))
+(logs / "codex-without.jsonl").write_text(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 11000, "cached_input_tokens": 9000, "output_tokens": 30}}))
+for app_, adds in (("claude", 1000), ("codex", 2000)):
+    p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens", str(logs / f"{app_}-with.jsonl"),
+                        str(logs / f"{app_}-without.jsonl")], capture_output=True, timeout=60)
+    assert p.returncode == 0 and json.loads(p.stdout)["agon_adds_input"] == adds, (app_, p.stdout, p.stderr)
+p = subprocess.run([sys.executable, str(HERE / "scripts" / "measure.py"), "tokens", str(logs / "codex-with.jsonl"),
+                    str(HERE / "README.md")], capture_output=True, timeout=60)
+assert p.returncode != 0 and b"no turns found" in p.stderr, p.stderr
+assert "python scripts/measure.py idle 120" in (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
