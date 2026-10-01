@@ -2,8 +2,9 @@
 
 ## Positioning
 
-**Your AI rivals, one team.** Agon turns Claude (Claude Code), GPT (Codex) and Gemini (Antigravity) into one
-team working on your project, and shows it live in an arena. Two pillars:
+**Your AI rivals, one team.** Agon turns the agents of Claude Code, OpenAI Codex and Antigravity into one
+team working on your project (not affiliated with Anthropic, OpenAI or Google; in commands and settings they are
+`claude`, `gpt` and `gemini`), and shows it live in an arena. Two pillars:
 
 1. **AI team arena.** Agents coordinate on a shared board, review each other's work across vendors, and can
    duel on a task so you learn which AI is best on *your* code.

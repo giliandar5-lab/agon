@@ -1,4 +1,4 @@
-"""Agon: a shared chat where AI agents from different apps build one project together.
+"""Agon: a shared chat and task board where the agents of Claude Code, OpenAI Codex and Antigravity build one project.
 
 python agon.py <name>        MCP server (stdio) for one agent: claude / gemini / gpt
 python agon.py hook <name>   the agent's hook: Stop wakes it with new messages, UserPromptSubmit tells a returning
@@ -48,7 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 # One chat per user, whichever copy of agon.py runs: the apps' plugins each install their own copy
 DB = os.environ.get("AGON_DB") or str(Path.home() / ".agon" / "agon.db")
 PORT = 8765
-__version__ = VERSION = "0.6.0"  # also in the plugin manifests; flit reads __version__ for the PyPI package
+__version__ = VERSION = "0.7.0"  # also in the plugin manifests; flit reads __version__ for the PyPI package
 PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")  # MCP revisions we speak, newest first
 MAX_TEXT = 8000  # characters in one message
 MAX_INBOX = 12000  # characters in one inbox result; the rest waits for the next call

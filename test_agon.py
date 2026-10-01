@@ -4429,6 +4429,7 @@ for readme, one_team in (("README.md", "one team at a time"), ("README.ru.md", "
                    "AGON_LIMIT_PATTERNS", "`--wait`", "v0.2"):
         assert needed in text, (readme, needed)
 
+LIMITS = f"(v{agon.VERSION.rsplit('.', 1)[0]})"  # the version the READMEs' status and limitations name
 # Phase 3: both READMEs explain ask (the modes, the commands and their flags, how to replace them, the fallback, the
 # timeout, Codex's approval and timeout settings), and the roadmap has the phase ticked
 for readme in ("README.md", "README.ru.md"):
@@ -4438,7 +4439,7 @@ for readme in ("README.md", "README.ru.md"):
                    "`AGON_CMD_GPT`", "`AGON_CMD_GEMINI`", "`{prompt}`", "`{cwd}`", "`python agon.py setup`",
                    "`tool_timeout_sec`",
                    '[plugins."agon@agon".mcp_servers.agon.tools.ask]\n  approval_mode = "approve"',
-                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", "(v0.6)"):
+                   "`[mcp_servers.agon.tools.ask]`", "`git worktree remove --force", LIMITS):
         assert needed in text, (readme, needed)
     for name in agon.COMMANDS:  # the table shows the commands and flags Agon really uses
         for args in (agon.COMMANDS[name], agon.MODE_ARGS["review"][name], agon.MODE_ARGS["task"][name]):
@@ -4483,7 +4484,7 @@ for readme, words in (("README.md", ("## Task board (`board`)", "#task-board-boa
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words[:6], "`board`", "`claim`", "`done`", "`review`", "`approve`", "`changes`", "`after`",
                    "`AGON_LEASE`", "7200", "`AGON_AUTO_REVIEW=1`", "`UserPromptSubmit`", "`TaskCompleted`",
-                   "`mcp(agon/*)`", "(v0.6)", '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
+                   "`mcp(agon/*)`", LIMITS, '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python",'
                    ' "args": ["/path/to/agon/agon.py", "hook", "claude"], "timeout": 10 }] }]',
                    '"UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python /path/to/agon/agon.py hook'
                    ' gpt", "timeout": 10 }] }]'):
@@ -4501,10 +4502,10 @@ wake_lines = {"claude": ["claude", *agon.WAKE_COMMANDS["claude"], *agon.WAKE_PER
               "gpt": ["codex", *agon.WAKE_COMMANDS["gpt"], *agon.WAKE_PERMISSIONS["gpt"][0]],
               "gemini": ["agy", *agon.WAKE_COMMANDS["gemini"], *agon.WAKE_PERMISSIONS["gemini"][0]]}
 for readme, words in (("README.md", ("## Autopilot (`python agon.py autopilot`)", "#autopilot-python-agonpy-autopilot",
-                                     "Your own subscriptions at your own limits; official CLIs only.", "(v0.6)")),
+                                     "Your own subscriptions at your own limits; official CLIs only.", LIMITS)),
                       ("README.ru.md", ("## Автопилот (`python agon.py autopilot`)",
                                         "#автопилот-python-agonpy-autopilot",
-                                        "Твои подписки, твои лимиты; только официальные CLI.", "(v0.6)"))):
+                                        "Твои подписки, твои лимиты; только официальные CLI.", LIMITS))):
     text = (HERE / readme).read_text(encoding="utf-8")
     for needed in (*words, "`python agon.py stats`", "--agents claude,gpt --lead gpt", "`AGON_LEAD`", "`AGON_PROJECT`",
                    "`AGON_WAKE_ON_BROADCAST`", "`AGON_ACK_PATTERNS`", "`AGON_DEBOUNCE_SECONDS`", "`AGON_MAX_WORKERS`",
@@ -4547,7 +4548,7 @@ for readme, words in (("README.md", ("## Arena (`python agon.py`)", "#arena-pyth
                    "`say --file ", "`AGON_SETUP_CMD`", "`AGON_SETUP_TIMEOUT`", "`AGON_ROOT`", "`npm ci`",
                    "`agon/duel-N-a`", "`Agon duel A`", "`git merge agon/duel-3-a`", "`git branch -D ...`",
                    "`.venv/bin/python -m pytest -q`", "`/board?duel=N`", "`python agon.py export replay`", "`--project ",
-                   "`--no-redact`", "`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`", "(v0.6)"):
+                   "`--no-redact`", "`.py: gpt 4 of 5, claude 1 of 3 — give such tasks to gpt`", LIMITS):
         assert needed in text, (readme, needed)
     assert "(v0.5)" not in text, readme
 assert "- [x] Phase 6 — The arena" in roadmap and "Phase 6 additions" in roadmap and "Done in v0.6.0" in roadmap
@@ -4736,6 +4737,42 @@ sqlite3.connect(agon.DB).execute("CREATE TABLE live(pid INTEGER)").connection.cl
 assert agon.older_copies() == []
 agon.DB = test_db
 assert 'id="outdated"' in agon.PAGE and "s.outdated" in agon.PAGE
+
+# Phase 7, 8 and 9. The public texts name the apps, never GPT as a product, and say Agon is not affiliated with their
+# companies; the READMEs (PyPI shows the English one) carry the registry's mcp-name, absolute links only (PyPI breaks
+# relative ones), what Agon runs, sends and fetches, example prompts, support, and the Python each install needs
+summary = agon.__doc__.splitlines()[0]
+assert "Claude Code, OpenAI Codex and Antigravity" in summary and not re.search(r"\bGPT", summary)
+assert len(summary) <= 120
+for name in (".claude-plugin/marketplace.json", ".claude-plugin/plugin.json", ".codex-plugin/plugin.json", "plugin.json"):
+    text = (HERE / name).read_text(encoding="utf-8")
+    assert not re.search(r"\bGPT", text) and "Not affiliated with Anthropic, OpenAI or Google." in text, name
+    assert "@" not in text, name  # no e-mail address in a manifest
+assert not re.search(r"\bGPT", (HERE / "ROADMAP.md").read_text(encoding="utf-8").split("## Progress")[0])
+B = "https://github.com/giliandar5-lab/agon/blob/main/"
+for readme, words in (
+        ("README.md", ("Claude Code, OpenAI Codex and Antigravity", "not affiliated with Anthropic, OpenAI or Google",
+                       "## What Agon runs, sends and fetches", "Agon itself makes no network requests",
+                       "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`", "127.0.0.1 only", "Agon never pushes or fetches",
+                       "More prompts that work:", "## Support", "/issues", f"{B}SECURITY.md", f"{B}PRIVACY.md",
+                       "uv tool install agon-arena", "pipx install agon-arena", "uvx agon-arena",
+                       "Only `uvx` and `uv tool` download a\nPython", "installing a plugin turns them on")),
+        ("README.ru.md", ("Claude Code, OpenAI Codex и Antigravity", "не связанный с Anthropic, OpenAI или Google",
+                          "## Что Agon запускает, отправляет и скачивает", "Сам Agon не делает сетевых запросов",
+                          "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`", "только на 127.0.0.1",
+                          "Agon\n  никогда не делает push или fetch", "Ещё запросы, которые работают:", "## Поддержка",
+                          "/issues", f"{B}SECURITY.md", f"{B}PRIVACY.md", "uv tool install agon-arena",
+                          "pipx install agon-arena", "uvx agon-arena", "Только `uvx` и `uv tool` сами скачивают Python",
+                          "установка плагина включает их"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    assert not re.search(r"\bGPT", text.split("\n## Quick start")[0].split("\n## Быстрый старт")[0]), readme
+    assert text.count("<!-- mcp-name: io.github.giliandar5-lab/agon -->") == 1, readme
+    assert not re.findall(r"\]\((?!https?://|#)", text), (readme, re.findall(r"\]\((?!https?://|#)[^)]*\)", text))
+    for word in words:
+        assert word in text, (readme, word)
+    assert len(re.findall(r"^> ", text.split("## How agents wake up")[0].split("## Как агенты просыпаются")[0],
+                          re.M)) >= 6, readme  # the example prompts: at least five, a line or more each
+    assert "@" not in re.sub(r"`[^`]*`|agon@agon", "", text.split("## How")[0].split("## Как")[0]), readme  # no e-mail
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

@@ -1,23 +1,29 @@
 # Agon ⚔️
 
+<!-- mcp-name: io.github.giliandar5-lab/agon -->
+
 [![test](https://github.com/giliandar5-lab/agon/actions/workflows/test.yml/badge.svg)](https://github.com/giliandar5-lab/agon/actions/workflows/test.yml)
 
 **Your AI rivals, one team.**
 
-[Русская версия](README.ru.md)
+[Русская версия](https://github.com/giliandar5-lab/agon/blob/main/README.ru.md)
 
-Claude (Claude Code), GPT (Codex) and Gemini (Antigravity) come from rival companies. In Agon they build
-**your** project together: they talk in one shared chat, split the work and play to each other's strengths,
-while you watch and steer from a live arena in your browser.
+Claude Code, OpenAI Codex and Antigravity come from rival companies. In Agon their agents build **your** project
+together: they talk in one shared chat, split the work and play to each other's strengths, while you watch and steer
+from a live arena in your browser.
+
+Agon is an independent open-source project, not affiliated with Anthropic, OpenAI or Google. In commands and settings
+the three agents are called `claude` (Claude Code), `gpt` (Codex) and `gemini` (Antigravity).
 
 *Agon (ἀγών) was the ancient Greek spirit of contest, honored at Olympia: rivals competing in the open made
 each other better.*
 
-> **Status: early preview (v0.6).** Agon gives your agents a shared chat and a task board, and you a live arena.
+> **Status: early preview (v0.7).** Agon gives your agents a shared chat and a task board, and you a live arena.
 > Agents wake up on their own, install with one command, and ask each other for a second opinion across vendors, with
 > a verdict that rests on your tests, which Agon runs itself. When one agent hits its usage limit, its tasks go to the
 > others. With autopilot on, Agon wakes the agents itself, with no app open. Duels show which AI is best on *your*
-> code, and a scoreboard counts it per project. Coming next: packaging. See [ROADMAP.md](ROADMAP.md).
+> code, and a scoreboard counts it per project. Install it from PyPI (`uvx agon-arena`) or as plugins. See
+> [ROADMAP.md](https://github.com/giliandar5-lab/agon/blob/main/ROADMAP.md).
 
 ```
 Claude Code (claude) ─┐
@@ -26,7 +32,7 @@ Antigravity (gemini) ─┘
 ```
 
 - **One file, zero dependencies.** Just Python 3.10+. Read it before you run it. (The plugin manifests and two
-  tiny launchers, `agon` and `agon.cmd`, only start `agon.py`.)
+  tiny launchers, `agon` and `agon.cmd`, only start `agon.py`; the PyPI package `agon-arena` is that same file.)
 - **Works inside the apps you already use** (VS Code, Codex in the ChatGPT desktop app or the codex CLI, Antigravity),
   on Windows, macOS and Linux.
 - **Four tools for agents:** `send` posts to everyone or to one agent; `inbox` returns new messages and waits up to
@@ -41,9 +47,12 @@ Antigravity (gemini) ─┘
 
 ## Quick start
 
-You need Python 3.10 or newer.
+You need Python 3.10 or newer for the plugins and for a clone: install it first. Only `uvx` and `uv tool` download a
+Python of their own when yours is missing or older.
 
-**1. Install the plugins.** Each one brings the MCP server and the Stop hook.
+**1. Install the plugins.** Each one brings the MCP server and Agon's hooks. The hooks are the wake-up feature (see
+[How agents wake up](#how-agents-wake-up)): installing a plugin turns them on, Codex asks you to trust them first, and
+removing the plugin turns them off.
 
 Claude Code, inside Claude Code:
 
@@ -81,15 +90,24 @@ In the Antigravity IDE, clone the repository into `~/.gemini/config/plugins/agon
 Restart the apps after installing. On Windows, `python3` is usually a Microsoft Store stub, so the Codex and
 Antigravity plugins start Python through `agon.cmd`, which uses the `py` launcher (or `python`).
 
-**2. No plugins? Let setup print the commands.**
+**2. No plugins? Install the `agon` command and let setup print the commands.**
+
+```
+uv tool install agon-arena    # or: pipx install agon-arena, or pip install agon-arena
+agon setup
+```
+
+`uvx agon-arena` runs it without installing (it opens the arena), but uv deletes that copy when it cleans its cache,
+so set up the apps with an installed `agon`. From a clone, `python agon.py setup` does the same:
 
 ```
 git clone https://github.com/giliandar5-lab/agon
 python agon.py setup
 ```
 
-It looks for `claude`, `codex` and `agy` and prints the exact commands and hook snippets for your machine, with
-absolute paths to your Python and to `agon.py`. It never changes your config files: you paste what you need.
+Setup looks for `claude`, `codex` and `agy` and prints the exact commands and hook snippets for your machine, with
+absolute paths to the command that starts Agon. It never changes your config files: you paste what you need. Hooks are
+optional: without them the agents still talk through Agon's tools, and wake up only when you prompt them.
 
 **3. Or configure by hand.** Replace `/path/to/agon` with the folder you cloned into, and `python` with your
 Python command if it's named differently.
@@ -120,10 +138,10 @@ Antigravity: `agy mcp add agon python /path/to/agon/agon.py gemini`, and in `~/.
 { "agon": { "enabled": true, "Stop": [{ "type": "command", "command": "python /path/to/agon/agon.py hook gemini", "timeout": 60 }] } }
 ```
 
-**4. Open the arena** from the folder you cloned:
+**4. Open the arena**: `agon` (or `uvx agon-arena`, or `python agon.py` in the folder you cloned):
 
 ```
-python agon.py
+agon
 ```
 
 It opens http://127.0.0.1:8765 (see [Arena](#arena-python-agonpy)).
@@ -137,6 +155,36 @@ It opens http://127.0.0.1:8765 (see [Arena](#arena-python-agonpy)).
 
 > Build a Snake game in Python. claude, you lead: put the work on the board, one task per part (game logic, graphics
 > and menus, tests and README), each with the files it edits. Then everyone takes a task.
+
+More prompts that work:
+
+> gpt, review claude's last task on the board: read the diff and Agon's test run, then approve or ask for changes
+> with evidence.
+
+> Before you report a change as done, ask gemini to review it. Merge nothing that the verdict and the tests reject.
+
+> claude, plan the login page as board tasks that each fit one agent's context, with the files each one edits and
+> the tasks it waits for. gpt and gemini, claim one each when the plan is up.
+
+Or start a duel in the arena (**Duels**): give two or three agents the same task and pick the winner blind.
+
+## What Agon runs, sends and fetches
+
+Agon itself makes no network requests: no telemetry, no update checks, nothing to download. The arena page loads
+nothing from the internet either. What it runs, all on your computer and as you:
+
+- **The apps' own command-line tools** (`claude`, `codex`, `agy`), only for the features that need them and that you
+  use: `ask`, an automatic review (`AGON_AUTO_REVIEW`), duels and [autopilot](#autopilot-python-agonpy-autopilot),
+  which runs only while you run it. Each runs on your own plan, and sends its prompt, with the code it reads, to its
+  company under that company's terms, the same as when you use the app yourself.
+- **git**, in your project: worktrees, branches and commits for tasks and duels, a local copy for a gemini review.
+  Agon never pushes or fetches.
+- **Your test command** (`AGON_TEST_CMD`) and **setup command** (`AGON_SETUP_CMD`), which you set: Agon runs them
+  unasked when an agent calls `board done`, before a review and in duels, so a verdict rests on tests Agon ran.
+- **The arena**, a web server on 127.0.0.1 only (port 8765), while you run it.
+
+It keeps the chat, the board and the history in `~/.agon/agon.db` on your computer. See
+[PRIVACY.md](https://github.com/giliandar5-lab/agon/blob/main/PRIVACY.md).
 
 ## How agents wake up
 
@@ -546,7 +594,7 @@ addresses, and your home folder's path (as `~`). `--no-redact` keeps them; `-o F
   instructions to your agents (see [Arena](#arena-python-agonpy)).
 - Agon records every ask, verdict, duel and the plan gauges in the same database, for the arena and the scoreboard.
 
-## Limitations (v0.6)
+## Limitations (v0.7)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
   for a channel), unless autopilot runs. Claude Code also ends a chain of automatic turns after 8 continuations in a
@@ -589,10 +637,16 @@ python test_agon.py
 
 Prints `ok` when everything works. CI runs it on Linux, Windows and macOS.
 
+## Support
+
+Questions, bugs and ideas: [GitHub issues](https://github.com/giliandar5-lab/agon/issues). To report a security
+problem privately, see [SECURITY.md](https://github.com/giliandar5-lab/agon/blob/main/SECURITY.md).
+
 ## Contributing
 
-Agon stays one file with zero dependencies. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Agon stays one file with zero dependencies. See [CONTRIBUTING.md](https://github.com/giliandar5-lab/agon/blob/main/CONTRIBUTING.md).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/giliandar5-lab/agon/blob/main/LICENSE). Claude Code, Codex and Antigravity are trademarks of their owners; Agon is not
+affiliated with or endorsed by Anthropic, OpenAI or Google.
