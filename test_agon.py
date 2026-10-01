@@ -4902,6 +4902,21 @@ for readme in ("README.md", "README.ru.md"):
     assert "raw.githubusercontent.com/giliandar5-lab/agon/main/docs/images/arena.png)" in text, readme
     assert "Screenshot with demo data" in text, readme
 
+# Phase 7, 16. Both READMEs give the measured numbers with their date, systems and Python, what every agent reads at the
+# start as this version has it, and say which token numbers aren't measured
+for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "Python 3.13", "Windows Server 2025",
+                                     "Ubuntu 24.04", "macOS 26 (arm64)", "not measured, since its headless usage needs"
+                                     " an API key")),
+                      ("README.ru.md", ("## Замеры", "Замерено 2026-10-01", "Python 3.13", "Windows Server 2025",
+                                        "не замерено — его работа без интерфейса требует API-ключа"))):
+    text = (HERE / readme).read_text(encoding="utf-8")
+    for word in words:
+        assert word in text, (readme, word)
+    size, chars = numbers["tools_list_bytes"], numbers["instructions_chars"]
+    shown = (f"{size:,}", f"{chars:,}") if readme == "README.md" else (f"{size:,}".replace(",", " "),
+                                                                        f"{chars:,}".replace(",", " "))
+    assert all(n in text for n in shown), (readme, shown)  # the README's sizes are this version's
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()

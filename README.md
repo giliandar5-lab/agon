@@ -599,6 +599,26 @@ addresses, and your home folder's path (as `~`). `--no-redact` keeps them; `-o F
   instructions to your agents (see [Arena](#arena-python-agonpy)).
 - Agon records every ask, verdict, duel and the plan gauges in the same database, for the arena and the scoreboard.
 
+## Measured
+
+Measured on 2026-10-01 on GitHub's runners with Python 3.13, by
+[`scripts/measure.py`](https://github.com/giliandar5-lab/agon/blob/main/scripts/measure.py): each process idles for two
+minutes, after it has answered. Memory is private bytes on Windows, PSS on Linux and the physical footprint on macOS.
+
+| | Windows Server 2025 | Ubuntu 24.04 | macOS 26 (arm64) |
+|---|---|---|---|
+| An agent's MCP server, idle: CPU / memory | 0.10% / 29 MB | 0.03% / 31 MB | 0.05% / 33 MB |
+| The arena with one page open, idle: CPU / memory | 0.00% / 17 MB | 0.01% / 29 MB | 0.02% / 36 MB |
+
+CPU is a percentage of one core. What every agent reads at the start: the `tools/list` reply is 2,755 bytes and the
+server instructions are 1,644 characters (Claude Code and Codex defer the tool schemas, so the model sees the tool names
+and the instructions first).
+
+Tokens per turn are what an app reports for the same prompt with Agon and without it:
+`python scripts/measure.py tokens WITH.jsonl WITHOUT.jsonl`, with logs of `claude -p --output-format stream-json
+--verbose` or `codex exec --json`. Claude Code and Codex: to be measured on the maintainer's Windows machine before the
+release. Antigravity (`gemini`): not measured, since its headless usage needs an API key.
+
 ## Limitations (v0.7)
 
 - A hook wakes an agent only when it finishes a turn: an agent that has stopped waits for you (or, in Claude Code,
