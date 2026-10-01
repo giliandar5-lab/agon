@@ -5645,7 +5645,9 @@ def cli():
     """The `agon` and `agon-arena` commands of the PyPI package, and `python agon.py`: run the command in sys.argv and
     exit with its code; Ctrl+C, and a reader that stops reading (agon setup | head), end it quietly."""
     try:
-        sys.exit(main(sys.argv[1:]))
+        code = main(sys.argv[1:])
+        sys.stdout.flush()  # here, not at exit, where a reader that went away is only "Exception ignored" and code 120
+        sys.exit(code)
     except KeyboardInterrupt:
         pass
     except BrokenPipeError:  # the reader went away: no traceback, and no second error when Python flushes stdout
