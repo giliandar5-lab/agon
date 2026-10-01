@@ -4593,6 +4593,11 @@ code_, out, err = cli_run("--bogus")
 assert (code_, out) == (1, "") and "unknown option --bogus" in err, (code_, out, err)
 ping = b'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\n'
 assert json.loads(cli_run("claude", stdin=ping)[1]) == {"jsonrpc": "2.0", "id": 1, "result": {}}  # still the server
+p = subprocess.Popen([sys.executable, SERVER, "setup"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                     env=dict(os.environ, AGON_DB=str(Path(TMP, "pipe.db"))))
+p.stdout.close()  # agon setup | head: the reader is gone before setup writes (Python starts slower than this line)
+assert b"Traceback" not in p.stderr.read() and p.wait(60) in (0, 1)
+p.stderr.close()
 for argv0, name in (("/home/me/.local/bin/agon", "agon"), (r"C:\Users\me\.local\bin\agon.exe", "agon"),
                     ("/x/bin/agon-arena", "agon"), ("/x/agon/agon.py", "python agon.py"), ("", "python agon.py"),
                     ("/x/agon/agon", "agon")):  # (the plugins' ./agon launcher runs agon.py, so argv[0] is agon.py)

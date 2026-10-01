@@ -5643,11 +5643,15 @@ def arena():
 
 def cli():
     """The `agon` and `agon-arena` commands of the PyPI package, and `python agon.py`: run the command in sys.argv and
-    exit with its code; Ctrl+C ends it quietly."""
+    exit with its code; Ctrl+C, and a reader that stops reading (agon setup | head), end it quietly."""
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         pass
+    except BrokenPipeError:  # the reader went away: no traceback, and no second error when Python flushes stdout
+        with contextlib.suppress(OSError):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
 
 
 if __name__ == "__main__":
