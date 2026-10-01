@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0  # the tests run v0.6.0's agon.py from history against a newer database
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}

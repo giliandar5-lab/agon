@@ -3266,7 +3266,8 @@ for table, columns in (("runs", "id agent trigger session started ended status t
                                 " task note"),
                        ("pilot", "agent session turns context started used usd tokens_in tokens_cached tokens_out"
                                  " parked why failures"),
-                       ("live", "pid agent client socket busy beat wake pushed"), ("state", "key value")):
+                       ("live", "pid agent client socket busy beat wake pushed version"), ("state", "key value"),
+                       ("copies", "path app version seen")):  # version, copies: Phase 7
     assert [row[1] for row in v04.execute(f"PRAGMA table_info({table})")] == columns.split(), table
 v04.close()
 # Phase 6: a database made by v0.5.0 (its 11 steps, with an agent, a task and a run in it) opens and gets the arena's
@@ -3283,7 +3284,7 @@ opened = subprocess.run([sys.executable, "-c", "import agon; agon.db(); agon.clo
                         text=True, env=dict(os.environ, AGON_DB=str(Path(TMP, "v05.db"))), timeout=60)
 assert opened.returncode == 0, opened  # as any copy of agon.py opens it
 v05 = sqlite3.connect(Path(TMP, "v05.db"), isolation_level=None)
-assert v05.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 18
+assert v05.execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA) == 20
 for table, columns in (("asks", "id asker agent mode task project started ended answered verdict tests branch problem"),
                        ("reviews", "id task owner reviewer verdict tests at"),
                        ("duels", "id project prompt base state started ended winner baseline report note"),
@@ -4637,6 +4638,86 @@ try:
             assert str(e).endswith("set AGON_CMD_GPT to its full command (`agon setup` prints it)."), e
 finally:
     sys.argv = saved_argv
+
+# Phase 7, 4. Every app keeps its own copy of Agon, and all share one database, so a copy may be older than another.
+# Schema steps stay backward compatible, so an older copy keeps working on a database a newer one migrated; each copy
+# notes its file, app and version, and the arena and setup name the app whose copy is older, with how to update it
+agon.close_db()
+agon.DB, test_db = str(Path(TMP, "copies.db")), agon.DB
+COPIES = dict(os.environ, AGON_DB=agon.DB)
+new_copy = Agent("claude", client="claude-code", env=COPIES)  # migrates the database to this version's steps
+assert agon.db().execute("PRAGMA user_version").fetchone()[0] == len(agon.SCHEMA)
+v06 = subprocess.run(["git", "show", "6d38db6:agon.py"], cwd=HERE, capture_output=True)  # v0.6.0, before Phase 7
+if v06.returncode == 0:  # (CI checks out the whole history; a copy without it skips only this part)
+    old_dir = Path(TMP, "v06")
+    old_dir.mkdir()
+    (old_dir / "agon.py").write_bytes(v06.stdout)
+    old_copy = Agent("gpt", client="codex-mcp-client", argv=[sys.executable, str(old_dir / "agon.py"), "gpt"], env=COPIES)
+    assert old_copy.hello["serverInfo"]["version"] == "0.6.0", old_copy.hello
+    new_copy("send", text="from the new copy")
+    assert "from the new copy" in old_copy("inbox", wait=0)
+    old_copy("send", text="from the old copy")
+    assert "from the old copy" in new_copy("inbox", wait=0)
+    assert "#1" in old_copy("board", action="add", title="Old copies still use the board")
+    for _ in range(100):  # its server's row in live, without a version
+        if agon.db().execute("SELECT 1 FROM live WHERE client = 'codex-mcp-client'").fetchone():
+            break
+        time.sleep(0.1)
+    old_rows = [row for row in agon.arena_state()["outdated"] if row["version"] == "older than 0.7"]
+    assert old_rows == [{"app": "Codex", "version": "older than 0.7", "newest": agon.VERSION, "path": None,
+                         "update": "codex plugin marketplace upgrade agon, then codex plugin add agon@agon, and"
+                                   " restart Codex"}], old_rows
+    old_copy.close()
+else:
+    print("skipped: an older copy of agon.py from git history (this clone has no history)", file=sys.stderr)
+mine = str(Path(SERVER).resolve())
+assert agon.db().execute("SELECT app, version FROM copies WHERE path = ?", (mine,)).fetchone() == ("Claude Code",
+                                                                                                    agon.VERSION)
+new_copy.close()
+agon.db().execute("DELETE FROM live")
+now = time.time()
+for path, app_, version, seen in (
+        ("/u/.claude/plugins/cache/agon/agon/0.5.0/agon.py", "Claude Code", "0.5.0", now - 100),  # updated since
+        ("/u/.codex/plugins/cache/agon/agon/agon.py", "Codex", "0.5.0", now - 10),
+        ("/u/old/agon.py", None, "0.1.0", now - 40 * 86400)):  # not seen for 40 days: gone
+    agon.db().execute("INSERT INTO copies VALUES (?, ?, ?, ?)", (path, app_, version, seen))
+assert agon.arena_state()["outdated"] == [{
+    "app": "Codex", "version": "0.5.0", "newest": agon.VERSION, "path": "/u/.codex/plugins/cache/agon/agon/agon.py",
+    "update": "codex plugin marketplace upgrade agon, then codex plugin add agon@agon, and restart Codex"}]
+out = io.StringIO()
+agon.setup(out)
+assert f"Codex runs Agon 0.5.0, older than {agon.VERSION}. It keeps working; to update it: codex plugin marketplace" \
+       " upgrade agon, then codex plugin add agon@agon, and restart Codex." in out.getvalue(), out.getvalue()
+assert "This copy is" not in out.getvalue() and "0.1.0" not in out.getvalue()
+agon.db().execute("INSERT INTO copies VALUES ('/u/new/agon.py', NULL, '99.0.0', ?)", (now,))
+assert agon.older_copies()[0] == (f"        This copy is Agon {agon.VERSION}; another one that uses this chat is"
+                                  " 99.0.0. Update this one."), agon.older_copies()
+assert {row["app"] for row in agon.arena_state()["outdated"]} == {"Codex", "Claude Code"}  # 'claude' ran this copy
+before = agon.db().execute("SELECT seen FROM copies WHERE path = ?", (mine,)).fetchone()[0]
+agon.note_copy("Claude Code")  # the same copy, app and version within the hour: nothing to write
+assert agon.db().execute("SELECT seen FROM copies WHERE path = ?", (mine,)).fetchone()[0] == before
+agon.note_copy("Antigravity")  # the same file in another app: noted at once
+assert agon.db().execute("SELECT app FROM copies WHERE path = ?", (mine,)).fetchone()[0] == "Antigravity"
+for path, app_, hint in (
+        ("/u/.local/share/uv/tools/agon-arena/lib/python3.12/site-packages/agon.py", None, "uv tool upgrade agon-arena"),
+        ("/u/.local/pipx/venvs/agon-arena/lib/python3.12/site-packages/agon.py", None, "pipx upgrade agon-arena"),
+        ("/u/.cache/uv/archive-v0/x/lib/python3.12/site-packages/agon.py", None, "uvx agon-arena@latest"),
+        ("/usr/lib/python3/dist-packages/agon.py", None, "pip install -U agon-arena"),
+        ("/u/.gemini/plugins/agon/agon.py", None, "git pull in the folder you cloned Agon into, then agy plugin"
+                                                   " install that folder again"),
+        ("/u/src/agon/agon.py", None, f"git pull in {Path('/u/src/agon')}"),
+        (None, "Claude Code", "claude plugin marketplace update agon, then claude plugin update agon@agon, and restart"
+                              " Claude Code")):
+    assert agon.update_hint(app_, path) == hint, (path, agon.update_hint(app_, path))
+assert agon.version_key("0.10.0") > agon.version_key("0.9.1") > agon.version_key("") == ()
+agon.close_db()
+agon.DB = str(Path(TMP, "no-such", "agon.db"))
+assert agon.older_copies() == [] and not Path(agon.DB).parent.exists()  # setup reads a chat only when there is one
+agon.DB = str(Path(TMP, "v05-like.db"))  # a chat an older copy made, without these tables yet
+sqlite3.connect(agon.DB).execute("CREATE TABLE live(pid INTEGER)").connection.close()
+assert agon.older_copies() == []
+agon.DB = test_db
+assert 'id="outdated"' in agon.PAGE and "s.outdated" in agon.PAGE
 
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()

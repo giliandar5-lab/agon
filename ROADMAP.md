@@ -299,6 +299,9 @@ editing users' config files, hard-coded model rankings, claims we can't measure.
   these tools change monthly. If the docs are unreachable from your environment, use the facts below and list
   in the pull request what you could not re-verify.
 - `agon.py` stays one file with zero dependencies; existing tools stay backward compatible.
+- Every schema step stays backward compatible (new tables, or new columns with defaults, never a new meaning for an
+  old column), so an older copy keeps working: each app keeps its own copy of Agon, and all share one database. The
+  arena and setup name the app whose copy is older and say how to update it.
 - Every new behavior gets an assert-based check in `test_agon.py`; `python test_agon.py` must print `ok`.
 - The real apps (Claude Code, Codex, Antigravity) may not be available where you work: simulate them in tests
   (fake hook payloads, fake MCP clients, fake CLI scripts) and give manual test steps in the pull request.

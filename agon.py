@@ -350,6 +350,13 @@ SCHEMA = [  # PRAGMA user_version counts the steps already applied: add new step
     "CREATE TABLE gauges(agent TEXT NOT NULL, window TEXT NOT NULL, used REAL NOT NULL, resets REAL, session TEXT, seen"
     " REAL NOT NULL, PRIMARY KEY(agent, window))",
     "ALTER TABLE agents ADD COLUMN busy REAL NOT NULL DEFAULT 0",  # since when its app works, from its hooks; 0: idle
+    # Phase 7: every app keeps its own copy of Agon (each plugin, the agon command), and all share this database, so a
+    # copy may be older than another. Steps stay backward compatible (new tables, new columns with defaults), so an
+    # older copy keeps working, and the arena and setup name the app whose copy is older. The version of each open app's
+    # MCP server ('' for a server older than v0.7, which doesn't write it), and every copy that ran: its file, the app
+    # that ran it, its version, when
+    "ALTER TABLE live ADD COLUMN version TEXT NOT NULL DEFAULT ''",
+    "CREATE TABLE copies(path TEXT PRIMARY KEY, app TEXT, version TEXT NOT NULL, seen REAL NOT NULL)",
 ]
 _local = threading.local()
 
@@ -445,6 +452,76 @@ def too_long(text, what="message"):
     if len(text) > MAX_TEXT:
         return (f"The {what} is {len(text):,} characters; the limit is {MAX_TEXT:,}."
                 " Put long content in a file and send its path.")
+
+
+HOOK_APPS = {"claude": "Claude Code", "codex": "Codex", "antigravity": "Antigravity"}  # the app by its hook's format
+
+
+def note_copy(app=None):
+    """This copy of Agon (its file) just ran, in `app` (Claude Code, Codex, Antigravity; None: run by hand), at VERSION:
+    the arena and setup name the apps whose copies are older (see outdated()). It writes only when something changed or
+    an hour passed, since every write makes the arena look again. Best effort, like presence."""
+    path, now = str(Path(__file__).resolve()), time.time()
+    with contextlib.suppress(sqlite3.Error):
+        row = db().execute("SELECT app, version, seen FROM copies WHERE path = ?", (path,)).fetchone()
+        if row and row[1] == VERSION and (app is None or row[0] == app) and row[2] > now - 3600:
+            return
+        db().execute("INSERT INTO copies(path, app, version, seen) VALUES (?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET"
+                     " app = COALESCE(excluded.app, app), version = excluded.version, seen = excluded.seen",
+                     (path, app, VERSION, now))
+
+
+def version_key(version):
+    """A version such as 0.7.0 as numbers to compare; an unknown one ('': older than v0.7) as the oldest."""
+    try:
+        return tuple(int(part) for part in str(version).split("."))
+    except ValueError:
+        return ()
+
+
+def update_hint(app, path):
+    """How to bring an older copy of Agon up to date, from where it lives: an app's plugin, a package, a clone."""
+    parts = [part.lower() for part in Path(path).parts] if path else []
+    if "site-packages" in parts or "dist-packages" in parts:
+        if "pipx" in parts:
+            return "pipx upgrade agon-arena"
+        if any(part in UV_CACHE for part in parts):
+            return "uvx agon-arena@latest"
+        return "uv tool upgrade agon-arena" if "uv" in parts else "pip install -U agon-arena"
+    if app == "Claude Code" or ".claude" in parts:
+        return "claude plugin marketplace update agon, then claude plugin update agon@agon, and restart Claude Code"
+    if app == "Codex" or ".codex" in parts:
+        return "codex plugin marketplace upgrade agon, then codex plugin add agon@agon, and restart Codex"
+    if app == "Antigravity" or ".gemini" in parts:
+        return "git pull in the folder you cloned Agon into, then agy plugin install that folder again"
+    return f"git pull in {Path(path).parent}" if path else "update it"
+
+
+def outdated(now, con=None):
+    """The copies of Agon that are older than the newest one that ran here: [{app, version, newest, path, update}]. Each
+    app's copy seen last in the 30 days counts (an app's update installs the new copy in a new folder, and the old one
+    stays behind), and an open app's MCP server that wrote no version (older than v0.7)."""
+    con = con or db()
+    try:
+        rows = con.execute("SELECT path, app, version FROM copies WHERE seen > ? ORDER BY seen DESC",
+                           (now - 30 * 86400,)).fetchall()
+        old_servers = con.execute("SELECT DISTINCT client FROM live WHERE version = '' AND beat > ?",
+                                  (now - LIVE,)).fetchall()
+    except sqlite3.Error:  # a database that an older copy made, without these tables yet
+        return []
+    latest = {}
+    for path, app, version in rows:
+        latest.setdefault(app, (path, app, version))
+    copies = list(latest.values())
+    newest = max([VERSION, *(version for _, _, version in rows)], key=version_key)
+    found = [{"app": app, "version": version, "newest": newest, "path": path, "update": update_hint(app, path)}
+             for path, app, version in copies if version_key(version) < version_key(newest)]
+    for (client,) in old_servers:
+        app = APPS.get(client, client)
+        if not any(row["app"] == app for row in found):
+            found.append({"app": app, "version": "older than 0.7", "newest": newest, "path": None,
+                          "update": update_hint(app, None)})
+    return sorted(found, key=lambda row: (str(row["app"]), str(row["path"])))
 
 
 def touch(me, client=None):
@@ -2033,6 +2110,7 @@ def dispatch(session, method, params):
             session.client = name if isinstance(name, str) else None
             if not session.asked_by:
                 touch(session.me, session.client)
+                note_copy(APPS.get(session.client, session.client))
             if not (session.asked_by or session.headless or session.watching):  # an app the human opened
                 session.watching = threading.Thread(target=watch, args=(session,), daemon=True)
                 session.watching.start()
@@ -2121,9 +2199,10 @@ def register(session, now):
     """This MCP server's row in `live`, with a heartbeat: the human has the agent's app open. In Claude Code, with the
     path of the session's inbox socket, which Claude Code gives its MCP servers and hooks alike."""
     path = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET") if session.client == "claude-code" else None
-    db().execute("INSERT INTO live(pid, agent, client, socket, beat) VALUES (?, ?, ?, ?, ?) ON CONFLICT(pid) DO UPDATE"
-                 " SET agent = excluded.agent, client = excluded.client, socket = excluded.socket, beat = excluded.beat",
-                 (os.getpid(), session.me, session.client, path or None, now))
+    db().execute("INSERT INTO live(pid, agent, client, socket, beat, version) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(pid)"
+                 " DO UPDATE SET agent = excluded.agent, client = excluded.client, socket = excluded.socket, beat ="
+                 " excluded.beat, version = excluded.version", (os.getpid(), session.me, session.client, path or None,
+                                                                 now, VERSION))
 
 
 def unregister():
@@ -2474,6 +2553,7 @@ def hook(me, wait=HOOK_WAIT, fmt=None, inp=None, out=None):
     if os.environ.get("AGON_ASKED_BY"):  # an app that ask started answers its asker only: it may stop at once
         return
     touch(me)  # the agent's row, so its cursor can move; a sign of life that renews its claims on the board
+    note_copy(HOOK_APPS.get(fmt))
     headless = bool(os.environ.get("AGON_AUTOPILOT"))
     if payload.get("hook_event_name") == "UserPromptSubmit":  # Claude Code and Codex, before the agent starts a turn
         return prompt_hook(me, payload, out, headless)
@@ -3424,7 +3504,7 @@ def arena_state(now=None):
     auto = autopilot_state(now)
     return {"now": now, "paused": paused(), "autopilot": auto, "team": team_state(now), "tasks": tasks,
             "done": len(done), "asks": asks, "duels": duels_state(), "checks": checks_state(),
-            "project": default_project(auto), "score": scoreboard()}
+            "project": default_project(auto), "score": scoreboard(), "outdated": outdated(now)}
 
 
 def task_state(tid):
@@ -4118,6 +4198,8 @@ button { cursor: pointer; } button:hover { border-color: var(--dim); }
 button:disabled { opacity: .5; cursor: default; }
 #stop { background: var(--bad); border-color: var(--bad); color: #fff; font-weight: 600; min-width: 84px; }
 #stop.resume { background: var(--good); border-color: var(--good); }
+#outdated { padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line); color: var(--warn);
+  font-size: 13px; }
 nav { display: flex; gap: 2px; padding: 0 8px; background: var(--panel); border-bottom: 1px solid var(--line);
   overflow-x: auto; }
 nav button { border: 0; border-radius: 0; background: none; color: var(--dim); padding: 10px 12px; }
@@ -4451,6 +4533,10 @@ function update(s) {
   const pilot = $('#pilot');
   pilot.hidden = !s.autopilot;
   if (s.autopilot) pilot.textContent = 'autopilot: ' + (s.autopilot.agents || []).join(', ') + ', lead ' + s.autopilot.lead;
+  const old = $('#outdated');  // an older copy of Agon shares this database: it keeps working, and says how to update
+  old.hidden = !(s.outdated || []).length;
+  old.replaceChildren(...(s.outdated || []).map(c => el('div', '', (c.app || 'A copy run by hand') + ' runs Agon '
+    + c.version + ', older than ' + c.newest + '. It keeps working; to update it: ' + c.update + '.')));
   renderTeam(s.team, $('#roster'));
   renderAsks(s.asks, $('#asks'));
   renderBoard(s.tasks, s.done, $('#tasks'), openTask);
@@ -4615,6 +4701,7 @@ PAGE = ("""<!doctype html>
 <style nonce="{nonce}">""" + ARENA_STYLE + """</style>
 <header><h1>Agon</h1><span id="state" class="pill">connecting…</span><span id="pilot" class="pill" hidden></span>
 <span class="grow"></span><button type="button" id="stop">STOP</button></header>
+<div id="outdated" hidden></div>
 """ + ARENA_MAIN.replace("{composer}", COMPOSER) + """
 <script nonce="{nonce}">""" + ARENA_RENDER + ARENA_LIVE + """</script>
 """)
@@ -5184,6 +5271,31 @@ def installation():
     return "script", [sys.executable, str(path)]
 
 
+def older_copies():
+    """Setup's lines on the copies of Agon that share the chat and are older than another one (see outdated()). The chat
+    is opened read-only, and only when it exists: setup writes nothing."""
+    if not Path(DB).exists():
+        return []
+    try:
+        con = sqlite3.connect(Path(DB).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return []
+    try:
+        found, newest = outdated(time.time(), con), VERSION
+        with contextlib.suppress(sqlite3.Error):
+            newest = max([VERSION, *(v for (v,) in con.execute("SELECT version FROM copies WHERE seen > ?",
+                                                                (time.time() - 30 * 86400,)))], key=version_key)
+    finally:
+        con.close()
+    lines = [f"        This copy is Agon {VERSION}; another one that uses this chat is {newest}. Update this one."
+             ] if version_key(VERSION) < version_key(newest) else []
+    for copy in found:
+        if copy["path"] != str(Path(__file__).resolve()):
+            lines.append(f"        {copy['app'] or 'A copy run by hand'} runs Agon {copy['version']}, older than"
+                         f" {copy['newest']}. It keeps working; to update it: {copy['update']}.")
+    return lines
+
+
 def setup(out=None):
     """Print how to connect each app to this copy of Agon, with absolute paths: plugin commands, then the MCP server and
     hooks by hand. Agon never edits the apps' config files, so this only prints. The paths are those of the command that
@@ -5212,6 +5324,8 @@ def setup(out=None):
     legacy = Path(script).with_name("agon.db")
     if kind == "script" and "AGON_DB" not in os.environ and legacy.exists():
         say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
+    for line in older_copies():
+        say(line)
 
     hook = {"type": "command", "command": run[0], "args": [*run[1:], "hook", "claude"]}  # exec form: no shell
     claude_hook, claude_prompt = [{"hooks": [hook | {"timeout": 60}]}], [{"hooks": [hook | {"timeout": 10}]}]
