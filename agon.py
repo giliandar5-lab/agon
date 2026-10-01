@@ -5642,17 +5642,22 @@ def arena():
 
 
 def stdout_gone():
-    """On Windows, whether stdout is a pipe whose reader went away (PeekNamedPipe says ERROR_BROKEN_PIPE), since a
-    write there fails with EINVAL, which other errors share."""
+    """On Windows, whether stdout is a pipe whose reader went away, since a write there fails with EINVAL, which other
+    errors share. A zero-byte WriteFile on a pipe is sent as a write, so it fails with ERROR_NO_DATA (or
+    ERROR_BROKEN_PIPE) once the reader is gone, and writes nothing while it is there."""
     try:
         import ctypes
         import msvcrt
+        from ctypes import wintypes
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        if kernel32.PeekNamedPipe(ctypes.c_void_p(msvcrt.get_osfhandle(sys.stdout.fileno())), None, 0, None, None,
-                                  None):
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(sys.stdout.fileno()))
+        if kernel32.GetFileType(handle) != 3:  # FILE_TYPE_PIPE
             return False
-        return ctypes.get_last_error() == 109  # ERROR_BROKEN_PIPE
+        written = wintypes.DWORD()
+        if kernel32.WriteFile(handle, None, 0, ctypes.byref(written), None):
+            return False
+        return ctypes.get_last_error() in (109, 232)  # ERROR_BROKEN_PIPE, ERROR_NO_DATA
     except (OSError, ValueError, AttributeError, ImportError):
         return False
 
