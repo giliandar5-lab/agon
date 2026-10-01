@@ -5641,12 +5641,19 @@ def arena():
     return 0
 
 
-def stdout_works():
-    """Whether stdout still takes output: False once its reader went away."""
+def stdout_gone():
+    """On Windows, whether stdout is a pipe whose reader went away (PeekNamedPipe says ERROR_BROKEN_PIPE), since a
+    write there fails with EINVAL, which other errors share."""
     try:
-        sys.stdout.flush()
-        return True
-    except OSError:
+        import ctypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if kernel32.PeekNamedPipe(ctypes.c_void_p(msvcrt.get_osfhandle(sys.stdout.fileno())), None, 0, None, None,
+                                  None):
+            return False
+        return ctypes.get_last_error() == 109  # ERROR_BROKEN_PIPE
+    except (OSError, ValueError, AttributeError, ImportError):
         return False
 
 
@@ -5660,7 +5667,7 @@ def cli():
     except KeyboardInterrupt:
         pass
     except OSError as e:  # the reader went away: no traceback, and no second error when Python flushes stdout
-        if not (isinstance(e, BrokenPipeError) or os.name == "nt" and e.errno == 22 and not stdout_works()):
+        if not (isinstance(e, BrokenPipeError) or os.name == "nt" and e.errno == 22 and stdout_gone()):
             raise  # (Windows says EINVAL for a closed pipe; any other EINVAL is a real error)
         with contextlib.suppress(OSError):
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
