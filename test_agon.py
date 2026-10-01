@@ -4810,7 +4810,7 @@ for needed in ("never a new meaning for an\n  old column", "`flit_core` builds t
 # Phase 7, 12. CI builds the package as the release does, checks what it holds, installs it with pip, pipx and uv tool on
 # each system, ends a uvx-started Agon as an app would, and runs Claude Code's own validator on the plugin
 ci = (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
-for needed in ("  package:", "uv build -o dist", "check_package.py dist dist", 'installed "$bin/agon"',
+for needed in ("  package:", "-o dist", "check_package.py dist dist", 'installed "$bin/agon"',
                "pipx install dist/*.whl", "uv tool install dist/*.whl", "check_package.py uvx-kill dist/*.whl",
                "  plugin:", "npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."):
     assert needed in ci, needed
@@ -4823,7 +4823,7 @@ assert set(re.findall(r"^(?:import|from) (\w+)", checker, re.M)) <= set(sys.stdl
 # PyPI after the maintainer approves its environment, then the MCP Registry; by hand it is a dry run up to TestPyPI.
 # Trusted publishing: no token or password anywhere
 release = (HERE / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-for needed in ('tags: ["v*"]', "workflow_dispatch:", "check_package.py versions", "uv build -o dist",
+for needed in ('tags: ["v*"]', "workflow_dispatch:", "check_package.py versions", "-o dist",
                "check_package.py dist dist", "os: [ubuntu-latest, windows-latest, macos-latest]", '"3.10"',
                "name: testpypi", "repository-url: https://test.pypi.org/legacy/", "name: pypi",
                "if: github.ref_type == 'tag'", "pypa/gh-action-pypi-publish@release/v1", "id-token: write",
@@ -4832,6 +4832,20 @@ for needed in ('tags: ["v*"]', "workflow_dispatch:", "check_package.py versions"
 assert release.index("needs: build") < release.index("needs: test") < release.index("needs: testpypi") < release.index(
     "needs: pypi")
 assert "secrets." not in release and "password" not in release and "token:" not in release.replace("id-token:", "")
+# What the publishing jobs run is pinned: uv (pip --require-hashes), flit_core (uv build's constraints with hashes), and
+# one release of mcp-publisher, checked against the SHA-256 the workflow records before it runs, never releases/latest
+for workflow in (release, ci):
+    assert "releases/latest" not in workflow and "uv build -o" not in workflow
+    assert "--build-constraints .github/build-constraints.txt --require-hashes" in workflow
+assert "pip install --require-hashes -r .github/build-requirements.txt" in release
+assert re.search(r"VERSION: v\d+\.\d+\.\d+\n *SHA256: [0-9a-f]{64} ", release), "a pinned mcp-publisher"
+assert release.index("sha256sum --check --strict") < release.index("tar xzf mcp-publisher.tar.gz") < release.index(
+    "./mcp-publisher validate")
+assert "sha256sum --check --strict" in ci
+for name, package in ((".github/build-requirements.txt", "uv"), (".github/build-constraints.txt", "flit-core")):
+    pins = (HERE / name).read_text(encoding="utf-8")
+    assert re.search(rf"^{package}==\d+\.\d+\.\d+ \\$", pins, re.M) and len(re.findall(r"--hash=sha256:[0-9a-f]{64}",
+                                                                                     pins)) >= 1, name
 assert "permissions:\n  contents: read" in release  # write rights only in the jobs that publish
 # Phase 7, 14. server.json for the MCP Registry, and glama.json: the registry name the README carries, this version, the
 # package on PyPI run with uvx, the agent's name as a required argument, no e-mail address

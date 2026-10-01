@@ -48,7 +48,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: python -m pip install uv pipx
-      - run: uv build -o dist
+      - run: uv build --build-constraints .github/build-constraints.txt --require-hashes -o dist
       - run: python scripts/check_package.py dist dist
       - name: pip install
         run: |
@@ -77,9 +77,14 @@ jobs:
           persist-credentials: false
       - run: npm install -g @anthropic-ai/claude-code
       - run: claude plugin validate --strict .
-      - name: server.json, as the MCP Registry reads it
+      - name: server.json, as the MCP Registry reads it (the mcp-publisher the release uses, checked the same way)
         run: |
-          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          VERSION=$(sed -n 's/^ *VERSION: //p' .github/workflows/release.yml)
+          SHA256=$(sed -n 's/^ *SHA256: \([0-9a-f]*\).*/\1/p' .github/workflows/release.yml)
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/$VERSION/mcp-publisher_linux_amd64.tar.gz"
+          echo "$SHA256  mcp-publisher.tar.gz" | sha256sum --check --strict
+          tar xzf mcp-publisher.tar.gz mcp-publisher
           ./mcp-publisher validate
       - run: python3 scripts/check_package.py versions
 
