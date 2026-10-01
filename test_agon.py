@@ -5030,6 +5030,10 @@ for text in ("gpt, привет, давай просто поболтаем", "G
     row = (7, "claude", "all", text)  # an agent that speaks to gpt in a message to all wakes it (v0.7.4)
     assert agon.addressed("gpt", text) and agon.wakes("gpt", [row], False) == [row], text
 assert not agon.addressed("gpt", "claude asked gpt") and "To ask one agent, send to it" in agon.INSTRUCTIONS
+# a dead autopilot's fresh heartbeat doesn't keep a new one from starting (restarting it at once failed for 150 s)
+gone = subprocess.Popen([sys.executable, "-c", "pass"])
+gone.wait()
+assert agon.alive(os.getpid()) and not agon.alive(gone.pid) and agon.alive(None)  # a doubt never lets two run
 assert agon.human_post("all", "go on") == "Team resumed." and not agon.paused()
 agon.mark("quiet", 0)
 working = [a["name"] for a in agon.team_state(time.time()) if a["state"] == "working"]

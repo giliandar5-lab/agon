@@ -985,6 +985,33 @@ def kill_tree(p):
 JOB = None  # Windows: the job object that everything ask starts belongs to (see contain())
 
 
+def alive(pid):
+    """Whether process `pid` runs on this machine; True when that can't be told (another user's process, an odd pid
+    from agon.db), so that a doubt never lets two autopilots run."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return True
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:  # PermissionError: it runs, as another user
+            return True
+        return True
+    import ctypes
+    from ctypes import wintypes
+    k32 = kernel32()
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such process; access denied: it runs
+    try:
+        code = wintypes.DWORD()
+        return not k32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
+
 def kernel32():
     """Windows: kernel32, declared for the job objects of contain() and leftovers()."""
     import ctypes
@@ -3251,7 +3278,10 @@ class Autopilot:
         with transaction() as con:
             row = con.execute("SELECT value FROM state WHERE key = 'autopilot'").fetchone()
             other = json.loads(row[0]) if row else {}
-            if other.get("pid") != os.getpid() and other.get("beat", 0) > time.time() - LIVE:
+            # a recent heartbeat, unless its process is gone (killed, or its window closed): restarting autopilot
+            # right after it died failed for LIVE seconds (the first real-app test)
+            if other.get("pid") != os.getpid() and other.get("beat", 0) > time.time() - LIVE and alive(
+                    other.get("pid")):
                 raise ToolError(f"Autopilot already runs (process {other.get('pid')}, in {other.get('project')}): stop"
                                 f" it first, or wait {LIVE} s after it ends.")
             self.heartbeat(time.time())
