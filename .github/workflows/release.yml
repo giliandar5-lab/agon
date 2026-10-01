@@ -6,6 +6,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+    branches: [claude/ecstatic-brahmagupta-ky7muk]  # TEMPORARY: the TestPyPI dry run before release.yml is on main
   workflow_dispatch:
 
 permissions:
