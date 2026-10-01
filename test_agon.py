@@ -4774,6 +4774,25 @@ for readme, words in (
                           re.M)) >= 6, readme  # the example prompts: at least five, a line or more each
     assert "@" not in re.sub(r"`[^`]*`|agon@agon", "", text.split("## How")[0].split("## Как")[0]), readme  # no e-mail
 
+# Phase 7, 10. A privacy policy (what agon.db keeps, that Agon sends nothing, what the apps send) and a security policy
+# (private reports through GitHub, no e-mail address), linked from both READMEs
+privacy = (HERE / "PRIVACY.md").read_text(encoding="utf-8")
+for needed in ("~/.agon/agon.db", "Agon itself sends\nnothing over the network", "no telemetry", "delete the file",
+               "under that company's terms and privacy policy", "/issues", "not affiliated with Anthropic, OpenAI"):
+    assert needed in privacy, needed
+c = sqlite3.connect(":memory:")
+agon.migrate(c)
+tables = {name for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+c.close()
+assert tables == {"msgs", "agents", "tasks", "releases", "runs", "pilot", "live", "state", "asks", "reviews", "duels",
+                  "entries", "gauges", "copies"}, tables  # a new table: say in PRIVACY.md what it keeps, then add it
+security = (HERE / "SECURITY.md").read_text(encoding="utf-8")
+for needed in ("/security/advisories/new", "private vulnerability reporting", "`AGON_TEST_CMD`", "`AGON_SETUP_CMD`",
+               "127.0.0.1", "AGON_UNSAFE"):
+    assert needed in security, needed
+for text in (privacy, security):
+    assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)  # no e-mail address
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()

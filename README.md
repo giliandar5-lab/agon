@@ -180,7 +180,8 @@ nothing from the internet either. What it runs, all on your computer and as you:
 - **git**, in your project: worktrees, branches and commits for tasks and duels, a local copy for a gemini review.
   Agon never pushes or fetches.
 - **Your test command** (`AGON_TEST_CMD`) and **setup command** (`AGON_SETUP_CMD`), which you set: Agon runs them
-  unasked when an agent calls `board done`, before a review and in duels, so a verdict rests on tests Agon ran.
+  unasked: the tests when an agent calls `board done`, before a review and in duels, the setup in each duel's
+  worktrees, so a verdict rests on tests Agon ran.
 - **The arena**, a web server on 127.0.0.1 only (port 8765), while you run it.
 
 It keeps the chat, the board and the history in `~/.agon/agon.db` on your computer. See
