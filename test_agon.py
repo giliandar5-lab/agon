@@ -4582,6 +4582,62 @@ for argv0, name in (("/home/me/.local/bin/agon", "agon"), (r"C:\Users\me\.local\
     finally:
         sys.argv = saved_argv
 
+# Phase 7, 3. setup prints the command that starts this copy for good. From uv's cache (uvx), which uv deletes, it
+# prints no path at all: it says to install Agon for good. A package installer's copy (uv tool, pipx, pip) is started by
+# its agon command (or Python with -m agon); a git clone or a plugin's copy by Python and agon.py, as before
+def setup_as(file, scripts):  # what setup prints when this copy of agon.py lives at `file`, with scripts in `scripts`
+    saved_file, saved_get_path, out = agon.__file__, agon.sysconfig.get_path, io.StringIO()
+    agon.__file__ = str(file)
+    agon.sysconfig.get_path = lambda name, *a, **k: str(scripts) if name == "scripts" else saved_get_path(name, *a, **k)
+    try:
+        kind = agon.installation()
+        agon.setup(out)
+    finally:
+        agon.__file__, agon.sysconfig.get_path = saved_file, saved_get_path
+    return kind, out.getvalue()
+
+
+cache = Path(TMP, "uv-cache", "archive-v0", "Xh2k", "lib", "python3.11", "site-packages")
+cache.mkdir(parents=True)
+kind, out = setup_as(cache / "agon.py", Path(TMP, "nowhere"))
+assert kind == ("uvx", None) and "uv tool install agon-arena" in out and "  agon setup" in out, out
+assert str(cache) not in out and "archive-v0" not in out and "hook claude" not in out, out  # no path into it
+venv = Path(TMP, "tool-venv")
+site_packages, scripts = venv / "lib" / "python3.11" / "site-packages", venv / ("Scripts" if windows else "bin")
+site_packages.mkdir(parents=True)
+scripts.mkdir()
+kind, out = setup_as(site_packages / "agon.py", scripts)
+assert kind == ("package", [sys.executable, "-m", "agon"]), kind  # no agon command there: Python with -m agon
+assert agon.command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", sys.executable, "-m", "agon",
+                          "claude"]) in out, out
+command = scripts / ("agon.exe" if windows else "agon")
+command.write_text("")
+kind, out = setup_as(site_packages / "agon.py", scripts)
+assert kind == ("package", [str(command)]) and f"Agon    {agon.command_line([str(command)])}" in out, (kind, out)
+snippets = [json.loads(row) for row in out.splitlines() if row.startswith("  {")]
+assert snippets[0]["hooks"]["Stop"][0]["hooks"][0] == {"type": "command", "command": str(command),
+                                                        "args": ["hook", "claude"], "timeout": 60}, snippets[0]
+for needed in (agon.command_line(["agy", "mcp", "add", "agon", str(command), "gemini"]),
+               agon.command_line([str(command), "autopilot", "--agents", "claude,gpt,gemini", "--lead", "claude"]),
+               agon.command_line([str(command)]) + f"   then open http://127.0.0.1:{agon.PORT}"):
+    assert needed in out, (needed, out)
+assert str(site_packages) not in out, out  # the command, never the module's own path
+status_line = snippets[-1]["statusLine"]["command"]
+assert status_line == (f"{command.as_posix()} statusline" if windows else shlex.join([str(command), "statusline"]))
+kind, out = setup_as(Path(SERVER).resolve(), scripts)  # a clone (or a plugin's copy): Python and agon.py, as before
+assert kind == ("script", [sys.executable, str(Path(SERVER).resolve())]) and f"Agon    {Path(SERVER).resolve()}" in out
+# Hints name the command that started Agon: agon for the package's commands, else python agon.py
+saved_argv, sys.argv = sys.argv, [str(command)]
+try:
+    with settings(AGON_CMD_GPT='["no-such-codex-7"]'):
+        try:
+            agon.wake_command("gpt", "Hi", None, None, "")
+            raise AssertionError("a missing app")
+        except agon.ToolError as e:
+            assert str(e).endswith("set AGON_CMD_GPT to its full command (`agon setup` prints it)."), e
+finally:
+    sys.argv = saved_argv
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()

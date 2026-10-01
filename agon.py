@@ -34,6 +34,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
@@ -799,7 +800,7 @@ def ask_command(name, mode, prompt, cwd):
     program = shutil.which(template[0])
     if program is None:
         raise ToolError(f"Can't run {name}: {missing(template[0])}. Install it, or set {var} to its full command"
-                        " (`python agon.py setup` prints it).")
+                        f" (`{command_name()} setup` prints it).")
     if os.name == "nt" and program.lower().endswith((".bat", ".cmd")) and any(map(PLACEHOLDER.search, template)):
         raise ToolError(f"Can't run {name}: {program} is a batch file, and cmd.exe could run commands hidden in the"
                         f" prompt or the folder name. Set {var} to start the .exe itself.")
@@ -1290,7 +1291,7 @@ def barred(name):
     except (OSError, ValueError, AttributeError):  # no settings yet, not JSON, not an object
         pass
     return (f"Can't run gemini on your Google login: Google's terms forbid third-party software there, so Agon runs agy"
-            f" on a Gemini API key: set \"modelProvider\": \"gemini\" in {path} and GEMINI_API_KEY (`python agon.py"
+            f" on a Gemini API key: set \"modelProvider\": \"gemini\" in {path} and GEMINI_API_KEY (`{command_name()}"
             " setup` shows how), or AGON_GEMINI_PLAN=1 to use your Google login at your own risk")
 
 
@@ -2645,7 +2646,7 @@ def wake_command(name, prompt, session, budget, new):
     program, *wrapper = wake_program(name)
     if (found := shutil.which(program)) is None:
         raise ToolError(f"Can't wake {name}: {missing(program)}. Install it, or set AGON_CMD_{name.upper()} to its full"
-                        " command (`python agon.py setup` prints it).")
+                        f" command (`{command_name()} setup` prints it).")
     argv = [found, *wrapper, *WAKE_COMMANDS[name], *WAKE_PERMISSIONS[name][enabled("AGON_UNSAFE")]]
     model, effort = (os.environ.get(f"AGON_{name.upper()}_{what}", "").strip() for what in ("MODEL", "EFFORT"))
     var = f"AGON_{name.upper()}_ARGS"
@@ -3222,7 +3223,7 @@ class Autopilot:
         elif got["denied"]:
             self.notice(("denied", me), f"{me} couldn't use Agon's tools: headless, agy refuses an MCP tool it would ask"
                                         ' about. Add "permissions": {"allow": ["mcp(agon/*)"]} to'
-                                        f" {Path.home().joinpath(*GEMINI_SETTINGS)} (python agon.py setup shows it).")
+                                        f" {Path.home().joinpath(*GEMINI_SETTINGS)} ({command_name()} setup shows it).")
         if status == "done":
             db().execute("UPDATE pilot SET failures = 0 WHERE agent = ?", (me,))
         elif status == "limit":  # marked until it resets, its tasks go back to the board, and the lead hears of it
@@ -3284,7 +3285,7 @@ def stats(out=None):
                         " SUM(tokens_cached), SUM(tokens_out), SUM(usd), SUM(COALESCE(ended, started) - started),"
                         " MIN(started) FROM runs GROUP BY agent ORDER BY agent").fetchall()
     if not rows:
-        return say("Autopilot hasn't woken anyone yet: python agon.py autopilot.")
+        return say(f"Autopilot hasn't woken anyone yet: {command_name()} autopilot.")
     first = min(row[-1] for row in rows)
     say(f"Autopilot's wakes since {time.strftime('%Y-%m-%d %H:%M', time.localtime(first))}:",
         f"{'agent':<10}{'wakes':>6}{'pushed':>8}{'done':>6}{'failed':>8}{'limit':>7}{'stopped':>9}"
@@ -4899,7 +4900,7 @@ class Web(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").strip().lower()
         if (self.headers.get("Origin") or "").strip().lower() in (f"http://{host}", f"https://{host}"):
             return True
-        self.answer(403, "The arena takes this only from its own page (python agon.py say posts from a terminal).")
+        self.answer(403, f"The arena takes this only from its own page ({command_name()} say posts from a terminal).")
 
     def handle(self):
         try:
@@ -5163,10 +5164,33 @@ def command_line(args):
     return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
 
 
+UV_CACHE = ("archive-v0", "environments-v2")  # the folders of uv's cache where uvx keeps the tools it runs
+
+
+def installation():
+    """How this copy of Agon was installed, and the command that starts it for good: ("uvx", None) when it runs from
+    uv's cache, which uv deletes (uv cache clean, uv cache prune), so no path into it may be printed; ("package", the
+    agon command, or Python with -m agon) when a package installer put it in a site-packages folder (uv tool install,
+    pipx, pip); else ("script", Python and agon.py), a git clone or a plugin's copy."""
+    path = Path(__file__).resolve()
+    if {part.lower() for part in path.parts} & set(UV_CACHE):
+        return "uvx", None
+    if path.parent.name.lower() in ("site-packages", "dist-packages"):
+        scripts = Path(sysconfig.get_path("scripts"))
+        for name in ("agon.exe", "agon") if os.name == "nt" else ("agon",):
+            if (scripts / name).is_file():
+                return "package", [str(scripts / name)]
+        return "package", [sys.executable, "-m", "agon"]
+    return "script", [sys.executable, str(path)]
+
+
 def setup(out=None):
-    """Print how to connect each app to this copy of agon.py, with absolute paths: plugin commands, then the MCP
-    server and Stop hook by hand. Agon never edits the apps' config files, so this only prints."""
-    py, script, home, windows = sys.executable, str(Path(__file__).resolve()), Path.home(), os.name == "nt"
+    """Print how to connect each app to this copy of Agon, with absolute paths: plugin commands, then the MCP server and
+    hooks by hand. Agon never edits the apps' config files, so this only prints. The paths are those of the command that
+    starts this copy for good (see installation()): never a path into uv's cache, which a GUI app's PATH may not reach
+    either way."""
+    kind, run = installation()
+    py, home, windows = sys.executable, Path.home(), os.name == "nt"
 
     def say(*lines):
         print(*lines, sep="\n", file=out or sys.stdout)
@@ -5176,34 +5200,41 @@ def setup(out=None):
         say("", f"== {title}: " + (f"{cli} is {found}" if found else f"{cli} isn't on PATH (all this works for the"
                                                                      " app too)"))
 
-    say("Agon setup. Nothing is written: copy what you need.", "", f"Python  {py}", f"Agon    {script}",
+    if kind == "uvx":
+        return say("Agon setup. This Agon runs from uv's cache (uvx), which uv deletes when it cleans up (uv cache"
+                   " clean, uv cache prune):", "paths into it would break the hooks and servers set up with them."
+                   " Install Agon for good, then run setup again:", "  uv tool install agon-arena", "  agon setup",
+                   "Or use the plugins (they bring their own copy): https://github.com/giliandar5-lab/agon#quick-start")
+    script = run[-1]
+    shown = script if kind == "script" else command_line(run)
+    say("Agon setup. Nothing is written: copy what you need.", "", f"Python  {py}", f"Agon    {shown}",
         f"Chat    {DB}", "        (one team at a time: set AGON_DB to a different file per project for separate teams)")
     legacy = Path(script).with_name("agon.db")
-    if "AGON_DB" not in os.environ and legacy.exists():
+    if kind == "script" and "AGON_DB" not in os.environ and legacy.exists():
         say(f"        An older chat is in {legacy}: move it (and agon.db-wal, agon.db-shm) there to keep its history.")
 
-    claude_hook = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 60}]}]
-    claude_prompt = [{"hooks": [{"type": "command", "command": py, "args": [script, "hook", "claude"], "timeout": 10}]}]
+    hook = {"type": "command", "command": run[0], "args": [*run[1:], "hook", "claude"]}  # exec form: no shell
+    claude_hook, claude_prompt = [{"hooks": [hook | {"timeout": 60}]}], [{"hooks": [hook | {"timeout": 10}]}]
     app("Claude Code", "claude")
     say("Plugin, in a terminal (or in Claude Code: /plugin marketplace add, then /plugin install):",
         "  claude plugin marketplace add giliandar5-lab/agon",
         "  " + command_line(["claude", "plugin", "install", "agon@agon", "--config", f"python={py}"]),
         "By hand:",
-        "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", py, script, "claude"]),
+        "  " + command_line(["claude", "mcp", "add", "--scope", "user", "agon", "--", *run, "claude"]),
         f"  and the hooks, merged into {home / '.claude' / 'settings.json'}:",
         "  " + json.dumps({"hooks": {"Stop": claude_hook, "StopFailure": claude_hook, "UserPromptSubmit": claude_prompt}}),
         "Channels (research preview), to wake an idle Claude:",
         "  claude --dangerously-load-development-channels plugin:agon@agon   (by hand: server:agon)")
 
     if windows:  # Codex runs hook commands through PowerShell there: & and single quotes (literal) around the paths
-        codex_hook = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in (py, script)) + " hook gpt"
+        codex_hook = "& " + " ".join("'" + arg.replace("'", "''") + "'" for arg in run) + " hook gpt"
     else:
-        codex_hook = shlex.join([py, script, "hook", "gpt"])
+        codex_hook = shlex.join([*run, "hook", "gpt"])
     forward = ["--env", f"AGON_DB={os.environ['AGON_DB']}"] if os.environ.get("AGON_DB") else []  # Codex won't pass it
     app("Codex", "codex")
     say("Plugin:", "  codex plugin marketplace add giliandar5-lab/agon", "  codex plugin add agon@agon",
         "  then start Codex and trust the hook when it asks (or in /hooks)",
-        "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", py, script, "gpt"]),
+        "By hand:", "  " + command_line(["codex", "mcp", "add", "agon", *forward, "--", *run, "gpt"]),
         f"  and the hook, merged into {home / '.codex' / 'hooks.json'}:",
         "  " + json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": codex_hook, "timeout": timeout}]}]
                                      for event, timeout in (("Stop", 60), ("UserPromptSubmit", 10))}}),
@@ -5212,15 +5243,15 @@ def setup(out=None):
         f"  env_vars = {json.dumps(ENV_VARS)}")
 
     # Antigravity runs hook commands with sh -c, or with cmd /c on Windows, where quotes don't survive
-    agy_hook = " ".join([py, script, "hook", "gemini"]) if windows else shlex.join([py, script, "hook", "gemini"])
+    agy_hook = " ".join([*run, "hook", "gemini"]) if windows else shlex.join([*run, "hook", "gemini"])
     app("Antigravity", "agy")
     say("Plugin:", "  git clone https://github.com/giliandar5-lab/agon", "  agy plugin install ./agon",
         f"  (Antigravity IDE: clone it into {home / '.gemini' / 'config' / 'plugins' / 'agon'} instead)",
-        "By hand:", "  " + command_line(["agy", "mcp", "add", "agon", py, script, "gemini"]),
+        "By hand:", "  " + command_line(["agy", "mcp", "add", "agon", *run, "gemini"]),
         f"  and the hook, merged into {home / '.gemini' / 'config' / 'hooks.json'}:",
         "  " + json.dumps({"agon": {"enabled": True, "Stop": [{"type": "command", "command": agy_hook,
                                                                "timeout": 60}]}}))
-    if windows and " " in py + script:
+    if windows and " " in "".join(run):
         say("  This hook can't work: Antigravity can't run a path with a space. Use the plugin or paths without one.")
 
     # ask runs the apps by name, and an app may start Agon with a shorter PATH than this terminal has (npm's
@@ -5268,11 +5299,11 @@ def setup(out=None):
 
     # autopilot runs the apps the same way, and agy only in its API-key mode (see barred())
     gemini = Path.home().joinpath(*GEMINI_SETTINGS)
-    say("", "== Autopilot: keeps the team working with no app open (python agon.py autopilot --help)",
+    say("", f"== Autopilot: keeps the team working with no app open ({command_name()} autopilot --help)",
         "In your project folder, it wakes an agent when messages come for it: an open Claude Code session through its",
         "inbox, else the agent's app, headless, with the programs in AGON_CMD_* above, on your plan. STOP in the arena",
         "pauses it, Ctrl+C ends it:",
-        "  " + command_line([py, script, "autopilot", "--agents", ",".join(COMMANDS), "--lead", "claude"]),
+        "  " + command_line([*run, "autopilot", "--agents", ",".join(COMMANDS), "--lead", "claude"]),
         f"Brakes: AGON_MAX_WAKES_PER_HOUR ({MAX_WAKES}) wakes of an agent an hour, AGON_MAX_AUTORUNS (25) in a row"
         f" without you, AGON_TURN_TIMEOUT ({TURN_TIMEOUT}) seconds a turn, AGON_MAX_WORKERS ({MAX_WORKERS}) apps at"
         " once; AGON_DAILY_USD and AGON_DAILY_TOKENS cap each agent's day once you set them. Past its plan's limit,"
@@ -5287,21 +5318,26 @@ def setup(out=None):
     # the arena, and a phone that reaches it through a tunnel (the arena answers only at the names it knows)
     hosts = os.environ.get("AGON_ARENA_HOSTS", "").strip()
     say("", "== Arena: the chat, each agent's fuel, the board, duels and the score, in a browser",
-        "  " + command_line([py, script]) + f"   then open http://127.0.0.1:{PORT}",
+        "  " + command_line(run) + f"   then open http://127.0.0.1:{PORT}",
         "It answers only at its own address and takes posts only from its own page. On a phone, through a tunnel:",
         f"  ssh -L {PORT}:127.0.0.1:{PORT} you@this-computer   (an SSH app on the phone; then http://127.0.0.1:{PORT})",
         f"  tailscale serve --bg {PORT}   (Tailscale on both; it passes its own name, so list that exact name, such as",
         "  laptop.tail1234.ts.net, in AGON_ARENA_HOSTS, comma-separated: never a pattern, the check keeps other sites out)",
         f"Now: AGON_ARENA_HOSTS is {hosts}" if hosts else "Now: AGON_ARENA_HOSTS isn't set: 127.0.0.1 and localhost only.",
-        "In a terminal: python agon.py watch follows the chat, python agon.py say TEXT posts as you, and python agon.py",
-        "export replay|scorecard writes one HTML file to share (keys, e-mail addresses and your home folder masked).")
+        f"In a terminal: {command_name()} watch follows the chat, {command_name()} say TEXT posts as you, and"
+        f" {command_name()} export replay|scorecard writes one HTML file to share (keys, e-mail addresses and your home"
+        " folder masked).")
 
     # a plan's usage, which only Claude Code's status line reports; Agon keeps its percentages and reset times only
     if windows:  # Claude Code runs it with Git Bash (backslashes vanish) or PowerShell (a quoted program is a string)
-        runner = Path(py).as_posix()
-        status = f'{runner if " " not in runner else "py"} "{Path(script).as_posix()}" statusline'
+        runner = Path(run[0]).as_posix()
+        if kind == "script":
+            status = f'{runner if " " not in runner else "py"} "{Path(run[1]).as_posix()}" statusline'
+        else:  # the agon command, or Python with -m agon: unquoted, since PowerShell takes a quoted program for a string
+            program = runner if " " not in runner else "agon" if len(run) == 1 else "py"
+            status = " ".join([program, *run[1:], "statusline"])
     else:
-        status = shlex.join([py, script, "statusline"])
+        status = shlex.join([*run, "statusline"])
     say("", "== Fuel: the plan's usage in the arena (optional; Claude Code only, on a Pro or Max plan)",
         "Claude Code's status line gets the plan's 5-hour and 7-day usage. Agon's status line command keeps only those",
         "percentages, their reset times and the session id (not the transcript or the folders), and prints a usual line.",
