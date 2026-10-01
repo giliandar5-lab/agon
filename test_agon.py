@@ -4793,6 +4793,20 @@ for needed in ("/security/advisories/new", "private vulnerability reporting", "`
 for text in (privacy, security):
     assert not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+", text)  # no e-mail address
 
+# Phase 7, 11. The contributing guide and the roadmap: no build step to work on Agon, the package built at release,
+# backward-compatible schema steps, flit_core at build time only, the listings, and gemini's tokens not measured
+guide = (HERE / "CONTRIBUTING.md").read_text(encoding="utf-8")
+for needed in ("no build step while you work on it", "built at release time", "`flit_core` is needed only",
+               "`__version__` in `agon.py`", "never a new meaning for an old column", "Nothing over the network",
+               "SECURITY.md"):
+    assert needed in guide, needed
+roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+for needed in ("never a new meaning for an\n  old column", "`flit_core` builds the PyPI package\nat release time only",
+               "MCP Registry (`io.github.giliandar5-lab/agon`", "awesome-mcp-servers, mcp.so, Glama",
+               "awesome-codex-plugins", '`gemini` is "not measured"', "**Phase 7 additions",
+               "from 2,500 to 2,900 bytes"):
+    assert needed in roadmap, needed
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()
