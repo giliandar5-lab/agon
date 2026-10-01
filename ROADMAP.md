@@ -740,8 +740,10 @@ Code 2.1.285 and codex-cli 0.159.3 on Linux)**
   (Windows `%APPDATA%\uv\data\tools`) with the command in `~/.local/bin`. uvx and `uv tool` download a Python when
   none fits (`UV_PYTHON_DOWNLOADS=never` stops it); pip and pipx use the Python they run on.
 - uv's and pip's `agon.exe` on Windows is a real launcher program (uv's trampoline, distlib's launcher) that starts
-  Python in a job object and passes stdio through *(from their sources; whether killing `uvx.exe` leaves Python
-  running is checked on `windows-latest` in CI)*.
+  Python in a job object and passes stdio through *(from their sources)*. But `uvx.exe` itself starts `uv.exe`, which
+  starts `agon-arena.exe`: ending `uvx.exe` (TerminateProcess) leaves `uv.exe`, the launcher and Python running while
+  Agon's stdin stays open, and they end as soon as it closes, as it does when the app closes or dies. On Linux and
+  macOS, ending uvx (SIGTERM) ends Agon at once *(CI, `scripts/check_package.py uvx-kill`, 2026-10-01)*.
 - Updating a plugin: Claude Code `claude plugin marketplace update agon`, then `claude plugin update agon@agon`, and a
   restart; Codex `codex plugin marketplace upgrade agon`, then `codex plugin add agon@agon` *(both hands-on with a
   local marketplace)*. Each update installs the new copy in a new folder; the old one stays behind.
