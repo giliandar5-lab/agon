@@ -4807,6 +4807,18 @@ for needed in ("never a new meaning for an\n  old column", "`flit_core` builds t
                "from 2,500 to 2,900 bytes"):
     assert needed in roadmap, needed
 
+# Phase 7, 12. CI builds the package as the release does, checks what it holds, installs it with pip, pipx and uv tool on
+# each system, ends a uvx-started Agon as an app would, and runs Claude Code's own validator on the plugin
+ci = (HERE / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+for needed in ("  package:", "uv build -o dist", "check_package.py dist dist", 'installed "$bin/agon"',
+               "pipx install dist/*.whl", "uv tool install dist/*.whl", "check_package.py uvx-kill dist/*.whl",
+               "  plugin:", "npm install -g @anthropic-ai/claude-code", "claude plugin validate --strict ."):
+    assert needed in ci, needed
+assert ci.count("os: [ubuntu-latest, windows-latest, macos-latest]") == 2
+checker = (HERE / "scripts" / "check_package.py").read_text(encoding="utf-8")
+compile(checker, "check_package.py", "exec")
+assert set(re.findall(r"^(?:import|from) (\w+)", checker, re.M)) <= set(sys.stdlib_module_names), "stdlib only"
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()
