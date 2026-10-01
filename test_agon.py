@@ -4917,6 +4917,10 @@ for readme, words in (("README.md", ("## Measured", "Measured on 2026-10-01", "P
                                                                         f"{chars:,}".replace(",", " "))
     assert all(n in text for n in shown), (readme, shown)  # the README's sizes are this version's
 
+# Phase 7, 18. Version 0.7.0 everywhere, and the phase ticked with what it did and what is left to the maintainer
+roadmap = (HERE / "ROADMAP.md").read_text(encoding="utf-8")
+assert agon.VERSION == "0.7.0" and "- [x] Phase 7 — Packaging" in roadmap and "Done in v0.7.0" in roadmap
+
 for a in (claude, gemini, gpt, lead, coder, gem, solo):
     a.close()
 bdb.close()

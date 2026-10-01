@@ -25,7 +25,7 @@ Tick a phase in the same pull request that completes it.
 - [x] Phase 4 — Task board (no downtime)
 - [x] Phase 5 — Autopilot (Agon wakes the agents itself)
 - [x] Phase 6 — The arena
-- [ ] Phase 7 — Packaging
+- [x] Phase 7 — Packaging
 
 ## How every session works
 
@@ -302,6 +302,13 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
   session).
 - Tokens per turn: Claude Code and Codex, from the usage each app reports, with and without Agon. Antigravity's
   `gemini` is "not measured": its headless usage needs an API key.
+- Done in v0.7.0: the package (`agon-arena`, built by `flit_core` at release time), the `agon` command, setup that
+  prints the command an install keeps, a database that older copies keep working on, annotations, the directory policy
+  checks, PRIVACY.md and SECURITY.md, CI that builds and installs the package on each system, the release workflow,
+  `server.json`, the measuring and screenshot scripts, and the numbers CI measured. Left to the maintainer: the
+  TestPyPI dry run and the tag that publishes to PyPI and the MCP Registry (after testing with the real apps on
+  Windows), the token numbers for Claude Code and Codex, the listings' forms and pull requests, and the demo video (a
+  real recording only).
 
 ## Non-goals
 
