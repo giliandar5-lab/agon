@@ -216,12 +216,17 @@ Team rules:
 ASKED = """Agon's ask started this session for "{asker}": your final message is the answer, so Agon's tools are
 off here and team messages don't come to you."""
 
-# send and inbox only add to the local chat (inbox moves a cursor forward), and board only changes the board in agon.db:
-# Codex runs such tools without asking. So board's done runs the human's test command unasked (see board_done())
-LOCAL = {"destructiveHint": False, "openWorldHint": False}
+# Every tool says all four hints, since an app reads a missing one as the riskier value, and a directory listing needs
+# them. send and inbox only add to the local chat (inbox moves a cursor forward), and board only records task state on
+# the board in agon.db (every action also posts to the chat; reviews have a table of their own, so the history stays):
+# none is read-only or idempotent, none deletes anything, and none reaches beyond Agon's own data, so Codex runs them
+# without asking. So board's done runs the human's test command unasked (see board_done()): the human's own setting,
+# never the agent's
+LOCAL = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
 TOOLS = [
     {
         "name": "send",
+        "title": "Send a message",
         "description": "Send a message to the Agon team chat (at most 8,000 characters:"
         " put long content in a file and send its path).",
         "inputSchema": {
@@ -236,6 +241,7 @@ TOOLS = [
     },
     {
         "name": "inbox",
+        "title": "Read new messages",
         "description": "Your new Agon messages; waits up to `wait` s (max 55) for one. A new session starts with a"
         " recap; a long backlog comes in parts; says if the human paused the team.",
         "inputSchema": {"type": "object", "properties": {"wait": {"type": "integer"}}},
@@ -243,6 +249,7 @@ TOOLS = [
     },
     {
         "name": "board",
+        "title": "Task board",
         "description": "Task board: list; add (after: ids it waits for); claim a task before editing its files; done:"
         " Agon runs the human's tests as the user, outside your sandbox, unasked; another company's agent reviews"
         " (AGON_AUTO_REVIEW: headless, on the user's plan); review: approve or changes, with evidence.",
@@ -266,6 +273,7 @@ TOOLS = [
     },
     {
         "name": "ask",
+        "title": "Ask another company's agent",
         "description": "A second opinion from another company's agent, run headless on the user's plan; takes minutes."
         " Agon runs the project's tests itself (the human sets the command). review: read-only, ends with VERDICT:"
         " approve or changes. task: on a new git branch you may merge.",
@@ -279,8 +287,9 @@ TOOLS = [
             },
             "required": ["agent", "prompt"],
         },
-        # it sends the project to another company's app and spends the user's plan there: apps may ask first
-        "annotations": {"destructiveHint": False, "openWorldHint": True},
+        # it sends the project to another company's app and spends the user's plan there, and a task's agent writes
+        # files (on a branch of its own): destructive, and open-world by default, so the apps ask first
+        "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False},
     },
 ]
 

@@ -287,6 +287,13 @@ The full specification is [docs/autopilot.md](docs/autopilot.md): treat its **De
 
 - PyPI package `agon-arena` with an `agon` command (`uvx agon-arena`), listings in plugin marketplaces and MCP
   directories, a demo video, and measured numbers (idle CPU and RAM, `tools/list` size, tokens per turn).
+- Every tool says its `title` and all four hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`,
+  `openWorldHint`; `ask` keeps the default open world): the claude.ai directory requires them, and an app reads a
+  missing hint as the riskier value. `board` is not destructive: it records task state on Agon's own board, every
+  action also posts to the chat, and reviews have a table of their own. `ask` is: another company's agent may write
+  files (on a branch of its own). So the `tools/list` limit in the tests went from 2,500 to 2,900 bytes (the new size
+  and a small margin) instead of cutting the descriptions: Claude Code and Codex defer tool schemas behind tool
+  search, so the model reads the names and the server instructions first, and a schema only when it needs the tool.
 
 ## Non-goals
 

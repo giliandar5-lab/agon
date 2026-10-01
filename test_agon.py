@@ -4348,14 +4348,19 @@ arena.server_close()
 agon.close_db()
 agon.DB = test_db
 
-# 19. The tools/list reply stays small (every agent reads it into its context)
+# 19. The tools/list reply stays small (every agent reads it into its context). Phase 7 raised the limit from 2,500 to
+# the new size and a small margin: every tool now says its title and all four hints (a missing hint reads as the
+# riskier value, and the directory needs them), and the apps defer tool schemas anyway (see ROADMAP.md)
 sam.write({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
 raw = sam.p.stdout.readline()
-assert len(raw) < 2500 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "board",
+assert len(raw) < 2900 and [tool["name"] for tool in json.loads(raw)["result"]["tools"]] == ["send", "inbox", "board",
                                                                                               "ask"], len(raw)
 send_tool, inbox_tool, board_tool, ask_tool = json.loads(raw)["result"]["tools"]
 for tool in (send_tool, inbox_tool, board_tool):  # Phase 2, Ж: local, additive tools, so Codex doesn't ask every time
-    assert tool["annotations"] == {"destructiveHint": False, "openWorldHint": False}, tool
+    assert tool["annotations"] == {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False,
+                                   "openWorldHint": False}, tool  # Phase 7: board too deletes nothing (see LOCAL)
+assert [tool["title"] for tool in (send_tool, inbox_tool, board_tool, ask_tool)] == [
+    "Send a message", "Read new messages", "Task board", "Ask another company's agent"]
 # Phase 4: board takes its actions and their arguments; being local, Codex runs it unasked, so its description says
 # what done does without asking, and that an automatic review goes to another company's app on the user's plan
 assert board_tool["inputSchema"]["required"] == ["action"] and set(board_tool["inputSchema"]["properties"]) == {
@@ -4364,8 +4369,10 @@ assert board_tool["inputSchema"]["properties"]["action"]["enum"] == ["list", "ad
 for needed in ("claim a task before editing its files", "Agon runs the human's tests as the user, outside your sandbox,"
                " unasked", "another company's agent reviews", "(AGON_AUTO_REVIEW: headless, on the user's plan)"):
     assert needed in board_tool["description"], (needed, board_tool["description"])
-# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps may ask first
-assert ask_tool["annotations"] == {"destructiveHint": False, "openWorldHint": True}, ask_tool
+# Phase 3: ask sends the project to another company's app and spends the user's plan there, so the apps ask first.
+# Phase 7: destructive (a task's agent writes files), and open-world by default (no openWorldHint: the MCP default)
+assert ask_tool["annotations"] == {"readOnlyHint": False, "destructiveHint": True,
+                                  "idempotentHint": False}, ask_tool
 assert ask_tool["inputSchema"]["required"] == ["agent", "prompt"] and "ask" in agon.INSTRUCTIONS
 # Phase 3.1: nothing tells the agents that a reviewer runs the tests; Agon does, with a command they can't pass
 assert "Agon runs the project's tests itself (the human sets the command)" in ask_tool["description"], ask_tool
